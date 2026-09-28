@@ -12,7 +12,7 @@ keywords = ["egui", "shader", "blur", "filter", "wgsl"]
 categories = ["gui", "graphics", "rendering"]
 authors = ["Vasyanator"]
 # `assets/` holds the README GIFs; the README links them by absolute URL, so they stay out of the package.
-exclude = ["MODULE_README.md", "**/MODULE_README.md", "assets/"]
+exclude = ["MODULE_README.md", "**/MODULE_README.md", "assets/", "dev-docs/"]
 
 [lib]
 name = "egui_filter_layers"
