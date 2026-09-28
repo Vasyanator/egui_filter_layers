@@ -71,7 +71,7 @@ glutin = { version = "0.32", default-features = false, features = ["egl"] }
 
 [[example]]
 name = "demo"
-required-features = ["glow", "wgpu"]
+required-features = ["glow", "wgpu", "hot-reload"]
 
 [[example]]
 name = "process_image"

@@ -19,7 +19,14 @@ Adding a scene is a two-line change here: `mod name;` below and `name::ENTRY,` i
 The scene module defines `pub const ENTRY: SceneEntry` and its `Scene` implementation.
 */
 
+mod bloom;
+mod hot;
+mod mask;
+mod ripples;
 mod stack;
+mod textures;
+mod trails;
+mod water;
 
 use eframe::egui::{self, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 
@@ -27,7 +34,7 @@ use crate::backdrop::Backdrop;
 use crate::stack::Entry;
 
 /// Every scene, in selector order; the first one is the default.
-pub const SCENES: &[SceneEntry] = &[stack::ENTRY];
+pub const SCENES: &[SceneEntry] = &[stack::ENTRY, hot::ENTRY, ripples::ENTRY, water::ENTRY, trails::ENTRY, bloom::ENTRY, textures::ENTRY, mask::ENTRY];
 
 /// A registered scene: how to name it and how to build it.
 #[derive(Clone, Copy, Debug)]
@@ -51,8 +58,6 @@ pub fn find(key: &str) -> Option<usize> {
 #[derive(Debug)]
 pub struct SceneInit<'a> {
     /// The egui context (texture uploads, repaint handles for workers).
-    // No registered scene reads it yet; scenes that upload textures do. Drop this allow once one does.
-    #[allow(dead_code)]
     pub ctx: &'a egui::Context,
     /// `--rect`: the initial filter rect, in points.
     pub rect: Option<Rect>,

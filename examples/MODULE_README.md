@@ -7,7 +7,8 @@ processors. They are also the manual test bench for both backends.
 ## Files and submodules
 - `demo/`: interactive showcase (`--renderer glow|wgpu`, `--msaa N`, `--scene NAME`,
   `--stack a,b`, `--rect x,y,w,h`, `--screenshot out.ppm` for scripted checks,
-  `--record DIR [--frames N] [--fps F]` for README GIF frames). Requires both backend features.
+  `--record DIR [--frames N] [--fps F]` for README GIF frames). Requires both backend features and `hot-reload`
+  (`[[example]] required-features`; the "hot" scene uses `HotEffect`).
   - `main.rs`: command line, stderr logger, eframe start-up on either renderer, the app shell
     (status block, scene selector, lazily built scenes, dispatch).
   - `record.rs`: `--record` / `--screenshot` machinery and the PPM writer; scene-independent.
@@ -20,7 +21,24 @@ processors. They are also the manual test bench for both backends.
     for `mat4x4`, arrays collapsed.
   - `scenes/`: `mod.rs` (the `Scene` trait, `SceneEntry` registry `SCENES`, `SceneInit`,
     `SceneFrame`, shared `DragRect` and `record_rect`) and one file per scene: `stack.rs`
-    (scene "stack": the preset stack on a draggable rect).
+    (scene "stack": the preset stack on a draggable rect); `hot.rs` + `hot.wgsl` (scene "hot": a
+    `HotEffect` watching `hot.wgsl`, whose path is fixed at compile time from
+    `CARGO_MANIFEST_DIR`; an in-app editor saving the file from a worker thread, compile errors
+    as an overlay on the layer and in the panel, named values kept across reloads by `rebind`);
+    `bloom.rs` + `bloom_{bright,combine}.wgsl` (scene "bloom": own dark content; a custom bloom
+    with a scaled bright pass, `presets::bloom`, or Gaussian vs Kawase blur alone, with an averaged
+    frame-time readout); `textures.rs` + `tex_{displace,refract,lut}.wgsl` (scene "textures":
+    noise, normal map and a 256x16 flattened 16^3 LUT generated at build and attached to slots
+    0-2, one custom effect per slot; shows `check_textures` / `failed_textures`); `mask.rs` (scene
+    "mask": star from overlapping convex kites, circle and a "GLASS" galley as `Mask::Shape`
+    layers, draggable, frosted / lens / pixelate); `ripples.rs` (scene "ripples": full-area
+    `click_ripples` driven by an `Impulses` from presses / drags, lifetime and capacity controls,
+    live count; `scripted_impulses` = recording clicks as a pure function of the phase, shared
+    with water); `water.rs` (scene "water": full-area `wave_sim` substeps + `wave_display` under
+    an `egui::Window` menu whose rect is a `WaveObstacle` every frame, a draggable rock obstacle
+    painted after the layer, splashes, pointer wake, rain, `reset_state`); `trails.rs` (scene
+    "trails": `presets::trails` on a `DragRect` over the moving circles, an orbiting comet and a
+    pointer brush).
 - `process_image.rs` (feature `image`): offline processing of an image file on a headless wgpu
   device (`OfflineRenderer::headless` + `process_file`) with a fixed stack incl. a custom effect;
   `--ppp`, `--time`, `--max-tile` map to `OfflineOptions`. JPEG output of translucent input relies
@@ -57,3 +75,7 @@ processors. They are also the manual test bench for both backends.
 - Scene constructors and `Scene::ui` run on the GUI thread: no file I/O or heavy work there
   (use worker threads, e.g. the hot-reload scene's writer).
 - Scene-owned layers that keep state need a stable `FilterLayer::id` distinct across scenes.
+- Stateful layers step once per PAINT. The recorder paints every step a fixed number of times
+  (its screenshot handshake: currently twice), so recordings of stateful scenes are deterministic
+  but step faster than one step per frame and are not seamless loops (state crosses the seam);
+  `fl.delta_time` is 0 on the repeated paint, so per-second effects (trails) are unaffected.

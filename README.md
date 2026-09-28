@@ -486,23 +486,29 @@ first frame, which keeps passed-through audio in sync. Frame `i` gets `fl.time =
 ## Demo
 
 ```sh
-cargo run --example demo -- --renderer glow
-cargo run --example demo -- --renderer glow --msaa 4
-cargo run --example demo -- --renderer wgpu
-cargo run --example demo -- --renderer wgpu --msaa 4 --stack lens --rect 500,150,300,200
-cargo run --example demo -- --scene stack --stack kawase_blur,bloom
+cargo run --example demo --features hot-reload -- --renderer glow
+cargo run --example demo --features hot-reload -- --renderer glow --msaa 4
+cargo run --example demo --features hot-reload -- --renderer wgpu
+cargo run --example demo --features hot-reload -- --renderer wgpu --msaa 4 --stack lens --rect 500,150,300,200
+cargo run --example demo --features hot-reload -- --scene stack --stack kawase_blur,bloom
 ```
 
 Pick a scene in the side panel (or with `--scene NAME`). In the "stack" scene, drag the rect,
 resize it from its corner, stack presets, tune named parameters, and edit the custom WGSL effect
 live.
 
+The "hot" scene edits `examples/demo/scenes/hot.wgsl` through `HotEffect` (hence the
+`hot-reload` feature the demo requires): save from the in-app editor (Ctrl+S) or from any
+editor, and the layer recompiles in the background; a compile error shows naga's diagnostic on
+the layer while the last good version keeps running, and named parameter values survive the
+reload (`rebind`).
+
 `--stack name:v1:v2` overrides a preset's parameters, and `--record DIR` renders a seamless
 4-second loop of the selected scene (no side panel, deterministic time, one PPM per frame) — the
 GIFs above come from:
 
 ```sh
-cargo run --example demo -- --stack ripple:6:40:0.5 --record frames/
+cargo run --example demo --features hot-reload -- --stack ripple:6:40:0.5 --record frames/
 ffmpeg -framerate 25 -i frames/frame_%04d.ppm \
   -filter_complex "split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=bayer:bayer_scale=4" -loop 0 waves.gif
 ```

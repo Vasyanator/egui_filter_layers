@@ -8,9 +8,9 @@ This file owns the command line, the stderr logger, eframe start-up on either re
 app shell that dispatches to the selected scene.
 
 Usage:
-    cargo run --example demo -- [--renderer glow|wgpu] [--msaa N] [--verbose] [--scene NAME]
-                                [--stack blur,lens:2.5,...] [--rect x,y,w,h] [--screenshot out.ppm]
-                                [--record DIR [--frames N] [--fps F]]
+    cargo run --example demo --features hot-reload -- [--renderer glow|wgpu] [--msaa N] [--verbose] [--scene NAME]
+                                                    [--stack blur,lens:2.5,...] [--rect x,y,w,h] [--screenshot out.ppm]
+                                                    [--record DIR [--frames N] [--fps F]]
 
 `--scene` picks the scene (names: `scenes::SCENES` keys; default the first). `--stack` replaces the
 initial filter stack of the "stack" scene (names: see `stack::Kind::key`; `name:v1:v2` overrides
