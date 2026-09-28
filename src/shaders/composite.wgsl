@@ -4,7 +4,8 @@
 // capture, in capture UV (x, y, w, h). In frag mode 1 (wgpu) `frag_uv` already is
 // the capture uv, derived from the pixel position (see the prelude). The original capture is
 // read with the prelude's `original(uv)` (binding 3). params[0] = mask rect (min.xy, max.xy) in capture pixels,
-// params[1] = corner radii (nw, ne, se, sw) in pixels.
+// params[1] = corner radii (nw, ne, se, sw) in pixels, params[3].x = 1 for a shape mask (the
+// coverage texture at binding 6 replaces the rounded rect).
 // `effect.rs` appends one of the `effect` wrappers: the replace composite `fl_composite`
 // (gamma or linear output; glow and offline), or the two draws of the blended composite the
 // wgpu UI draws over egui's pass (erase: `(0, 0, 0, coverage)` under a `dst * (1 - src.a)`
@@ -28,13 +29,17 @@ fn fl_composite_uv(frag_uv: vec2<f32>) -> vec2<f32> {
     return select(region.xy + frag_uv * region.zw, frag_uv, fl.internal_frag_mode > 0.5);
 }
 
-// Rounded-rect mask coverage at capture uv `uv`, in [0, 1] (1-px antialiased edge). Values
-// within 1/1024 of 0 or 1 snap to exactly 0 or 1: a pixel-aligned edge puts pixel centres at
-// distance -0.5 only up to float error (`uv * size_px`), and an almost-1 coverage would make
-// the blended composite round differently from the filtered value (1/1024 is under a quarter
-// of an 8-bit step).
+// Mask coverage at capture uv `uv`, in [0, 1]: the rounded rect (1-px antialiased edge), or,
+// when params[3].x > 0.5 (a shape mask, F9), the alpha of the coverage texture (binding 6: the
+// rasterized shape, holding the run's window at its origin like the original, mapped by
+// `internal_cover_*`). Values within 1/1024 of 0 or 1 snap to exactly 0 or 1: a pixel-aligned
+// edge puts pixel centres at distance -0.5 only up to float error (`uv * size_px`), and an
+// almost-1 coverage would make the blended composite round differently from the filtered value
+// (1/1024 is under a quarter of an 8-bit step).
 fn fl_coverage(uv: vec2<f32>) -> f32 {
-    let coverage = clamp(0.5 - fl_rounded_rect_distance(uv * fl.size_px, fl.params[0], fl.params[1]), 0.0, 1.0);
+    let sdf = clamp(0.5 - fl_rounded_rect_distance(uv * fl.size_px, fl.params[0], fl.params[1]), 0.0, 1.0);
+    let shape = textureSampleLevel(fl_coverage_texture, fl_sampler, fl_storage_uv(uv, fl.texel, fl.internal_cover_scale, fl.internal_cover_offset), 0.0).a;
+    let coverage = select(sdf, shape, fl.params[3].x > 0.5);
     let snap = 1.0 / 1024.0;
     return select(select(coverage, 1.0, coverage > 1.0 - snap), 0.0, coverage < snap);
 }

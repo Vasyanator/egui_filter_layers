@@ -16,6 +16,8 @@ Key functions:
 - `LayerGeometry::composite_params()`: the composite pass's parameter block (every backend).
 - `pointer_uniform()`: the one screen-points -> capture-uv conversion of the pointer (`fl.pointer`),
   used by both backends and the offline renderer.
+- `mask_transform()`: the one layer-points -> capture-pixels mapping of a shape mask (F9), with
+  the layer transform, used by both backends and the offline renderer.
 - `px_f32()`: exact pixel-count -> `f32` conversion shared by the backends.
 
 Notes:
@@ -151,6 +153,33 @@ pub(crate) fn pointer_uniform(pointer: Option<(Pos2, bool)>, pixels_per_point: f
         return [0.0; 4];
     }
     [u, v, if pressed { 1.0 } else { 0.0 }, 1.0]
+}
+
+/// How a shape mask's layer points map to capture pixels: `pixel = point * scale - origin_px`
+/// (capture pixel `(0, 0)` = the capture's top-left corner).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MaskTransform {
+    /// Capture pixels per layer point (egui's pixels per point times the layer transform's scale).
+    pub scale: f32,
+    /// Subtracted after scaling.
+    pub origin_px: [f32; 2],
+}
+
+/// The mapping of a shape mask painted in the space of `painted` (the layer rect as painted, layer
+/// points) onto the capture `capture` of a layer rendered at `rendered` (the callback rect, layer
+/// transform applied, screen points) on a screen of `pixels_per_point`.
+///
+/// egui's layer transforms are a uniform scale plus a translation (`TSTransform`): `rendered =
+/// t + s * painted`, `s` = [`transform_scale`] and `t = rendered.min - s * painted.min`. A point
+/// `p` lands at screen pixel `(t + s * p) * ppp`, i.e. capture pixel `p * (s * ppp) - (capture.xy -
+/// t * ppp)`. Untransformed layers (`painted == rendered`) get `t = 0` exactly. Offline the frame is
+/// the screen and the layer: `painted = rendered` = the frame in points, `capture` at the origin.
+#[must_use]
+pub(crate) fn mask_transform(painted: Rect, rendered: Rect, pixels_per_point: f32, capture: PxRect) -> MaskTransform {
+    let s = transform_scale(painted, rendered);
+    let translation = rendered.min - painted.min * s;
+    let scale = pixels_per_point * s;
+    MaskTransform { scale, origin_px: [px_f32(capture.x) - translation.x * pixels_per_point, px_f32(capture.y) - translation.y * pixels_per_point] }
 }
 
 /// Computes the geometry of one layer, or `None` when nothing of it is visible.
@@ -333,6 +362,26 @@ mod tests {
         assert!(approx4(pointer_uniform(None, 2.0, capture), [0.0; 4]));
         assert!(approx4(pointer_uniform(Some((pos2(1.0, 1.0), true)), f32::NAN, capture), [0.0; 4]));
         assert!(approx4(pointer_uniform(Some((pos2(1.0, 1.0), true)), 1.0, PxRect { x: 0, y: 0, w: 0, h: 5 }), [0.0; 4]));
+    }
+
+    /// A shape mask point maps through the layer transform like the layer rect itself: the painted
+    /// rect's corners land on the rendered rect's corners in capture pixels.
+    #[test]
+    fn mask_points_follow_the_layer_transform() {
+        let painted = Rect::from_min_size(pos2(20.0, 10.0), vec2(100.0, 50.0));
+        let capture = PxRect { x: 30, y: 40, w: 500, h: 300 };
+        for transform in [egui::emath::TSTransform::IDENTITY, egui::emath::TSTransform::new(vec2(15.0, -5.0), 1.5)] {
+            let rendered = transform * painted;
+            let ppp = 2.0;
+            let map = mask_transform(painted, rendered, ppp, capture);
+            for (point, screen) in [(painted.min, rendered.min), (painted.max, rendered.max), (painted.center(), rendered.center())] {
+                let expected = [screen.x * ppp - 30.0, screen.y * ppp - 40.0];
+                let got = [point.x * map.scale - map.origin_px[0], point.y * map.scale - map.origin_px[1]];
+                assert!(approx(got[0], expected[0]) && approx(got[1], expected[1]), "{transform:?}: {got:?} vs {expected:?}");
+            }
+        }
+        let identity = mask_transform(painted, painted, 1.25, capture);
+        assert_eq!(identity.origin_px.map(f32::to_bits), [30.0_f32, 40.0].map(f32::to_bits), "no translation: exactly the capture origin");
     }
 
     /// A transformed layer: egui reports the callback rect with the layer transform applied and

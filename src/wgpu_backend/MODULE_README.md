@@ -22,7 +22,10 @@ One frame, per filter layer:
    `*Srgb` targets through an `Rgba8UnormSrgb` view of it with the linear-output entry, so
    meshes blend in linear like egui's), then hands the capture's unorm view to the chain executor
    (`ChainResources::record`, `chain.rs`): it runs the draws of `plan::plan` — effect passes
-   ping-pong (RGBA16F when the adapter can) — and returns the composite bind group. A stateful
+   ping-pong (RGBA16F when the adapter can) — and returns the composite bind group. A shape mask
+   (F9) is packed here and handed over with its transform (`geometry::mask_transform`) and the
+   texture groups the plugin resolved (mask textures join the beneath textures there); the
+   executor rasterizes it (`coverage.rs`) before the passes. A stateful
    layer (F7) first looks up its entry in `WgpuResources::states` (viewport + id; eviction of
    unpainted entries runs at every prepare) and hands its two state textures to the executor
    (`ChainState`), then records where the latest state is.
@@ -59,6 +62,10 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
 - `textures.rs`: egui-wgpu bind groups; own copies of textures uploaded in full that egui-wgpu
   has not applied yet (kept across the passes of a frame, partial deltas followed);
   `resolve_user_textures` (the same resolution for attached user textures, failures reported).
+- `coverage.rs`: egui-free mesh machinery shared by the backdrop re-render and the shape-mask
+  coverage rasterizer (`mesh_pipeline`, `EGUI_BLEND`, `CoverageRasterizer` with a white texture
+  group for untextured offline meshes, per-run `CoverageTargets`, `CoverageJob`); used by
+  `chain.rs`, so offline runs rasterize masks unchanged.
 - `chain.rs`: the chain executor (`ChainResources`, `ChainTargets`, `ChainWindow`, `record`,
   `frame_uniforms`, `chain_uniforms` = every draw's plan blocks (`fl`, then the named-parameter
   block) at the device's offset alignment (`ChainUniforms` / `DrawUniforms`); composites: replace `composite_pipeline` / `draw_composite` for offline,
@@ -72,8 +79,7 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   mesh pipeline (and whether the capture renders through its sRGB view), per-layer target pool
   (`LayerTargets`), persistent layer states (`states`: `StateRegistry<StateTargets>`).
 - `render.rs`: the `CallbackTrait` implementation (backdrop re-render, then the chain executor).
-- `mesh.wgsl`: mesh re-render shader (egui-wgpu maths + dithering; `fs_main` = gamma framebuffer
-  path, `fs_main_linear` = linear framebuffer path).
+- The mesh shader is `src/shaders/mesh.wgsl` (shared with glow's coverage rasterizer).
 
 ## Contracts and invariants
 - Every effect and composite pipeline shares ONE `@group(0)` layout (`ChainResources::layout`,
@@ -111,6 +117,8 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   creation succeeds, and wgpu rejects the pipeline when egui's encoder is finished (outside the
   crate) — uncaptured, so wgpu-core's default handler panics (native and WebGL2); browser WebGPU
   logs it and drops the frame. Never claim it latches.
+- Shape-mask coverage is `Rgba8Unorm`, the run's window at its origin, cleared then drawn with
+  egui's blend, single-sampled; only the composite binds it (the white dummy elsewhere).
 - The UI composite never writes pixels its mask does not cover (discard), and inside the mask it
   equals the filtered value exactly; only the 1-px antialiased edge is a blend with what the pass
   holds (on `*Srgb` targets in linear, so it differs from the offline / glow gamma mix there).

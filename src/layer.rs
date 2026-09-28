@@ -2,7 +2,7 @@
 File: layer.rs
 
 Purpose:
-`FilterLayer`, the user-facing shape: a rect (+ optional rounded mask) and a `FilterChain`,
+`FilterLayer`, the user-facing shape: a rect (+ a mask: rounded rect or any shape) and a `FilterChain`,
 painted into an `egui::Painter`. Resolves the chain into a backend-neutral `LayerJob` and hands
 it to whichever backend is installed on the painter's context.
 
@@ -13,6 +13,8 @@ Key functions:
 - `FilterLayer::paint()`.
 - `FilterLayer::texture()` / `check_textures()`: user textures (F8) and the check `paint` runs.
 - `FilterLayer::id()` / `state()` / `check_state()`: persistent state (F7) and its check.
+- `FilterLayer::mask()` / `corner_radius()` / `check_mask()`: the mask (F9); a shape mask is
+  tessellated in `paint` (`resolve_mask`, GUI thread).
 - `frame_input()`: the per-frame input (`fl.delta_time`, `fl.frame`, `fl.pointer`) read from the
   context on the GUI thread.
 
@@ -23,14 +25,18 @@ paints nothing, leaving the backdrop unfiltered. A failed backend is skipped the
 neither case requests repaints for animated chains. A layer whose user textures cannot serve its
 effects (`TextureError`: an invalid slot, or a slot an effect reads with nothing attached) is
 skipped too, its error logged once per context and message (`log_texture_error_once`), and so
-is a layer with a state pass but no id (`StateError::MissingId`, same latch). A pending
+is a layer with a state pass but no id (`StateError::MissingId`, same latch), and one whose mask
+shape contains a paint callback (`MaskError::Callback`, same latch). A pending
 `reset_state` request for the layer's id is consumed at its paint (`state::take_reset`).
 */
+
+use std::sync::Arc;
 
 use egui::{Context, CornerRadius, Id, Painter, Rect, TextureId};
 
 use crate::backend::{FrameInput, LayerJob, PointerInput, TextureError, installed};
 use crate::effect::TEXTURE_SLOTS;
+use crate::mask::{JobMask, Mask, MaskError, tessellate};
 use crate::pass::FilterChain;
 use crate::plan::check_textures;
 use crate::state::{StateError, StateOptions, take_reset};
@@ -91,6 +97,34 @@ fn log_state_error_once(ctx: &Context, error: &StateError) {
     }
 }
 
+/// Logs `error` (a layer skipped for its mask) once per context and message.
+fn log_mask_error_once(ctx: &Context, error: &MaskError) {
+    let message = error.to_string();
+    if first_layer_error(ctx, &message) {
+        log::error!(
+            "egui_filter_layers: a FilterLayer was skipped (it draws nothing extra) because its mask cannot be rasterized.\n\
+             Error: {message}\n\
+             Fix: build the mask from paths, circles, rects, meshes or text; `FilterLayer::check_mask` reports this without painting. Logged once per message."
+        );
+    }
+}
+
+/// The job mask of a layer painted on `ctx`: a shape is tessellated here, on the GUI thread, at the
+/// context's pixels per point with its tessellation options (feathering) and font atlas size (text
+/// uvs), without pre-rasterized discs (`mask::tessellate`).
+fn resolve_mask(ctx: &Context, mask: Mask, rect: Rect) -> JobMask {
+    match mask {
+        Mask::RoundedRect(radius) => JobMask::RoundedRect(radius),
+        Mask::Shape(shape) => {
+            let options = ctx.options(|options| options.tessellation_options);
+            // The method path does not satisfy `ctx.fonts`'s higher-ranked `FontsView<'_>` bound.
+            #[allow(clippy::redundant_closure_for_method_calls)]
+            let font_size = ctx.fonts(|fonts| fonts.font_image_size());
+            JobMask::Coverage(Arc::new(tessellate(shape, rect, ctx.pixels_per_point(), options, font_size)))
+        }
+    }
+}
+
 /// The per-frame input of `ctx`'s current pass: `stable_dt` clamped to
 /// `0..=FrameInput::MAX_DELTA_TIME` (non-finite reads as 0), `cumulative_frame_nr` truncated to
 /// its low 32 bits (wrapping, documented for `fl.frame`), and the latest pointer position (screen
@@ -127,8 +161,8 @@ pub struct FilterLayer {
     rect: Rect,
     /// The passes to run.
     chain: FilterChain,
-    /// Rounded-corner mask; outside it the backdrop is left untouched.
-    corner_radius: CornerRadius,
+    /// The mask (rounded rect by default); outside it the backdrop is left untouched.
+    mask: Mask,
     /// The user texture attached at each slot (`tex(i, uv)` in effects).
     textures: [Option<TextureId>; TEXTURE_SLOTS],
     /// The first out-of-range slot given to [`FilterLayer::texture`], reported by
@@ -144,7 +178,7 @@ impl FilterLayer {
     /// A layer filtering `rect` (points) through `chain` (a `Pass`, `Vec<Pass>` or `FilterChain`).
     #[must_use]
     pub fn new(rect: Rect, chain: impl Into<FilterChain>) -> Self {
-        Self { rect, chain: chain.into(), corner_radius: CornerRadius::ZERO, textures: [None; TEXTURE_SLOTS], invalid_slot: None, id: None, state: StateOptions::default() }
+        Self { rect, chain: chain.into(), mask: Mask::default(), textures: [None; TEXTURE_SLOTS], invalid_slot: None, id: None, state: StateOptions::default() }
     }
 
     /// Gives the layer a stable identity (e.g. `ui.id().with("water")`), REQUIRED when its
@@ -231,11 +265,39 @@ impl FilterLayer {
         check_textures(self.chain.passes(), self.textures.map(|texture| texture.is_some()))
     }
 
-    /// Restricts the filter to a rounded rect (anti-aliased edge).
+    /// Restricts the filter to a rounded rect (anti-aliased edge): shorthand for
+    /// `mask(Mask::RoundedRect(corner_radius))`, replacing any earlier mask.
     #[must_use]
     pub fn corner_radius(mut self, corner_radius: impl Into<CornerRadius>) -> Self {
-        self.corner_radius = corner_radius.into();
+        self.mask = Mask::RoundedRect(corner_radius.into());
         self
+    }
+
+    /// Restricts the filter to `mask` (replacing any earlier mask or corner radius); outside it,
+    /// and outside the layer rect, the backdrop stays untouched. A [`Mask::Shape`] is in layer
+    /// points (the space of the layer's rect, so it follows layer transforms), its alpha is the
+    /// coverage, and it is tessellated when the layer is painted (with egui's anti-aliasing
+    /// feather of one pixel at the context's pixels per point; under a zoomed layer transform the
+    /// feather scales with the zoom). Text galleys work in the UI (not offline).
+    #[must_use]
+    pub fn mask(mut self, mask: Mask) -> Self {
+        self.mask = mask;
+        self
+    }
+
+    /// The layer's mask.
+    #[must_use]
+    pub fn layer_mask(&self) -> &Mask {
+        &self.mask
+    }
+
+    /// Whether the mask can be rasterized ([`Mask::check`]: no paint callbacks).
+    /// [`FilterLayer::paint`] runs this and skips the layer on an error (logged once per context).
+    ///
+    /// # Errors
+    /// [`MaskError::Callback`].
+    pub fn check_mask(&self) -> Result<(), MaskError> {
+        self.mask.check()
     }
 
     /// The filtered rect, in points.
@@ -280,6 +342,10 @@ impl FilterLayer {
             log_state_error_once(ctx, &error);
             return;
         }
+        if let Err(error) = self.check_mask() {
+            log_mask_error_once(ctx, &error);
+            return;
+        }
         // An effect reading `fl.time` must keep moving in an otherwise idle app.
         if self.chain.is_animated() {
             ctx.request_repaint();
@@ -294,7 +360,8 @@ impl FilterLayer {
         // Consumed only by a stateful layer's paint, so a request waits for the layer it targets.
         let reset_state = stateful && self.id.is_some_and(|id| take_reset(ctx, id));
         let viewport = ctx.viewport_id();
-        let job = LayerJob { rect: self.rect, corner_radius: self.corner_radius, passes: self.chain.into_passes(), padding_points, time, frame_input, textures: self.textures, id: self.id, viewport, state: self.state, reset_state };
+        let mask = resolve_mask(ctx, self.mask, self.rect);
+        let job = LayerJob { rect: self.rect, mask, passes: self.chain.into_passes(), padding_points, time, frame_input, textures: self.textures, id: self.id, viewport, state: self.state, reset_state };
         backend.paint_layer(painter, job);
     }
 }
@@ -534,6 +601,69 @@ mod tests {
             FilterLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter);
         });
         assert_eq!(jobs, [(Some(id), true, true), (Some(id), false, true)], "consumed by the first paint of the id");
+    }
+
+    /// A backend that keeps the mask of every job.
+    struct Masks {
+        masks: std::sync::Mutex<Vec<JobMask>>,
+    }
+
+    impl Backend for Masks {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Glow
+        }
+        fn status(&self) -> BackendStatus {
+            BackendStatus::Installed { backend: BackendKind::Glow }
+        }
+        fn failed_effects(&self) -> Vec<EffectFailure> {
+            Vec::new()
+        }
+        fn failed_textures(&self) -> Vec<TextureFailure> {
+            Vec::new()
+        }
+        fn failed_states(&self) -> Vec<crate::state::StateFailure> {
+            Vec::new()
+        }
+        fn state_count(&self) -> usize {
+            0
+        }
+        fn paint_layer(&self, _painter: &Painter, job: LayerJob) {
+            self.masks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(job.mask);
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// F9: `corner_radius` is the rounded-rect mask; a shape mask reaches the backend tessellated
+    /// (feathered, in layer points); a mask with a paint callback never reaches it.
+    #[test]
+    fn masks_are_resolved_or_refused_before_the_backend() {
+        let rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(100.0, 100.0));
+        let circle = egui::Shape::circle_filled(pos2(60.0, 60.0), 30.0, egui::Color32::WHITE);
+        let layer = FilterLayer::new(rect, presets::invert(1.0));
+        assert_eq!(layer.clone().corner_radius(4).layer_mask(), &Mask::RoundedRect(CornerRadius::same(4)));
+        assert_eq!(layer.clone().corner_radius(4).mask(Mask::Shape(circle.clone())).layer_mask(), &Mask::Shape(circle.clone()), "the last mask wins");
+        let callback = egui::Shape::Callback(egui::PaintCallback { rect, callback: Arc::new(()) });
+        assert_eq!(layer.clone().mask(Mask::Shape(callback.clone())).check_mask(), Err(MaskError::Callback));
+
+        let ctx = Context::default();
+        let backend = Arc::new(Masks { masks: std::sync::Mutex::new(Vec::new()) });
+        register(&ctx, Arc::clone(&backend) as Arc<dyn Backend>);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = Painter::new(ui.ctx().clone(), LayerId::background(), Rect::EVERYTHING);
+            layer.clone().corner_radius(6).paint(&painter);
+            layer.clone().mask(Mask::Shape(circle.clone())).paint(&painter);
+            layer.clone().mask(Mask::Shape(callback.clone())).paint(&painter);
+        });
+        output.textures_delta.clear();
+        let masks = std::mem::take(&mut *backend.masks.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        assert_eq!(masks.len(), 2, "the callback mask is refused: {masks:?}");
+        assert_eq!(masks[0], JobMask::RoundedRect(CornerRadius::same(6)));
+        let Some(meshes) = masks[1].coverage() else { panic!("a shape mask is tessellated: {:?}", masks[1]) };
+        let bounds = meshes.meshes.iter().fold(Rect::NOTHING, |bounds, mesh| bounds.union(mesh.calc_bounds()));
+        // Radius 30 plus half a feather pixel (ppp 1), in layer points.
+        assert!((bounds.width() - 61.0).abs() < 0.01 && (bounds.center() - pos2(60.0, 60.0)).length() < 0.01, "{bounds:?}");
     }
 
     /// The "no backend installed" latch is per `Context`: set once per context, independent between contexts.

@@ -1,22 +1,31 @@
-// egui_filter_layers (wgpu): re-renders egui meshes into the offscreen capture
-// texture. The maths mirror egui-wgpu 0.36's `egui.wgsl` (vertex colour *
-// texture sample, premultiplied gamma, optional dithering) so the capture holds
-// what egui itself writes to the screen. Two fragment entries, like egui-wgpu:
-// `fs_main` (gamma framebuffer path: the capture is written as-is) and
-// `fs_main_linear` (linear framebuffer path: rendered through an sRGB view of
-// the capture, so blending happens in linear exactly as on a `*Srgb` screen).
-// Differences: vertex positions are mapped into the capture viewport instead of
-// the whole screen, the dithering noise is evaluated at the fragment's SCREEN
-// position, and egui-wgpu's `predictable_texture_filtering` is not mirrored
-// (hardware filtering only).
+// egui_filter_layers: draws egui meshes (egui's 20-byte vertex: pos, uv, packed
+// colour) into an offscreen texture. Two uses:
+// 1. wgpu backdrop re-render: the maths mirror egui-wgpu 0.36's `egui.wgsl`
+//    (vertex colour * texture sample, premultiplied gamma, optional dithering)
+//    so the capture holds what egui itself writes to the screen. Two fragment
+//    entries, like egui-wgpu: `fs_main` (gamma framebuffer path: the capture is
+//    written as-is) and `fs_main_linear` (linear framebuffer path: rendered
+//    through an sRGB view of the capture, so blending happens in linear exactly
+//    as on a `*Srgb` screen).
+// 2. Shape-mask coverage (F9, every backend): `vs_main` + `fs_main` without
+//    dithering into an RGBA8 coverage texture; the alpha is the coverage. glow
+//    runs this same module translated by naga's GLSL writer (`glow_backend/
+//    coverage.rs`), so it must stay translatable (one sampler per texture, a
+//    `u32` colour attribute unpacked by hand).
+// Differences from egui-wgpu: vertex positions are mapped into the target
+// viewport (`pos * pixels_per_point - origin_px`, where `pixels_per_point` may
+// include a layer transform's scale) instead of the whole screen, the dithering
+// noise is evaluated at the fragment's SCREEN position, and egui-wgpu's
+// `predictable_texture_filtering` is not mirrored (hardware filtering only).
 
 struct MeshLocals {
     pixels_per_point: f32,
     // 1 = dither like egui-wgpu with `dithering: true`, 0 = off.
     dithering: u32,
-    // Top-left of the capture viewport, in screen pixels.
+    // Subtracted from `pos * pixels_per_point`: the target's top-left corner (the
+    // capture's screen position for the re-render).
     origin_px: vec2<f32>,
-    // Size of the capture viewport, in pixels.
+    // Size of the target viewport, in pixels.
     size_px: vec2<f32>,
     reserved: vec2<f32>,
 };

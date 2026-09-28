@@ -16,6 +16,7 @@ Key items:
   `reset_state()`, `state_count()`, `failed_states()` (`Effect::new_state`, `FilterLayer::id`)
 - `offline` module and its re-exports (`OfflineRenderer`, ...; features `image` / `video`)
 - `HotEffect`, `rebind` (+ options, events, errors; feature `hot-reload`, native only)
+- shape masks (F9): `Mask`, `MaskError` (`FilterLayer::mask`, `OfflineOptions::with_mask`)
 
 Notes:
 Backends plug in behind the crate-internal `backend::Backend` trait; nothing outside a backend
@@ -244,6 +245,21 @@ module names a backend type.
 //! / `src_texel()` (input pixels) or `out_texel()`. [`presets::kawase_blur`] and
 //! [`presets::bloom`] are built from such passes. Offline, a scaled chain refuses tiling.
 //!
+//! **Masks.** A layer filters its whole rect, or a rounded rect ([`FilterLayer::corner_radius`]),
+//! or any egui shape: [`FilterLayer::mask`] with [`Mask::Shape`] — paths, circles, rects,
+//! meshes, text galleys (UI only), in the layer's points (so it follows layer transforms). The
+//! shape's alpha is the coverage (paint it opaque for a full-strength filter; egui's feathered edge
+//! anti-aliases it); outside it the backdrop stays untouched. It is tessellated when the layer is
+//! painted and rasterized into a coverage texture at capture resolution.
+//!
+//! ```no_run
+//! # fn frame(ui: &mut egui::Ui, rect: egui::Rect) {
+//! use egui_filter_layers::{FilterLayer, Mask, presets};
+//! let lens = egui::Shape::circle_filled(rect.center(), 60.0, egui::Color32::WHITE);
+//! FilterLayer::new(rect, presets::gaussian_blur(8.0)).mask(Mask::Shape(lens)).paint(ui.painter());
+//! # }
+//! ```
+//!
 //! **Distances are in layer points.** Sample radii, corner radii and every effect distance
 //! converted with `fl.pixels_per_point` are measured in the points of the layer the filter is
 //! painted in. Inside a transformed layer (an `egui::Scene`, `Context::set_transform_layer`) they
@@ -305,6 +321,7 @@ mod effect;
 mod geometry;
 mod impulses;
 mod layer;
+mod mask;
 mod pass;
 mod plan;
 pub mod presets;
@@ -329,6 +346,7 @@ pub use backend::{BackendKind, BackendStatus, EffectFailure, InstallError, Textu
 pub use effect::{Effect, EffectError, ParamError, ParamInfo, ParamType, ParamValue, SnippetLocation, TEXTURE_SLOTS};
 pub use impulses::{IMPULSE_COUNT_PARAM, IMPULSE_SLOTS, IMPULSES_PARAM, Impulse, ImpulsePack, Impulses};
 pub use layer::FilterLayer;
+pub use mask::{Mask, MaskError};
 pub use pass::{FilterChain, MIN_PASS_SCALE, PARAM_SLOTS, ParamIndexError, Params, Pass};
 pub use state::{StateError, StateFailure, StateFormat, StateOptions, failed_states, reset_state, state_count};
 

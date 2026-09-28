@@ -12,6 +12,7 @@ Key structures:
 Key functions:
 - `glsl_target()`: picks the dialect for a GL version, or explains why the context is unsupported.
 - `translate()`: naga `glsl-out` for both entry points + reflection lookup.
+- `translate_mesh()`: the shape-mask coverage rasterizer's program (`shaders/mesh.wgsl`, F9).
 
 Notes:
 Writer flags are EMPTY on purpose: `ADJUST_COORDINATE_SPACE` (naga's default) would flip clip-space
@@ -135,13 +136,14 @@ fn texture_unit(texture: (u32, u32), sampler: Option<(u32, u32)>) -> Option<u32>
     }
 }
 
-/// Translates one entry point, returning the source and naga's reflection.
-fn write_stage(compiled: &CompiledModule, target: GlslTarget, stage: naga::ShaderStage, entry: &str) -> Result<(String, glsl::ReflectionInfo), TranslateError> {
+/// Translates one entry point of `module` (validated as `info`), returning the source and naga's
+/// reflection.
+fn write_stage(module: &naga::Module, info: &naga::valid::ModuleInfo, target: GlslTarget, stage: naga::ShaderStage, entry: &str) -> Result<(String, glsl::ReflectionInfo), TranslateError> {
     let stage_name = if stage == naga::ShaderStage::Vertex { "vertex" } else { "fragment" };
     let options = glsl::Options { version: target.naga_version(), writer_flags: glsl::WriterFlags::empty(), ..glsl::Options::default() };
     let pipeline = glsl::PipelineOptions { shader_stage: stage, entry_point: entry.to_owned(), multiview: None };
     let mut source = String::new();
-    let reflection = glsl::Writer::new(&mut source, &compiled.module, &compiled.info, &options, &pipeline, naga::proc::BoundsCheckPolicies::default())
+    let reflection = glsl::Writer::new(&mut source, module, info, &options, &pipeline, naga::proc::BoundsCheckPolicies::default())
         .and_then(|mut writer| writer.write())
         .map_err(|error| TranslateError { stage: stage_name, message: error.to_string() })?;
     Ok((source, reflection))
@@ -153,8 +155,8 @@ fn write_stage(compiled: &CompiledModule, target: GlslTarget, stage: naga::Shade
 /// [`TranslateError`] when naga's GLSL back end rejects the module (e.g. a construct the target
 /// dialect cannot express) or when a sampler maps to an unknown binding.
 pub(crate) fn translate(compiled: &CompiledModule, target: GlslTarget) -> Result<GlslProgram, TranslateError> {
-    let (vertex, _) = write_stage(compiled, target, naga::ShaderStage::Vertex, VERTEX_ENTRY)?;
-    let (fragment, reflection) = write_stage(compiled, target, naga::ShaderStage::Fragment, FRAGMENT_ENTRY)?;
+    let (vertex, _) = write_stage(&compiled.module, &compiled.info, target, naga::ShaderStage::Vertex, VERTEX_ENTRY)?;
+    let (fragment, reflection) = write_stage(&compiled.module, &compiled.info, target, naga::ShaderStage::Fragment, FRAGMENT_ENTRY)?;
 
     let binding_of = |handle: naga::Handle<naga::GlobalVariable>| compiled.module.global_variables[handle].binding.as_ref().map(|b| (b.group, b.binding));
 
@@ -169,6 +171,40 @@ pub(crate) fn translate(compiled: &CompiledModule, target: GlslTarget) -> Result
     }
     samplers.sort_by_key(|(_, unit)| *unit);
     Ok(GlslProgram { vertex, fragment, uniform_block, params_block, samplers })
+}
+
+/// The mesh program (`shaders/mesh.wgsl`, `vs_main` + `fs_main`) that rasterizes shape-mask
+/// coverage (F9), translated like an effect.
+#[derive(Clone, Debug)]
+pub(crate) struct MeshProgram {
+    /// Vertex shader source (attributes at locations 0 = pos, 1 = uv, 2 = packed colour `uint`).
+    pub vertex: String,
+    /// Fragment shader source.
+    pub fragment: String,
+    /// The `MeshLocals` uniform block's name in each stage that uses it (naga names blocks per
+    /// stage); every one is bound to the same binding point.
+    pub locals_blocks: Vec<String>,
+    /// `(sampler uniform name, texture unit)`: the mesh texture on unit 0.
+    pub samplers: Vec<(String, u32)>,
+}
+
+/// Translates `shaders/mesh.wgsl` (the vertex stage and the gamma fragment entry `fs_main`) to
+/// `target` GLSL: the coverage rasterizer's program on glow. The module is parsed and validated
+/// here (once per `Resources` creation).
+///
+/// # Errors
+/// [`TranslateError`] when the crate's mesh shader does not parse, validate or translate (a
+/// crate bug, pinned by `the_mesh_shader_translates_for_every_target`).
+pub(crate) fn translate_mesh(target: GlslTarget) -> Result<MeshProgram, TranslateError> {
+    let source = crate::mask::MESH_WGSL;
+    let module = naga::front::wgsl::parse_str(source).map_err(|error| TranslateError { stage: "vertex", message: error.emit_to_string(source) })?;
+    let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty()).validate(&module).map_err(|error| TranslateError { stage: "vertex", message: error.to_string() })?;
+    let (vertex, vertex_reflection) = write_stage(&module, &info, target, naga::ShaderStage::Vertex, "vs_main")?;
+    let (fragment, fragment_reflection) = write_stage(&module, &info, target, naga::ShaderStage::Fragment, "fs_main")?;
+    let locals_blocks = vertex_reflection.uniforms.values().chain(fragment_reflection.uniforms.values()).cloned().collect();
+    // The mesh module has exactly one texture (group 1, binding 0) read through one sampler.
+    let samplers = fragment_reflection.texture_mapping.keys().map(|name| (name.clone(), 0)).collect();
+    Ok(MeshProgram { vertex, fragment, locals_blocks, samplers })
 }
 
 #[cfg(test)]
@@ -213,12 +249,14 @@ mod tests {
         }
     }
 
+    /// Units 0 (the last pass output), 1 (the original) and 3 (the shape-mask coverage, F9; the
+    /// white dummy for a rounded rect).
     #[test]
-    fn the_composite_pass_translates_with_two_texture_units() {
+    fn the_composite_pass_translates_with_three_texture_units() {
         let Ok(composite) = composite_module() else { panic!("composite must validate") };
         for target in TARGETS {
             match translate(&composite, target) {
-                Ok(program) => check_program("composite", &program, target, &[0, 1]),
+                Ok(program) => check_program("composite", &program, target, &[0, 1, 3]),
                 Err(error) => panic!("composite {target:?}: {error}"),
             }
         }
@@ -330,6 +368,26 @@ mod tests {
         let snippet = "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) + textureSampleLevel(fl_src_texture, fl_user0_sampler, uv, 0.0); }";
         let Ok(effect) = Effect::new("mixed", snippet) else { panic!("must validate") };
         assert!(translate(effect.module(), GlslTarget::Desktop330).is_err_and(|error| error.message.contains("multiple samplers")));
+    }
+
+    /// F9 (roadmap risk 3): naga's GLSL writer translates the mesh shader for every dialect —
+    /// three vertex attributes with explicit locations (the `u32` colour as an integer
+    /// attribute), one uniform block per stage, one combined sampler.
+    #[test]
+    fn the_mesh_shader_translates_for_every_target() {
+        for target in TARGETS {
+            let program = translate_mesh(target);
+            let Ok(program) = program else { panic!("{target:?}: {program:?}") };
+            for location in 0..3 {
+                assert!(program.vertex.contains(&format!("layout(location = {location}) in")), "{target:?}: attribute {location}\n{}", program.vertex);
+            }
+            assert!(program.vertex.contains(") in uint "), "{target:?}: the colour is an integer attribute\n{}", program.vertex);
+            assert!(!program.vertex.contains("gl_Position.yz"), "coordinate-space adjustment must be off");
+            assert_eq!(program.locals_blocks.len(), 2, "{target:?}: {:?}", program.locals_blocks);
+            assert!(program.locals_blocks.iter().all(|block| program.vertex.contains(block.as_str()) || program.fragment.contains(block.as_str())));
+            assert_eq!(program.samplers.len(), 1, "{target:?}: {:?}", program.samplers);
+            assert!(program.fragment.contains(program.samplers[0].0.as_str()));
+        }
     }
 
     #[test]

@@ -25,6 +25,8 @@
 //!   `reset_state` starts over, a new frame size continues the state, a stateful chain refuses
 //!   tiling (`NotTileable`); the `wave_sim` preset spreads a centred impulse symmetrically and its
 //!   energy stays bounded over many frames.
+//! * Shape masks (F9): a star mask matches the UI (exact where coverage is 0 or 1, within one step
+//!   on the AA edge), tiled equals whole; text masks and textured meshes are refused.
 //! * The GPU tests of this file share one device (`GPU`, a test-only static; see there) and run
 //!   in parallel on it.
 //!
@@ -923,4 +925,105 @@ fn trails_fade_by_their_decay_per_second() {
     for (row, want) in red_at.iter().zip(expected) {
         assert!(row.iter().zip(want).all(|(value, want)| value.abs_diff(want) <= 1), "{red_at:?}");
     }
+}
+
+// ---- F9: shape masks ----
+
+/// A five-pointed star centred at `center` (points), tips at `outer`, notches at `inner`, as
+/// convex pieces (egui fills convex paths only): the inner pentagon and one triangle per tip.
+fn star(center: Pos2, outer: f32, inner: f32) -> egui::Shape {
+    let at = |radius: f32, degrees: f32| center + radius * vec2(degrees.to_radians().cos(), degrees.to_radians().sin());
+    let notch = |k: u8| at(inner, -54.0 + 72.0 * f32::from(k));
+    let mut pieces = vec![egui::Shape::convex_polygon((0..5).map(notch).collect(), Color32::WHITE, egui::Stroke::NONE)];
+    for k in 0..5_u8 {
+        let tip = at(outer, -90.0 + 72.0 * f32::from(k));
+        pieces.push(egui::Shape::convex_polygon(vec![notch((k + 4) % 5), tip, notch(k)], Color32::WHITE, egui::Stroke::NONE));
+    }
+    egui::Shape::Vec(pieces)
+}
+
+/// The star mask of the equivalence test in frame points at `ppp`: centred, 56 / 22 PIXELS.
+fn frame_star(ppp: f32) -> egui::Shape {
+    star(pos2(px(WIDTH) / 2.0 / ppp, px(HEIGHT) / 2.0 / ppp), 56.0 / ppp, 22.0 / ppp)
+}
+
+impl Ui {
+    /// The image under a layer covering it masked by `mask` (F9), as egui-wgpu draws it; the
+    /// second frame's pixels.
+    fn render_masked(&self, chain: &FilterChain, mask: &egui_filter_layers::Mask) -> Vec<u8> {
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(px(WIDTH) / self.ppp, px(HEIGHT) / self.ppp));
+        let mut pixels = Vec::new();
+        for _ in 0..2 {
+            let viewports = std::iter::once((ViewportId::ROOT, ViewportInfo { native_pixels_per_point: Some(self.ppp), ..Default::default() })).collect();
+            let input = egui::RawInput { screen_rect: Some(rect), time: Some(f64::from(TIME)), viewports, ..Default::default() };
+            let mut output = self.ctx.run_ui(input, |ui| {
+                let painter = ui.painter();
+                painter.image(self.texture.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                FilterLayer::new(rect, chain.clone()).mask(mask.clone()).paint(painter);
+            });
+            let mut textures_delta = std::mem::take(&mut output.textures_delta);
+            let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
+            pixels = self.draw(&primitives, &mut textures_delta);
+            textures_delta.clear();
+        }
+        assert!(matches!(egui_filter_layers::status(&self.ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&self.ctx));
+        pixels
+    }
+}
+
+/// F9: a star path mask offline equals the UI — exactly wherever the coverage is 0 or 1 (the
+/// same tessellation and the same rasterizer: `wgpu_backend/coverage.rs`), within one step on the
+/// anti-aliased edge (the UI blends the composite over the screen, offline mixes in the shader);
+/// outside the star the frame is untouched. The same run tiled equals the whole run within one
+/// step on the edge (each tile rasterizes its own window). Text masks (no font atlas offline),
+/// textured meshes and paint callbacks are refused with typed errors before any GPU work.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn a_path_mask_offline_equals_the_ui_and_text_masks_are_refused() {
+    let image = test_image(WIDTH, HEIGHT, |_, _| 255);
+    let chain = FilterChain::from(presets::invert(1.0)).then(presets::gaussian_blur(1.5));
+    for ppp in [1.0, 2.0] {
+        let ui = Ui::new(wgpu::TextureFormat::Rgba8Unorm, false, ppp, &image);
+        let mut offline = OfflineRenderer::from_render_state(&ui.state).unwrap_or_else(|error| panic!("{error}"));
+        let mask = egui_filter_layers::Mask::Shape(frame_star(ppp));
+        let expected = ui.render_masked(&chain, &mask);
+        let options = OfflineOptions::default().with_pixels_per_point(ppp).with_time(TIME).with_mask(mask.clone()).with_output_alpha(AlphaMode::Premultiplied);
+        let result = offline.process(&FrameRef::new(&image, WIDTH, HEIGHT, AlphaMode::Straight), &chain, &options).unwrap_or_else(|error| panic!("{error}"));
+        let (count, max, first) = compare(&expected, result.pixels(), WIDTH, true);
+        eprintln!("star mask, ppp {ppp}: {count} differing values, max diff {max}, first at {first:?}");
+        assert!(max <= 1, "ppp {ppp}: max diff {max} ({count} values, first at {first:?})");
+        // The anti-aliased outline is a few hundred pixels at most; everything else is exact.
+        assert!(count < 600, "ppp {ppp}: {count} values differ");
+        let at = |pixels: &[u8], x: u32, y: u32| {
+            let i = usize::try_from((y * WIDTH + x) * 4).unwrap_or(0);
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        // Centre: filtered (inverted); a corner: the image itself.
+        let (centre, corner) = ((WIDTH / 2, HEIGHT / 2), (3, 3));
+        assert_ne!(at(result.pixels(), centre.0, centre.1), at(&image, centre.0, centre.1), "ppp {ppp}: the star's centre is filtered");
+        assert_eq!(at(result.pixels(), corner.0, corner.1), at(&image, corner.0, corner.1), "ppp {ppp}: outside the star the frame is kept");
+
+        let tiled = offline.process(&FrameRef::new(&image, WIDTH, HEIGHT, AlphaMode::Straight), &chain, &options.clone().with_max_tile_size(Some(64))).unwrap_or_else(|error| panic!("tiled: {error}"));
+        let (count, max, first) = compare(result.pixels(), tiled.pixels(), WIDTH, false);
+        eprintln!("star mask tiled vs whole, ppp {ppp}: {count} differing values, max diff {max}, first at {first:?}");
+        assert!(max <= 1 && count < 200, "ppp {ppp}: tiled vs whole: {count} values, max {max}, first at {first:?}");
+    }
+
+    // Refusals: typed, before any GPU work.
+    let (_instance, adapter, device, queue) = gpu();
+    let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
+    let frame = FrameRef::new(&image, WIDTH, HEIGHT, AlphaMode::Straight);
+    let layout = egui::Context::default();
+    let mut galley = None;
+    let mut output = layout.run_ui(egui::RawInput::default(), |ui| galley = Some(ui.painter().layout_no_wrap("MASK".to_owned(), egui::FontId::monospace(32.0), Color32::WHITE)));
+    // The font atlas upload is irrelevant here; epaint asserts deltas are handled.
+    output.textures_delta.clear();
+    let Some(galley) = galley else { panic!("the layout pass ran") };
+    let text = egui_filter_layers::Mask::Shape(egui::Shape::galley(pos2(10.0, 10.0), galley, Color32::WHITE));
+    let refused = offline.process(&frame, &FilterChain::from(presets::invert(1.0)), &OfflineOptions::default().with_mask(text));
+    assert!(matches!(refused, Err(egui_filter_layers::OfflineError::Mask(egui_filter_layers::MaskError::Text))), "{:?}", refused.map(|frame| frame.width()));
+    let mut textured = egui::Mesh::with_texture(egui::TextureId::User(1));
+    textured.add_rect_with_uv(Rect::from_min_max(pos2(0.0, 0.0), pos2(20.0, 20.0)), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    let refused = offline.process(&frame, &FilterChain::from(presets::invert(1.0)), &OfflineOptions::default().with_mask(egui_filter_layers::Mask::Shape(egui::Shape::mesh(textured))));
+    assert!(matches!(refused, Err(egui_filter_layers::OfflineError::Mask(egui_filter_layers::MaskError::TexturedMesh { .. }))), "{:?}", refused.map(|frame| frame.width()));
 }

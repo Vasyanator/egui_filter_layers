@@ -491,6 +491,7 @@ Each phase is marked done here in the same commit that lands it.
 - Phase 6 (F5 hot reload, feature `hot-reload`, `src/hot.rs`: `HotEffect::watch` / `watch_with` + `HotOptions` (interval, repaint `Context`, set-up closure), `poll` -> `HotReloadEvent`, `current` / `error` / `status_text`, `HotReloadError` (missing / io / compile with diagnostic / spawn / stopped), free fn `rebind(&Pass, &Effect) -> Rebound`; not compiled on wasm32): done.
 - Phase 3c (F8 user textures: `FilterLayer::texture(slot, TextureId)` / `texture_at` / `check_textures`, `TEXTURE_SLOTS` = 3; prelude `tex(i, uv)` (the texture's own sampler = its egui `TextureOptions`), `tex_size(i)`, `tex_load(i, px)` (`textureLoad`); `fl_user0..2` + samplers at `@group(1..=3)` = egui-wgpu's texture layout; binding 7 (`fl_nearest_sampler`) removed; `Effect::reads_texture` from an IR scan (constant slot = that slot, computed = all); `plan::check_textures` refuses a layer / offline run reading an unattached slot (`TextureError`, logged once per context in the UI); `plan::Bindings::user`; wgpu binds egui's own bind group per slot (kept copies for full uploads not yet applied), dummy groups elsewhere, composites group 0 only; glow units 4..6 from `Painter::texture`; unresolvable ids skip the layer and are reported by `failed_textures()` (`TextureFailure`, latched per id); offline `OfflineTexture` (`new` / `from_color_image`) + `OfflineOptions::with_texture`, uploaded once per texture identity, `OfflineError::Texture` / `TextureTooLarge`; glow params UBO grow-only + `glBufferSubData`; GPU tests wgpu + glow + offline (UI == offline bit for bit, tiled == whole), glow scenes for `original()` in later passes and `fl.pointer` / `delta_time` / `frame`): done.
 - Phase 4 (F7 persistent state: `Effect::new_state` / `is_state`; `FilterLayer::id` (required, `StateError::MissingId` via `check_state`) / `state(StateOptions)`; `StateFormat` RGBA16F (renderable + filterable or refused: `failed_states` / `StateFailure`, offline `OfflineError::State`) / opt-in RGBA8; `reset_state(ctx, id)`, `state_count(ctx)`; `src/state.rs` (`StateRegistry`: per `(ViewportId, Id)`, one step per frame, eviction after > 120 frames AND > 2 s); `plan.rs` state steps (`StepKind`, `Slot::StateA/B`, `StatePlanInput` / `StatePlan`: clear, sizes, final slot); prelude `state` / `state_load` / `state_px` / `state_size` / `state_texel`, `fl.pass_index` documented; `FlUniforms` 448 B; wgpu `WgpuResources::states` + `Target::ensure_kept` + pipelines keyed by format; glow `GlowState::states` + `RenderTarget::ensure_kept`; offline state carried across runs, `reset_state`, `with_state`, `NotTileable`; `VideoProcessor::reset_state`, per-stream reset; `HotOptions::with_state`; presets `trails`, `wave_sim` + `wave_display` + `WaveObstacle`; GPU tests wgpu (Vulkan + GL) / glow / offline / video): done.
+- Phase 5 (F9 shape masks: public `Mask` (`RoundedRect` default / `Shape`), `MaskError`, `FilterLayer::mask` / `layer_mask` / `check_mask` (`corner_radius` = shorthand), `OfflineOptions::with_mask`, `OfflineError::Mask`; `src/mask.rs` (`tessellate`, `JobMask`, `CoverageMeshes::pack` -> `PackedCoverage`); `LayerJob::mask`; `geometry::mask_transform` (layer points -> capture pixels through the layer transform); `plan.rs` `Slot::Coverage`, `CoverageStep`, `ChainPlan::with_coverage`, `COVERAGE_MASK_FLAG` (`params[3].x`), `mesh_locals` / `coverage_locals`, `Allocations::coverage`; `composite.wgsl` `fl_coverage` selects SDF / coverage alpha (snap kept); `mesh.wgsl` moved to `src/shaders/`; wgpu `coverage.rs` (shared mesh pipeline, rasterizer used by `chain::record`, UI and offline); glow `coverage.rs` + `glsl::translate_mesh` (naga translation, no hand-written GLSL); GPU tests wgpu (Vulkan + GL) / glow (incl. 4x MSAA) / offline (UI equivalence, tiled == whole, refusals)): done.
 
 ## 18. Findings during execution
 - Phase 1: naga's GLSL writer rejects one texture read through two samplers in one module
@@ -646,3 +647,29 @@ Each phase is marked done here in the same commit that lands it.
   per paint; `trails(decay)` takes the fraction kept per SECOND (`pow(decay, fl.delta_time)`), so
   it is frame-rate independent. Neither preset is animated by itself (documented: repaint while
   moving). `HotEffect::watch_state` became `HotOptions::with_state(true)`.
+- Phase 5 (F9): roadmap risk 3 did not materialise: naga's GLSL writer translates `mesh.wgsl`
+  (`vs_main` + `fs_main`) for GLSL 330, ES 300 and WebGL2 with explicit attribute locations and the
+  `u32` colour as an integer attribute (`glVertexAttribIPointer`); pinned by
+  `the_mesh_shader_translates_for_every_target`, no hand-written fallback. naga names the
+  `MeshLocals` block PER STAGE, so both names are bound to the binding point.
+- Phase 5: deviations from §9. Tessellation is `mask::tessellate` (an `epaint::Tessellator` with the
+  context's pixels per point, tessellation options and font atlas size) instead of `ctx.tessellate`:
+  the latter uses egui's pre-rasterized discs, so small circles would sample the font atlas and the
+  UI would differ from the offline tessellation; without them only text samples the atlas and UI and
+  offline tessellate identical meshes. The coverage texture holds the run's WINDOW at its origin
+  (like the source) instead of the whole capture, so offline tiles rasterize their own window
+  (tiled == whole, tested) and a huge frame never needs a whole-frame coverage texture. Only the
+  composite binds the coverage; effects get no `mask(uv)` helper in 0.2 (for a rounded rect it would
+  read the white dummy = 1, a silent wrong answer; left out rather than faked). The coverage is the
+  shape's alpha, so a translucent fill filters partially (documented feature).
+- Phase 5: egui fills CONVEX paths only; a concave outline (the star of the tests) must be built
+  from convex pieces or a mesh. Adjacent pieces' feathered edges overlap into faint interior seams
+  (union of two ~0.5 coverages = 0.75); documented in the README, not worked around.
+- Phase 5: mask texture failures. glow: an id `Painter::texture` does not know skips the layer and is
+  reported by `failed_textures`. wgpu: the same for user texture ids; a font atlas the plugin cannot
+  resolve yet (size mismatch with the CPU atlas) only skips that frame (it cannot be permanent).
+  Paint callbacks in a mask are refused on every path (`MaskError::Callback`, logged once per
+  context and message; offline `OfflineError::Mask`), offline also text and textured meshes.
+- Phase 5: equivalence measured: a star mask over invert + blur, UI vs offline: exact where the
+  coverage is 0 or 1, max 1 step on the anti-aliased outline (~450 values at 1 and 2 ppp); tiled vs
+  whole offline: bit-identical.

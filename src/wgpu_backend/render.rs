@@ -22,7 +22,10 @@ Stateful layers (F7): the layer's state entry (`WgpuResources::states`, keyed by
 outside the per-frame pool) is looked up before recording and updated after it; a state format
 the device cannot render / filter skips the layer (`Shared::fail_state`). Unpainted states are
 evicted at every prepare (`StateRegistry::evict`).
-The composite BLENDS over egui's pass (`chain::draw_composite_over`): pixels outside the rounded
+A shape mask (F9) is packed here and handed to the chain executor with its layer-points ->
+capture-pixels transform (`geometry::mask_transform`) and the texture groups the plugin resolved;
+the executor rasterizes it into the run's coverage texture.
+The composite BLENDS over egui's pass (`chain::draw_composite_over`): pixels outside the
 mask keep what the pass holds, since the re-rendered backdrop lacks paint callbacks and lower
 filter layers. On `*Srgb` targets the meshes are rendered through an sRGB view of the capture
 (`WgpuResources::srgb_capture`) so they blend in linear like egui's own draws.
@@ -33,13 +36,15 @@ use std::sync::Arc;
 use egui::epaint::{ClippedPrimitive, Primitive};
 use egui_wgpu::{CallbackResources, ScreenDescriptor};
 
+use super::coverage::CoverageJob;
 use super::chain::{ChainJob, ChainRecording, ChainSource, ChainState, ChainWindow, draw_composite_over};
 use super::gpu::{Target, begin_pass};
-use super::resources::{CAPTURE_FORMAT, CAPTURE_SRGB_VIEW_FORMAT, MESH_LOCALS_SIZE, WgpuResources};
+use super::resources::{CAPTURE_FORMAT, CAPTURE_SRGB_VIEW_FORMAT, WgpuResources};
 use super::{BeneathPlan, Drawn, LayerSlot, LoggedOnce, Shared};
 use crate::backend::LayerJob;
-use crate::geometry::{LayerGeometry, PxRect, layer_geometry, px_f32, transform_scale};
-use crate::plan::StatePlanInput;
+use crate::geometry::{LayerGeometry, PxRect, layer_geometry, mask_transform, px_f32, transform_scale};
+use crate::mask::CoverageMeshes;
+use crate::plan::{MESH_LOCALS_SIZE, StatePlanInput, mesh_locals};
 use crate::state::StateKey;
 
 /// One painted filter layer, as egui-wgpu sees it.
@@ -59,23 +64,11 @@ impl FilterCallback {
     }
 }
 
-/// Serializes `MeshLocals` (see `mesh.wgsl`): pixels per point, dithering flag, capture origin
-/// and size in pixels.
+/// The backdrop re-render's `MeshLocals` (`shaders/mesh.wgsl`, packed by `plan::mesh_locals`):
+/// screen points -> capture pixels (`pos * pixels_per_point - capture.xy`) over the capture.
 #[must_use]
-pub(super) fn mesh_locals(pixels_per_point: f32, dithering: bool, capture: PxRect) -> [u8; MESH_LOCALS_SIZE] {
-    let mut bytes = [0_u8; MESH_LOCALS_SIZE];
-    let fields: [[u8; 4]; 6] = [
-        pixels_per_point.to_ne_bytes(),
-        u32::from(dithering).to_ne_bytes(),
-        px_f32(capture.x).to_ne_bytes(),
-        px_f32(capture.y).to_ne_bytes(),
-        px_f32(capture.w).to_ne_bytes(),
-        px_f32(capture.h).to_ne_bytes(),
-    ];
-    for (chunk, field) in bytes.chunks_exact_mut(4).zip(fields) {
-        chunk.copy_from_slice(&field);
-    }
-    bytes
+pub(super) fn backdrop_locals(pixels_per_point: f32, dithering: bool, capture: PxRect) -> [u8; MESH_LOCALS_SIZE] {
+    mesh_locals(pixels_per_point, dithering, [px_f32(capture.x), px_f32(capture.y)], [px_f32(capture.w), px_f32(capture.h)])
 }
 
 /// The scissor of a primitive clipped by `clip_rect` (points), in capture-texture pixels, or
@@ -244,7 +237,7 @@ impl egui_wgpu::CallbackTrait for FilterCallback {
         let Some(pipelines) = self.pipelines(device, resources) else {
             return Vec::new();
         };
-        let Some(geometry) = layer_geometry(plan.callback_rect, plan.clip_rect, screen.pixels_per_point, screen.size_in_pixels, self.job.padding_points, self.job.corner_radius, plan.transform_scale) else {
+        let Some(geometry) = layer_geometry(plan.callback_rect, plan.clip_rect, screen.pixels_per_point, screen.size_in_pixels, self.job.padding_points, self.job.mask.corner_radius(), plan.transform_scale) else {
             return Vec::new();
         };
         let mut recording = Recording { device, queue, encoder, geometry, pixels_per_point: screen.pixels_per_point, screen: screen.size_in_pixels };
@@ -279,7 +272,7 @@ impl egui_wgpu::CallbackTrait for FilterCallback {
         // egui-wgpu reports the same rect / clip the plugin planned with; a mismatch would mean
         // the composite lands somewhere else than what was captured, so it is skipped instead.
         let transform_scale = transform_scale(self.job.rect, info.viewport);
-        let region = layer_geometry(info.viewport, info.clip_rect, info.pixels_per_point, info.screen_size_px, self.job.padding_points, self.job.corner_radius, transform_scale).map(|geometry| geometry.region);
+        let region = layer_geometry(info.viewport, info.clip_rect, info.pixels_per_point, info.screen_size_px, self.job.padding_points, self.job.mask.corner_radius(), transform_scale).map(|geometry| geometry.region);
         if region != Some(drawn.region) {
             log::debug!("egui_filter_layers (wgpu): paint region {region:?} differs from the prepared {:?}; layer skipped this frame", drawn.region);
             return;
@@ -301,7 +294,7 @@ impl FilterCallback {
         let render_view_format = resources.srgb_capture.then_some(CAPTURE_SRGB_VIEW_FORMAT);
         let capture_target = Target::ensure(&mut targets.capture, rec.device, CAPTURE_FORMAT, render_view_format, "egui_filter_layers capture", size);
 
-        let locals_buffer = targets.mesh_locals.write(rec.device, rec.queue, &mesh_locals(rec.pixels_per_point, self.shared.options.dithering(), capture));
+        let locals_buffer = targets.mesh_locals.write(rec.device, rec.queue, &backdrop_locals(rec.pixels_per_point, self.shared.options.dithering(), capture));
         let locals = rec.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("egui_filter_layers mesh locals"),
             layout: &resources.mesh_locals_layout,
@@ -321,6 +314,19 @@ impl FilterCallback {
         // once no recorded command uses them).
         let mut state = state_key.map(|key| resources.states.begin(key, format, frame, time, self.job.reset_state, || [None, None]));
         let state_input = state.as_ref().map(|(_, run, _)| StatePlanInput { scale: self.job.state.scale(), current: run.current, previous_px: run.previous, step: run.step });
+        // A shape mask (F9): its meshes in layer points, mapped through the layer transform the
+        // callback rect reveals; every texture they sample was resolved by the plugin.
+        let packed = self.job.mask.coverage().map(CoverageMeshes::pack);
+        let coverage = match &packed {
+            Some(packed) => {
+                let textures: Option<Vec<&wgpu::BindGroup>> = packed.draws.iter().map(|draw| plan.textures.get(&draw.texture)).collect();
+                let Some(textures) = textures else {
+                    return;
+                };
+                Some(CoverageJob { packed, transform: mask_transform(self.job.rect, plan.callback_rect, rec.pixels_per_point, capture), textures })
+            }
+            None => None,
+        };
         let job = ChainJob {
             source: ChainSource { view: &capture_target.view, allocated: capture_target.size },
             geometry: rec.geometry,
@@ -333,6 +339,7 @@ impl FilterCallback {
             pipelines,
             user_textures: plan.user_textures.each_ref().map(Option::as_ref),
             state: state_input,
+            coverage,
         };
         let recorded = {
             let mut chain_state = state.as_mut().map(|(entry, _, _)| ChainState { targets: &mut entry.targets, format });
@@ -438,7 +445,7 @@ mod tests {
 
     #[test]
     fn mesh_locals_follow_the_wgsl_layout() {
-        let bytes = mesh_locals(1.5, true, CAPTURE);
+        let bytes = backdrop_locals(1.5, true, CAPTURE);
         let read = |offset: usize| f32::from_ne_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
         assert!((read(0) - 1.5).abs() < f32::EPSILON);
         assert_eq!(u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 1);

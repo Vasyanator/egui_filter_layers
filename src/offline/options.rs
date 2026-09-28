@@ -7,8 +7,8 @@ shows its effects.
 
 Key structures:
 - `OfflineOptions` (public): pixels per point, time, per-frame input (`delta_time`, `frame`,
-  pointer), background, corner radius, output alpha, tile size limit, user textures (F8),
-  persistent state options (F7).
+  pointer), background, mask (corner radius or a shape, F9), output alpha, tile size limit, user
+  textures (F8), persistent state options (F7).
 - `PointerState` (public): pointer position in frame uv + pressed.
 
 Key functions:
@@ -22,6 +22,8 @@ its own frame times / index, and an explicit value wins.
 */
 
 use egui::{Color32, CornerRadius, pos2};
+
+use crate::mask::Mask;
 
 use super::{AlphaMode, DEFAULT_MAX_TILE_SIZE, OfflineError, OfflineTexture};
 use crate::backend::TextureError;
@@ -39,8 +41,8 @@ pub struct OfflineOptions {
     pub(super) time: f32,
     /// Colour the frame is drawn over before filtering; `None` = transparent.
     pub(super) background: Option<Color32>,
-    /// Rounded mask of the layer (the frame's corners), in layer points.
-    pub(super) corner_radius: CornerRadius,
+    /// The layer's mask (rounded rect by default; a shape in layer points, F9).
+    pub(super) mask: Mask,
     /// Alpha convention of the result.
     pub(super) output_alpha: AlphaMode,
     /// Largest texture side used; `None` = the device limit (see [`DEFAULT_MAX_TILE_SIZE`]).
@@ -76,7 +78,7 @@ impl Default for OfflineOptions {
             pixels_per_point: 1.0,
             time: 0.0,
             background: None,
-            corner_radius: CornerRadius::ZERO,
+            mask: Mask::default(),
             output_alpha: AlphaMode::Straight,
             max_tile_size: Some(DEFAULT_MAX_TILE_SIZE),
             delta_time: None,
@@ -192,10 +194,22 @@ impl OfflineOptions {
     }
 
     /// Rounds the layer's corners (layer points), like [`FilterLayer::corner_radius`](crate::FilterLayer::corner_radius):
-    /// outside the mask the unfiltered frame is kept.
+    /// outside the mask the unfiltered frame is kept. Shorthand for
+    /// `with_mask(Mask::RoundedRect(radius))`, replacing any earlier mask.
     #[must_use]
     pub fn with_corner_radius(mut self, radius: impl Into<CornerRadius>) -> Self {
-        self.corner_radius = radius.into();
+        self.mask = Mask::RoundedRect(radius.into());
+        self
+    }
+
+    /// The layer's mask, like [`FilterLayer::mask`](crate::FilterLayer::mask): a shape is in
+    /// layer points (the frame spans `0..width / pixels_per_point` points), tessellated per run at
+    /// the options' pixels per point with egui's default tessellation options. Offline masks must
+    /// pass [`Mask::check_offline`]: no text (no font atlas offline) and only untextured meshes;
+    /// otherwise the run fails with [`OfflineError::Mask`] before any GPU work.
+    #[must_use]
+    pub fn with_mask(mut self, mask: Mask) -> Self {
+        self.mask = mask;
         self
     }
 
@@ -278,6 +292,7 @@ impl OfflineOptions {
         if let Some(slot) = self.invalid_texture_slot {
             return Err(OfflineError::Texture(TextureError::InvalidSlot { slot }));
         }
+        self.mask.check_offline()?;
         if !(self.pixels_per_point.is_finite() && self.pixels_per_point > 0.0) {
             return Err(OfflineError::InvalidOption { option: "pixels_per_point", reason: format!("must be finite and positive, got {}", self.pixels_per_point) });
         }
@@ -303,6 +318,17 @@ mod tests {
     use super::*;
     use crate::geometry::{PxRect, layer_geometry};
     use egui::{Rect, vec2};
+
+    /// F9: masks offline are checked with `Mask::check_offline` before any GPU work.
+    #[test]
+    fn offline_masks_are_validated() {
+        let circle = egui::Shape::circle_filled(pos2(5.0, 5.0), 3.0, Color32::WHITE);
+        assert!(OfflineOptions::default().with_mask(Mask::Shape(circle.clone())).validate().is_ok());
+        let callback = egui::Shape::Callback(egui::PaintCallback { rect: Rect::EVERYTHING, callback: std::sync::Arc::new(()) });
+        let options = OfflineOptions::default().with_mask(Mask::Shape(egui::Shape::Vec(vec![circle, callback])));
+        assert!(matches!(options.validate(), Err(OfflineError::Mask(crate::MaskError::Callback))));
+        assert_eq!(options.with_corner_radius(3).mask, Mask::RoundedRect(CornerRadius::same(3)), "the corner radius replaces the mask");
+    }
 
     #[test]
     fn frame_input_options_are_validated_and_resolved() {

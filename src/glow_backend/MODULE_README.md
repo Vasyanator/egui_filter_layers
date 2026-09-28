@@ -15,7 +15,8 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
    the layer for non-normalized formats; multisampled -> resolve with identical rects into a
    renderbuffer of the SAME internal format, then blit the padded capture rect into the RGBA8
    capture texture;
-5. plan the run (`plan::plan`, whole capture; a stateful layer's `GlowState::states` entry, looked
+5. plan the run (`plan::plan`, whole capture, `with_coverage` for a shape mask whose meshes are
+   then rasterized into the coverage target by `coverage.rs` before the passes; a stateful layer's `GlowState::states` entry, looked
    up after evicting unpainted ones, feeds its state input), grow its state targets keeping their
    content (`RenderTarget::ensure_kept`: new texture + blit) and clear the one the plan names,
    grow the ping-pong targets to the plan's
@@ -32,13 +33,18 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
 - `mod.rs`: `install_glow`, `destroy_glow`, `GlowBackend` (`Backend` impl), `GlowState`, latches;
   the paint callback resolves the layer's user textures through `egui_glow::Painter::texture`
   (an unknown id skips the layer: `GlowState::fail_texture`, `failed_textures()`).
-- `glsl.rs`: pure WGSL->GLSL translation (naga `glsl-out`, empty writer flags), dialect choice,
+- `glsl.rs`: pure WGSL->GLSL translation (naga `glsl-out`, empty writer flags; also
+  `translate_mesh`, the coverage rasterizer's program, whose `MeshLocals` block naga names per
+  stage, so both names are bound), dialect choice,
   the reflected `fl` and named-parameter block names (by `@binding` 0 / 4), and the texture-unit table of the prelude's layout (`GROUP0_TEXTURE_BINDINGS`,
   `USER_UNIT_BASE`).
 - `resources.rs`: `GlError`, `RenderTarget` (incl. `ensure_kept` / `clear` for state targets),
   `ParamsBuffer` (grow-only params UBO), `Resources`
   (incl. dummy textures), `build_program` (all GL object code).
 - `render.rs`: the per-layer GL sequence and state restoration.
+- `coverage.rs`: shape-mask coverage (F9): the mesh program (`shaders/mesh.wgsl` via
+  `glsl::translate_mesh`), its VAO (float pos / uv, INTEGER colour attribute), VBO / EBO / locals
+  UBO and the RGBA8 coverage target; created with the first shape-masked layer, a failure latches.
 
 ## Contracts and invariants
 - All GL calls happen with the context current (inside the callback or in `on_exit`).
@@ -50,6 +56,10 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   object with the parameters egui_glow set from its `TextureOptions`. Max unit 6 < the 16 GLES 3 /
   WebGL2 guarantee. naga cannot translate a texture read through two samplers in one module, so
   the prelude has one sampler per texture and exact reads via `textureLoad` (`texelFetch`).
+- Mask textures (the font atlas for text, a mask mesh's texture) are egui_glow's own, resolved by
+  the paint callback (`Painter::texture`; unknown: `fail_texture`) and bound on unit 0 of the
+  coverage draw only. The coverage target is bottom-up like every target (clip-space y up), so
+  the prelude's `flip_y` reads it like the capture.
 - User textures are only read, never modified or kept: egui_glow applies a frame's texture deltas
   before painting and frees after it, so an id resolved in the callback is current and alive.
 - Every wiring decision (which slot a draw binds and writes, mappings, uniform bytes) comes from

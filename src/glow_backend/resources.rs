@@ -33,6 +33,7 @@ use std::collections::HashSet;
 
 use glow::HasContext as _;
 
+use super::coverage::CoverageResources;
 use super::glsl::{GlslProgram, GlslTarget, TranslateError, translate};
 use crate::effect::composite_module;
 use crate::pass::UNIFORM_BLOCK_SIZE;
@@ -559,6 +560,8 @@ pub(super) struct Resources {
     pub transparent: glow::Texture,
     /// 1x1 opaque white texture for the coverage units when there is no coverage texture.
     pub white: glow::Texture,
+    /// The shape-mask coverage rasterizer (F9), created with the first shape-masked layer.
+    pub coverage: Option<CoverageResources>,
 }
 
 impl Resources {
@@ -611,6 +614,9 @@ impl Resources {
             gl.delete_program(self.composite);
             gl.delete_texture(self.transparent);
             gl.delete_texture(self.white);
+            if let Some(coverage) = self.coverage {
+                coverage.destroy(gl);
+            }
         }
     }
 }
@@ -682,6 +688,7 @@ impl Partial {
                         composite,
                         transparent,
                         white,
+                        coverage: None,
                     })
                 }
                 // Unreachable by construction (every field was set above); handled without a

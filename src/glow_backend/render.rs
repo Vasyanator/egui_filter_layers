@@ -27,6 +27,9 @@ Notes (GL state contract, checked against egui_glow 0.36.2 `painter.rs`):
   uniform-buffer bindings, so those are reset here (`cleanup`). No sampler object is ever bound:
   every texture samples through its own parameters (user textures through the ones egui_glow
   set from their `TextureOptions`).
+- Shape masks (F9): the plan's coverage step runs right after the capture (`coverage.rs`: the
+  mask's meshes into the coverage target with egui's blend); only the composite binds it (unit 3).
+  Its GL errors are the crate's own work (latch).
 - User textures (F8) are egui_glow's own texture objects (resolved by `mod.rs` through
   `Painter::texture`), bound on units `USER_UNIT_BASE + i` for the draws the plan says; they are
   only read, never modified.
@@ -56,14 +59,16 @@ use std::collections::HashSet;
 
 use glow::HasContext as _;
 
+use super::coverage::CoverageResources;
 use super::{GlowState, StateTargets};
 use super::glsl::{GROUP0_TEXTURE_BINDINGS, GlslTarget, USER_UNIT_BASE};
 use super::resources::{GlError, PARAMS_BINDING_POINT, ParamsBuffer, ReadFormat, ReadFormatError, RenderTarget, ResolveTarget, Resources, TargetFormat, UNIFORM_BINDING_POINT};
 use crate::backend::LayerJob;
 use crate::effect::{BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, TEXTURE_SLOTS};
-use crate::geometry::{LayerGeometry, PxRect, layer_geometry, transform_scale};
+use crate::geometry::{LayerGeometry, MaskTransform, PxRect, layer_geometry, mask_transform, transform_scale};
+use crate::mask::PackedCoverage;
 use crate::pass::{FrameUniforms, InputUniforms, UNIFORM_BLOCK_SIZE};
-use crate::plan::{Allocations, Bindings, ChainPlan, Slot, StatePlan, StatePlanInput, composite_params_block, composite_uniforms, params_block, plan, step_uniforms};
+use crate::plan::{Allocations, Bindings, ChainPlan, Slot, StatePlan, StatePlanInput, composite_params_block, coverage_locals, composite_uniforms, params_block, plan, step_uniforms};
 use crate::state::StateFormat;
 
 /// Stand-in key for rejections that have no known format (no colour buffer, or a driver that
@@ -110,6 +115,15 @@ impl CallerState {
     }
 }
 
+/// `egui_glow`'s textures one layer samples, resolved by the paint callback (`mod.rs`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LayerTextures<'a> {
+    /// The texture of every attached user texture slot (`None` where none is attached).
+    pub user: [Option<glow::Texture>; TEXTURE_SLOTS],
+    /// A shape mask (F9): its packed meshes and the texture of each of its draws.
+    pub coverage: Option<(&'a PackedCoverage, &'a [glow::Texture])>,
+}
+
 /// The per-layer inputs every GL step below needs.
 struct LayerRun<'a> {
     /// Pixel geometry of the layer.
@@ -126,6 +140,9 @@ struct LayerRun<'a> {
     embedded: bool,
     /// `egui_glow`'s texture of every attached user texture slot (resolved by the caller).
     user_textures: [Option<glow::Texture>; TEXTURE_SLOTS],
+    /// A shape mask (F9): its packed meshes, `egui_glow`'s texture of each draw, and the
+    /// layer-points -> capture-pixels transform.
+    coverage: Option<(&'a PackedCoverage, &'a [glow::Texture], MaskTransform)>,
 }
 
 /// How one layer run ended; applied to `GlowState` by [`paint_layer`].
@@ -180,12 +197,13 @@ unsafe fn drain_errors(gl: &glow::Context) {
 /// Runs one filter layer. Never panics; failures are latched in `state`. The caller's framebuffer
 /// bindings are saved before anything else and restored on every path.
 ///
-/// `user_textures[i]` is `egui_glow`'s texture of `job.textures[i]` (`None` where none is attached).
+/// `textures` are `egui_glow`'s textures of the job's attached user textures and of its shape
+/// mask's draws (resolved by the caller).
 ///
 /// # Safety
 /// `gl` must be the current context on this thread, called from inside an `egui_glow` paint
-/// callback (so egui restores its own state afterwards); `user_textures` are alive on it.
-pub(super) unsafe fn paint_layer(gl: &glow::Context, state: &mut GlowState, target: GlslTarget, info: &egui::PaintCallbackInfo, job: &LayerJob, user_textures: [Option<glow::Texture>; TEXTURE_SLOTS]) {
+/// callback (so egui restores its own state afterwards); every texture of `textures` is alive on it.
+pub(super) unsafe fn paint_layer(gl: &glow::Context, state: &mut GlowState, target: GlslTarget, info: &egui::PaintCallbackInfo, job: &LayerJob, textures: LayerTextures<'_>) {
     if state.failure.is_some() || state.destroyed || job.passes.is_empty() {
         return;
     }
@@ -193,7 +211,7 @@ pub(super) unsafe fn paint_layer(gl: &glow::Context, state: &mut GlowState, targ
     unsafe {
         // FIRST, before resource creation / the RGBA16F probe, which bind framebuffer 0.
         let caller = CallerState::save(gl);
-        paint_saved(gl, state, target, info, job, caller, user_textures);
+        paint_saved(gl, state, target, info, job, caller, textures);
         caller.restore(gl);
     }
 }
@@ -202,11 +220,12 @@ pub(super) unsafe fn paint_layer(gl: &glow::Context, state: &mut GlowState, targ
 ///
 /// # Safety
 /// As [`paint_layer`].
-unsafe fn paint_saved(gl: &glow::Context, state: &mut GlowState, target: GlslTarget, info: &egui::PaintCallbackInfo, job: &LayerJob, caller: CallerState, user_textures: [Option<glow::Texture>; TEXTURE_SLOTS]) {
+unsafe fn paint_saved(gl: &glow::Context, state: &mut GlowState, target: GlslTarget, info: &egui::PaintCallbackInfo, job: &LayerJob, caller: CallerState, textures: LayerTextures<'_>) {
+    let LayerTextures { user: user_textures, coverage } = textures;
     // The callback rect is the layer rect after any layer transform; the transform scale joins
     // pixels-per-point in `LayerGeometry::pixels_per_layer_point` (padding, radii, `fl.pixels_per_point`).
     let transform_scale = transform_scale(job.rect, info.viewport);
-    let Some(geometry) = layer_geometry(info.viewport, info.clip_rect, info.pixels_per_point, info.screen_size_px, job.padding_points, job.corner_radius, transform_scale) else {
+    let Some(geometry) = layer_geometry(info.viewport, info.clip_rect, info.pixels_per_point, info.screen_size_px, job.padding_points, job.mask.corner_radius(), transform_scale) else {
         return;
     };
 
@@ -235,6 +254,20 @@ unsafe fn paint_saved(gl: &glow::Context, state: &mut GlowState, target: GlslTar
                 None => return,
             }
         }
+        // The mask rasterizer is created with the first shape-masked layer (a failure is a crate
+        // bug in the mesh shader or a driver refusal: latched like the composite's).
+        if coverage.is_some()
+            && let Some(resources) = state.resources.as_mut()
+            && resources.coverage.is_none()
+        {
+            match CoverageResources::create(gl, target) {
+                Ok(created) => resources.coverage = Some(created),
+                Err(error) => {
+                    state.latch("creating the shape-mask rasterizer", &error);
+                    return;
+                }
+            }
+        }
         let diagnose = job.passes.iter().any(|pass| state.suspects.contains(&pass.effect().module().id));
         let state_key = job.state_key();
         let state_format = job.state.format();
@@ -248,7 +281,8 @@ unsafe fn paint_saved(gl: &glow::Context, state: &mut GlowState, target: GlslTar
         };
         let screen = [i32::try_from(info.screen_size_px[0]).unwrap_or(i32::MAX), i32::try_from(info.screen_size_px[1]).unwrap_or(i32::MAX)];
         let input = job.frame_input.resolve(info.pixels_per_point, geometry.capture);
-        let run = LayerRun { geometry, job, input, screen, caller, embedded: target != GlslTarget::Desktop330, user_textures };
+        let coverage = coverage.map(|(packed, textures)| (packed, textures, mask_transform(job.rect, info.viewport, info.pixels_per_point, geometry.capture)));
+        let run = LayerRun { geometry, job, input, screen, caller, embedded: target != GlslTarget::Desktop330, user_textures, coverage };
 
         // Unpainted states are freed at every paint (GL is current here), then this layer's
         // entry is looked up (a format change replaces its targets, freed too).
@@ -366,6 +400,7 @@ unsafe fn run_layer(gl: &glow::Context, resources: &mut Resources, run: &LayerRu
         let Some(plan) = plan(&run.job.passes, capture.size(), PxRect { x: 0, y: 0, w: capture.w, h: capture.h }, [capture.x, capture.y], attached, state_input) else {
             return LayerOutcome::Done(None);
         };
+        let plan = if run.coverage.is_some() { plan.with_coverage() } else { plan };
         // Both ping-pong targets hold every step's viewport (the plan's pool size).
         let needed = plan.target_px.map(|side| i32::try_from(side).unwrap_or(i32::MAX));
         let max = resources.max_size;
@@ -393,6 +428,19 @@ unsafe fn run_layer(gl: &glow::Context, resources: &mut Resources, run: &LayerRu
             (Some(_), None) => return LayerOutcome::Done(None),
             (None, _) => None,
         };
+        // The shape mask's coverage (F9), before the passes (it depends only on the mask).
+        if let (Some(step), Some((packed, textures, transform))) = (plan.coverage, run.coverage) {
+            let Some(coverage) = resources.coverage.as_mut() else {
+                return LayerOutcome::Latch { what: "rasterizing the mask", error: "the mask rasterizer is missing (crate bug)".to_owned() };
+            };
+            if let Err(error) = coverage.draw(gl, packed, textures, &coverage_locals(&transform, &step), step.used_px, max) {
+                return LayerOutcome::Latch { what: "allocating the mask coverage target", error: error.to_string() };
+            }
+            let error = gl.get_error();
+            if error != glow::NO_ERROR {
+                return LayerOutcome::Latch { what: "rasterizing the mask", error: format!("GL error 0x{error:04x}") };
+            }
+        }
         match run_passes(gl, resources, states, run, &plan, programs, diagnose) {
             Ok(Some((index, error))) => return LayerOutcome::PassFailed { index, error },
             Ok(None) => {}
@@ -581,6 +629,7 @@ fn target_of<'a>(resources: &'a Resources, states: Option<&'a StateTargets>, slo
         Slot::Pong => Some(&resources.ping_pong[1]),
         Slot::StateA => states.and_then(|states| states[0].as_ref()),
         Slot::StateB => states.and_then(|states| states[1].as_ref()),
+        Slot::Coverage => resources.coverage.as_ref().map(|coverage| &coverage.target),
     }
 }
 
@@ -588,7 +637,8 @@ fn target_of<'a>(resources: &'a Resources, states: Option<&'a StateTargets>, slo
 /// step's content, held at its target's `(0, 0)` corner, through them).
 fn allocations(resources: &Resources, states: Option<&StateTargets>) -> Allocations {
     let state = |index: usize| states.and_then(|states| states[index].as_ref()).map_or([0, 0], RenderTarget::allocated_px);
-    Allocations { source: resources.capture.allocated_px(), ping_pong: [resources.ping_pong[0].allocated_px(), resources.ping_pong[1].allocated_px()], state: [state(0), state(1)] }
+    let coverage = resources.coverage.as_ref().map_or([0, 0], |coverage| coverage.target.allocated_px());
+    Allocations { source: resources.capture.allocated_px(), ping_pong: [resources.ping_pong[0].allocated_px(), resources.ping_pong[1].allocated_px()], state: [state(0), state(1)], coverage }
 }
 
 /// Binds every texture of one draw on its texture units (`glsl.rs`): the `@group(0)` textures on
@@ -616,7 +666,8 @@ unsafe fn bind_textures(gl: &glow::Context, resources: &Resources, states: Optio
                 BINDING_SOURCE_TEXTURE => texture_of(Some(bindings.src)),
                 BINDING_ORIGINAL_TEXTURE => texture_of(bindings.original),
                 BINDING_STATE_TEXTURE => texture_of(bindings.state),
-                BINDING_COVERAGE_TEXTURE => resources.white,
+                // Full coverage (white) unless the plan binds a shape mask's coverage.
+                BINDING_COVERAGE_TEXTURE => bindings.coverage.and_then(|slot| target_of(resources, states, slot)).map_or(resources.white, |target| target.texture),
                 // `GROUP0_TEXTURE_BINDINGS` holds nothing else.
                 _ => resources.transparent,
             };
@@ -744,7 +795,7 @@ mod tests {
         assert_eq!(glow_plan, wgpu_plan);
 
         let used = capture.size().map(|side| u32::try_from(side).unwrap_or(0));
-        let allocations = Allocations { source: [256, 256], ping_pong: [[320, 192], used], state: [[0, 0]; 2] };
+        let allocations = Allocations { source: [256, 256], ping_pong: [[320, 192], used], state: [[0, 0]; 2], coverage: [0, 0] };
         let time = 1.25;
         let wgpu_uniforms = chain_uniforms(&wgpu_frame_uniforms(&geometry, time), &wgpu_plan, &passes, &geometry, &allocations, 256);
         let glow_frame = frame_uniforms(&geometry, time);
@@ -764,6 +815,23 @@ mod tests {
             let differing: Vec<usize> = (0..UNIFORM_BLOCK_SIZE / 4).map(|word| word * 4).filter(|&at| glow_block[at..at + 4] != wgpu_block[at..at + 4]).collect();
             assert_eq!(differing, flags, "block {index}: only the backend flags may differ");
         }
+        // F9: a shape-masked run's composite block (coverage mapping, mask flag) is shared too.
+        let (glow_masked, wgpu_masked) = (glow_plan.clone().with_coverage(), wgpu_plan.with_coverage());
+        assert_eq!(glow_masked, wgpu_masked);
+        let allocations = Allocations { coverage: [512, 256], ..allocations };
+        let glow_block = composite_uniforms(&glow_frame, &glow_masked, &allocations, &geometry);
+        let wgpu_masked_uniforms = chain_uniforms(&wgpu_frame_uniforms(&geometry, time), &wgpu_masked, &passes, &geometry, &allocations, 256);
+        let Some(draw) = wgpu_masked_uniforms.draws.last() else { panic!("the composite draw") };
+        let wgpu_block = bytes_at_masked(&wgpu_masked_uniforms.bytes, &draw.fl);
+        let differing: Vec<usize> = (0..UNIFORM_BLOCK_SIZE / 4).map(|word| word * 4).filter(|&at| glow_block[at..at + 4] != wgpu_block[at..at + 4]).collect();
+        assert_eq!(differing, flags, "masked composite: only the backend flags may differ");
+        assert_ne!(glow_block, composite_uniforms(&glow_frame, &glow_plan, &allocations, &geometry), "the mask changes the composite block");
+    }
+
+    /// The bytes of `range` in `bytes`.
+    #[cfg(feature = "wgpu")]
+    fn bytes_at_masked<'a>(bytes: &'a [u8], range: &std::ops::Range<u64>) -> &'a [u8] {
+        &bytes[usize::try_from(range.start).unwrap_or(0)..usize::try_from(range.end).unwrap_or(0)]
     }
 
     #[test]

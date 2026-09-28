@@ -191,16 +191,20 @@ impl TextureCopies {
     }
 }
 
-/// A bind group for every texture `primitives` reference, or none for textures that cannot be
-/// resolved this frame (see the file header). `font_size` is the CPU font atlas size.
-pub(super) fn snapshot_textures(shared: &Shared, primitives: &[ClippedPrimitive], font_size: [usize; 2]) -> HashMap<TextureId, wgpu::BindGroup> {
-    let used: HashSet<TextureId> = primitives
+/// Every texture the meshes of `primitives` sample.
+pub(super) fn primitive_textures(primitives: &[ClippedPrimitive]) -> HashSet<TextureId> {
+    primitives
         .iter()
         .filter_map(|primitive| match &primitive.primitive {
             Primitive::Mesh(mesh) => Some(mesh.texture_id),
             Primitive::Callback(_) => None,
         })
-        .collect();
+        .collect()
+}
+
+/// A bind group for every texture of `used`, or none for textures that cannot be resolved this
+/// frame (see the file header). `font_size` is the CPU font atlas size.
+pub(super) fn snapshot_textures(shared: &Shared, used: HashSet<TextureId>, font_size: [usize; 2]) -> HashMap<TextureId, wgpu::BindGroup> {
     let font_size = [u32::try_from(font_size[0]).unwrap_or(u32::MAX), u32::try_from(font_size[1]).unwrap_or(u32::MAX)];
     let state = &shared.render_state;
     let mut copies = shared.texture_copies();

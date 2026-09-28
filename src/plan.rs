@@ -23,6 +23,7 @@ Key structures:
   layer's texture (else a dummy).
 - `PassStep`, `CompositeStep`, `ChainPlan`: the draws of one run, in order, and the pool size.
 - `Allocations`: the allocated size of every slot's texture (backends report them).
+- `CoverageStep`: a shape mask's coverage rasterization (F9), `ChainPlan::with_coverage`.
 - `TextureMapping`: capture uv -> storage uv of one texture content (`clamp(uv) * scale -
   offset`, the prelude's `internal_*_scale` / `internal_*_offset`).
 
@@ -35,6 +36,8 @@ Key functions:
 - `step_uniforms()` / `composite_uniforms()`: the full `FlUniforms` block of one draw.
 - `params_block()` / `composite_params_block()`: the bytes bound at binding 4 (`p: Params`) for a
   step / the composite; `EMPTY_PARAMS_BLOCK` (16 zero bytes) when a module declares none.
+- `mesh_locals()` / `coverage_locals()`: the `MeshLocals` block of `shaders/mesh.wgsl` (the wgpu
+  backdrop re-render; the coverage step on every backend).
 
 Notes:
 Pass `i` reads the capture (i = 0) or pass `i - 1`'s output and writes `Ping` (even i) / `Pong`
@@ -56,6 +59,12 @@ reset) is cleared first (`StatePlan::clear`). A repeated run in the same frame (
 skips the state steps: its display steps read the state as it is. The read mapping of the latest
 content uses ITS size, the writes the new size, so a resized layer reads the previous state
 stretched. Stateful runs cover the whole capture only (never tiled).
+Shape mask (F9): `ChainPlan::with_coverage` adds a `CoverageStep` that rasterizes the mask's
+meshes into `Slot::Coverage` before the passes; the texture holds the run's WINDOW at its origin
+(like the source), so the composite maps it with the original's content in the coverage
+allocation (`internal_cover_*`) and sets `params[3].x = 1` (`COVERAGE_MASK_FLAG`): the composite
+reads the texture's alpha instead of the rounded-rect SDF. Only the composite binds it; every
+other draw binds the backend's white dummy. Windows (offline tiles) rasterize their own window.
 Scale (F6): a pass with `scale < 1` renders `scaled_px(capture, scale)` pixels holding the WHOLE
 capture at that resolution (at the texture origin); readers map it with `TextureMapping::of(
 scaled, allocated, 0)`, so `uv` keeps its capture meaning and bilinear sampling resamples (the
@@ -67,7 +76,7 @@ every step.
 
 use crate::backend::TextureError;
 use crate::effect::TEXTURE_SLOTS;
-use crate::geometry::{LayerGeometry, PxRect, px_f32};
+use crate::geometry::{LayerGeometry, MaskTransform, PxRect, px_f32};
 use crate::pass::{FrameUniforms, Params, Pass, UNIFORM_BLOCK_SIZE, pack_uniforms};
 
 /// One texture of a chain run. Backends map every variant to their own texture object.
@@ -83,6 +92,9 @@ pub(crate) enum Slot {
     StateA,
     /// State texture 1 of the layer (F7).
     StateB,
+    /// The mask coverage texture of a shape mask (F9): the run's window at the texture origin,
+    /// rasterized by the plan's [`CoverageStep`] before the composite reads it.
+    Coverage,
 }
 
 impl Slot {
@@ -145,6 +157,9 @@ pub(crate) struct Bindings {
     /// Per user texture slot: `true` = bind the texture the layer attached there, `false` = the
     /// backend's dummy (nothing attached, or the composite).
     pub user: [bool; TEXTURE_SLOTS],
+    /// Bound at `fl_coverage_texture`: [`Slot::Coverage`] for the composite of a shape-masked run,
+    /// `None` (the backend's 1x1 WHITE dummy) otherwise.
+    pub coverage: Option<Slot>,
 }
 
 /// What a slot's texture holds at one point of a run: the whole capture rendered at
@@ -215,6 +230,18 @@ pub(crate) struct CompositeStep {
     pub frag_offset: [f32; 2],
 }
 
+/// The coverage rasterization of a shape-masked run (F9), drawn before the passes: the mask's
+/// meshes (`mask::PackedCoverage`) into [`Slot::Coverage`], cleared to transparent first, over
+/// `(0, 0, used_px)` with the egui premultiplied blend (coverage = the accumulated alpha). The
+/// texture holds the run's WINDOW at its origin (like the source), at full resolution.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CoverageStep {
+    /// Viewport size in pixels from the target's origin: the window.
+    pub used_px: [i32; 2],
+    /// The window's origin in capture pixels (the mesh transform subtracts it).
+    pub window_origin: [i32; 2],
+}
+
 /// Every draw of one chain run, in execution order.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChainPlan {
@@ -233,6 +260,23 @@ pub(crate) struct ChainPlan {
     pub target_px: [u32; 2],
     /// The state textures' part of the run (stateful runs only).
     pub state: Option<StatePlan>,
+    /// The mask coverage step (shape-masked runs only, [`ChainPlan::with_coverage`]).
+    pub coverage: Option<CoverageStep>,
+}
+
+impl ChainPlan {
+    /// The plan of a SHAPE-masked run (F9): adds the coverage step (the window, like
+    /// [`ChainPlan::source`]; it needs a [`Slot::Coverage`] texture of at least
+    /// [`ChainPlan::target_px`]) and binds it as the composite's coverage, which switches the
+    /// composite from the rounded-rect SDF to the texture's alpha (`composite_uniforms`).
+    #[must_use]
+    pub(crate) fn with_coverage(mut self) -> Self {
+        let window_origin = self.source.origin_px.map(|side| i32::try_from(side).unwrap_or(i32::MAX));
+        let used_px = self.target_px.map(|side| i32::try_from(side).unwrap_or(i32::MAX));
+        self.coverage = Some(CoverageStep { used_px, window_origin });
+        self.composite.bindings.coverage = Some(Slot::Coverage);
+        self
+    }
 }
 
 /// The allocated size of every slot's texture in one run, in pixels (reported by the backend
@@ -245,6 +289,8 @@ pub(crate) struct Allocations {
     pub ping_pong: [[u32; 2]; 2],
     /// Of [`Slot::StateA`] and [`Slot::StateB`] (zero without state).
     pub state: [[u32; 2]; 2],
+    /// Of [`Slot::Coverage`] (zero without a shape mask).
+    pub coverage: [u32; 2],
 }
 
 impl Allocations {
@@ -257,6 +303,7 @@ impl Allocations {
             Slot::Pong => self.ping_pong[1],
             Slot::StateA => self.state[0],
             Slot::StateB => self.state[1],
+            Slot::Coverage => self.coverage,
         }
     }
 }
@@ -315,7 +362,7 @@ pub(crate) fn plan(passes: &[Pass], capture: [i32; 2], window: PxRect, composite
     for (index, pass) in passes.iter().enumerate() {
         let state_binding = latest.map(|(slot, _)| Slot::state(slot));
         let state_content = latest.map(|(_, content)| content);
-        let bindings = Bindings { src: input_slot, original: Some(Slot::Source), state: state_binding, user: attached };
+        let bindings = Bindings { src: input_slot, original: Some(Slot::Source), state: state_binding, user: attached, coverage: None };
         if pass.effect().is_state() {
             // `state` and `state_px` are `Some` here (checked above); a repeated run skips it.
             let (Some(state), Some(px), Some((read, _))) = (state, state_px, latest) else {
@@ -347,7 +394,7 @@ pub(crate) fn plan(passes: &[Pass], capture: [i32; 2], window: PxRect, composite
     }
     let composite = CompositeStep {
         // The composite module reads no user texture and no state: dummies.
-        bindings: Bindings { src: input_slot, original: Some(Slot::Source), state: None, user: [false; TEXTURE_SLOTS] },
+        bindings: Bindings { src: input_slot, original: Some(Slot::Source), state: None, user: [false; TEXTURE_SLOTS], coverage: None },
         input,
         frag_offset: [-px_f32(composite_origin[0]), -px_f32(composite_origin[1])],
     };
@@ -358,7 +405,7 @@ pub(crate) fn plan(passes: &[Pass], capture: [i32; 2], window: PxRect, composite
         final_index,
         final_px: content.logical_px,
     });
-    Some(ChainPlan { steps, composite, source, target_px, state })
+    Some(ChainPlan { steps, composite, source, target_px, state, coverage: None })
 }
 
 /// Checks that every user texture slot an effect of `passes` may read
@@ -462,6 +509,11 @@ fn draw_uniforms(frame: &FrameUniforms, draw: &Draw, allocations: &Allocations, 
         out.state_texel = content.texel(frame);
         out.state_size = content.logical_px.map(to_f32_exact);
     }
+    // The coverage holds the window like the source does (same content, its own allocation).
+    if let Some(slot) = draw.bindings.coverage {
+        let mapping = draw.original.mapping(allocations.of(slot));
+        out.cover = [mapping.scale, mapping.offset];
+    }
     out.pass_index = draw.pass_index;
     out.frag_offset = draw.frag_offset;
     out.frag_texel = draw.written.map_or(frame.texel, |written| written.texel(frame));
@@ -478,12 +530,47 @@ pub(crate) fn step_uniforms(frame: &FrameUniforms, plan: &ChainPlan, step: &Pass
 }
 
 /// The complete `FlUniforms` block of `plan`'s composite: its bindings' mappings and the mask /
-/// region parameters of `geometry` (`LayerGeometry::composite_params`).
+/// region parameters of `geometry` (`LayerGeometry::composite_params`). A composite that binds a
+/// coverage texture (a shape mask) also sets `params[3].x = 1` ([`COVERAGE_MASK_FLAG`]): the
+/// composite then takes the coverage from that texture's alpha instead of the rounded-rect SDF.
 #[must_use]
 pub(crate) fn composite_uniforms(frame: &FrameUniforms, plan: &ChainPlan, allocations: &Allocations, geometry: &LayerGeometry) -> [u8; UNIFORM_BLOCK_SIZE] {
     let composite = &plan.composite;
     let draw = Draw { bindings: composite.bindings, input: composite.input, original: plan.source, frag_offset: composite.frag_offset, written: None, scale: 1.0, state: None, pass_index: 0 };
-    draw_uniforms(frame, &draw, allocations, &geometry.composite_params())
+    let mut params = geometry.composite_params();
+    if composite.bindings.coverage.is_some() {
+        params[COVERAGE_MASK_FLAG][0] = 1.0;
+    }
+    draw_uniforms(frame, &draw, allocations, &params)
+}
+
+/// The composite parameter slot whose `x` is 1 when the mask is the coverage texture
+/// (`composite.wgsl`'s `fl_coverage`), 0 for the rounded-rect SDF.
+pub(crate) const COVERAGE_MASK_FLAG: usize = 3;
+
+/// Size of the mesh shader's `MeshLocals` block (`shaders/mesh.wgsl`; std140 = WGSL layout).
+pub(crate) const MESH_LOCALS_SIZE: usize = 32;
+
+/// The `MeshLocals` block of a mesh draw (`shaders/mesh.wgsl`, the backdrop re-render on wgpu and
+/// the coverage rasterizer everywhere): a vertex at `pos` lands at pixel `pos * scale - origin_px`
+/// of a viewport of `size_px` pixels; `dithering` as egui-wgpu (never for coverage).
+#[must_use]
+pub(crate) fn mesh_locals(scale: f32, dithering: bool, origin_px: [f32; 2], size_px: [f32; 2]) -> [u8; MESH_LOCALS_SIZE] {
+    let mut bytes = [0_u8; MESH_LOCALS_SIZE];
+    let fields: [[u8; 4]; 6] = [scale.to_ne_bytes(), u32::from(dithering).to_ne_bytes(), origin_px[0].to_ne_bytes(), origin_px[1].to_ne_bytes(), size_px[0].to_ne_bytes(), size_px[1].to_ne_bytes()];
+    for (chunk, field) in bytes.chunks_exact_mut(4).zip(fields) {
+        chunk.copy_from_slice(&field);
+    }
+    bytes
+}
+
+/// The `MeshLocals` block of `step` (the coverage rasterization of a run) for a mask whose layer
+/// points map to capture pixels by `transform` (`geometry::MaskTransform`): the window's origin is
+/// subtracted, so the texture holds the window at its origin like the source. No dithering.
+#[must_use]
+pub(crate) fn coverage_locals(transform: &MaskTransform, step: &CoverageStep) -> [u8; MESH_LOCALS_SIZE] {
+    let origin = [transform.origin_px[0] + px_f32(step.window_origin[0]), transform.origin_px[1] + px_f32(step.window_origin[1])];
+    mesh_locals(transform.scale, false, origin, [px_f32(step.used_px[0]), px_f32(step.used_px[1])])
 }
 
 /// The binding-4 bytes of a draw whose module declares no `struct Params`: 16 zero bytes, the
@@ -546,7 +633,7 @@ mod tests {
         assert_eq!(reads, [Slot::Source, Slot::Ping, Slot::Pong]);
         assert_eq!(writes, [Slot::Ping, Slot::Pong, Slot::Ping]);
         assert!(plan.steps.iter().enumerate().all(|(index, step)| step.pass == index && step.used_px == [100, 50]));
-        assert_eq!(plan.composite.bindings, Bindings { src: Slot::Ping, original: Some(Slot::Source), state: None, user: NO_TEXTURES });
+        assert_eq!(plan.composite.bindings, Bindings { src: Slot::Ping, original: Some(Slot::Source), state: None, user: NO_TEXTURES, coverage: None });
         assert_eq!(plan.composite.frag_offset.map(f32::to_bits), [-4.0_f32, -8.0].map(f32::to_bits));
         assert_eq!(plan.steps[0].frag_offset.map(f32::to_bits), [16.0_f32, 32.0].map(f32::to_bits));
         assert_eq!(plan.target_px, [100, 50], "the pool holds the window");
@@ -566,7 +653,7 @@ mod tests {
         let effect = identity();
         let passes: Vec<Pass> = (0..3).map(|index| Pass::new(&effect).with_param(0, [f32::from(u8::try_from(index).unwrap_or(0)); 4]).unwrap_or_else(|error| panic!("{error}"))).collect();
         // Capture 64x32; window (16, 8) 16x16; textures: source 32x32, ping 64x16, pong 32x64.
-        let allocations = Allocations { source: [32, 32], ping_pong: [[64, 16], [32, 64]], state: [[0, 0]; 2] };
+        let allocations = Allocations { source: [32, 32], ping_pong: [[64, 16], [32, 64]], state: [[0, 0]; 2], coverage: [0, 0] };
         let Some(plan) = plan(&passes, [64, 32], PxRect { x: 16, y: 8, w: 16, h: 16 }, [4, 8], NO_TEXTURES, None) else { panic!("planned") };
         let frame = FrameUniforms { aux_scale: [3.0, 3.0], texel: [0.25, 0.5], ..FrameUniforms::default() };
         let blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = plan.steps.iter().map(|step| step_uniforms(&frame, &plan, step, &allocations, &passes[step.pass])).collect();
@@ -578,7 +665,7 @@ mod tests {
         assert!(blocks.iter().all(|block| holds(block, offsets::AUX_SCALE, [2.0, 1.0]) && holds(block, offsets::AUX_OFFSET, [0.5, 0.25])));
         // Full resolution: both texels are the frame's, the pass scale 1.
         assert!(blocks.iter().all(|block| holds(block, offsets::SRC_TEXEL, [0.25, 0.5]) && holds(block, offsets::FRAG_TEXEL, [0.25, 0.5]) && (read(block, offsets::PASS_SCALE) - 1.0).abs() < f32::EPSILON));
-        let dummy_draw = Draw { bindings: Bindings { src: Slot::Ping, original: None, state: None, user: NO_TEXTURES }, input: plan.source, original: plan.source, frag_offset: [0.0; 2], written: None, scale: 1.0, state: None, pass_index: 0 };
+        let dummy_draw = Draw { bindings: Bindings { src: Slot::Ping, original: None, state: None, user: NO_TEXTURES, coverage: None }, input: plan.source, original: plan.source, frag_offset: [0.0; 2], written: None, scale: 1.0, state: None, pass_index: 0 };
         let dummy = draw_uniforms(&frame, &dummy_draw, &allocations, passes[0].params());
         assert!(holds(&dummy, offsets::AUX_SCALE, [3.0, 3.0]), "a dummy original keeps the frame's aux mapping");
         assert!(holds(&blocks[2], offsets::PARAMS, [2.0, 2.0]));
@@ -650,7 +737,7 @@ mod tests {
         assert_eq!(plan.steps[3].written, plan.source, "a full step after scaled ones writes the capture resolution");
         assert_eq!(plan.composite.input, plan.source);
 
-        let allocations = Allocations { source: [101, 51], ping_pong: [[128, 64], [101, 51]], state: [[0, 0]; 2] };
+        let allocations = Allocations { source: [101, 51], ping_pong: [[128, 64], [101, 51]], state: [[0, 0]; 2], coverage: [0, 0] };
         let frame = FrameUniforms { texel: [1.0 / 101.0, 1.0 / 51.0], ..FrameUniforms::default() };
         let blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = plan.steps.iter().map(|step| step_uniforms(&frame, &plan, step, &allocations, &chain[step.pass])).collect();
         // Step 0: full-resolution input (the source), 51x26 output.
@@ -749,11 +836,11 @@ mod tests {
         assert_eq!(plan.steps.iter().map(|step| step.state).collect::<Vec<_>>(), [Some(previous), Some(previous), Some(stepped), Some(stepped)]);
         assert!(plan.steps[1..3].iter().all(|step| step.written == stepped && step.used_px == [51, 26] && step.frag_offset == [0.0, 0.0] && (step.scale - 0.5).abs() < f32::EPSILON));
         assert_eq!(plan.steps[1].input, plan.steps[0].written, "a state pass's src is the display chain's input");
-        assert_eq!(plan.composite.bindings, Bindings { src: Slot::Pong, original: Some(Slot::Source), state: None, user: NO_TEXTURES });
+        assert_eq!(plan.composite.bindings, Bindings { src: Slot::Pong, original: Some(Slot::Source), state: None, user: NO_TEXTURES, coverage: None });
         assert_eq!(plan.state, Some(StatePlan { clear: None, target_px: [51, 26], final_index: 1, final_px: [51, 26] }));
 
         // Uniforms: a state read maps the content it reads (previous size first, new after).
-        let allocations = Allocations { source: [101, 51], ping_pong: [[101, 51]; 2], state: [[64, 32], [32, 32]] };
+        let allocations = Allocations { source: [101, 51], ping_pong: [[101, 51]; 2], state: [[64, 32], [32, 32]], coverage: [0, 0] };
         let frame = FrameUniforms { texel: [1.0 / 101.0, 1.0 / 51.0], ..FrameUniforms::default() };
         let blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = plan.steps.iter().map(|step| step_uniforms(&frame, &plan, step, &allocations, &chain[step.pass])).collect();
         assert!(holds(&blocks[1], offsets::STATE_SCALE, [30.0 / 32.0, 20.0 / 32.0]) && holds(&blocks[1], offsets::STATE_OFFSET, [0.0, 0.0]));
@@ -794,6 +881,50 @@ mod tests {
         assert!(plan(&chain, [40, 20], PxRect { x: 0, y: 0, w: 20, h: 20 }, [0, 0], NO_TEXTURES, Some(fresh)).is_none(), "stateful runs are never windowed");
         let Some(stateless) = plan(&chain[..1], [40, 20], whole, [0, 0], NO_TEXTURES, None) else { panic!("planned") };
         assert_eq!((stateless.steps[0].bindings.state, stateless.state), (None, None));
+    }
+
+    /// F9: a shape-masked plan rasterizes the window into `Slot::Coverage` before the passes and
+    /// binds it only for the composite, whose block carries the coverage mapping (the window like
+    /// the original, in the coverage texture's own allocation) and the mask-kind flag; the passes'
+    /// blocks are unchanged, and a rounded-rect plan has no coverage at all.
+    #[test]
+    fn a_shape_mask_adds_the_coverage_step_for_the_composite_only() {
+        let window = PxRect { x: 16, y: 8, w: 48, h: 24 };
+        let Some(rounded) = plan(&passes(2), [64, 32], window, [4, 8], NO_TEXTURES, None) else { panic!("planned") };
+        assert_eq!((rounded.coverage, rounded.composite.bindings.coverage), (None, None));
+        let masked = rounded.clone().with_coverage();
+        assert_eq!(masked.coverage, Some(CoverageStep { used_px: [48, 24], window_origin: [16, 8] }));
+        assert_eq!(masked.composite.bindings.coverage, Some(Slot::Coverage));
+        assert_eq!(masked.steps, rounded.steps, "the passes do not change");
+        assert!(masked.steps.iter().all(|step| step.bindings.coverage.is_none()));
+
+        let geometry = LayerGeometry { region: window, capture: PxRect { x: 0, y: 0, w: 64, h: 32 }, rect_uv: [0.0, 0.0, 1.0, 1.0], region_uv: [0.0, 0.0, 1.0, 1.0], mask_rect_px: [0.0, 0.0, 64.0, 32.0], mask_radii_px: [0.0; 4], pixels_per_layer_point: 1.0 };
+        let frame = FrameUniforms::for_layer(&geometry, 0.0, false);
+        let allocations = Allocations { source: [64, 32], ping_pong: [[64, 32]; 2], state: [[0, 0]; 2], coverage: [128, 64] };
+        let flag = offsets::PARAMS + COVERAGE_MASK_FLAG * 16;
+        let rounded_block = composite_uniforms(&frame, &rounded, &allocations, &geometry);
+        assert!(read(&rounded_block, flag).abs() < f32::EPSILON && holds(&rounded_block, offsets::COVER_SCALE, [1.0, 1.0]), "rounded rect: SDF, identity cover mapping");
+        let block = composite_uniforms(&frame, &masked, &allocations, &geometry);
+        assert!((read(&block, flag) - 1.0).abs() < f32::EPSILON);
+        // The window (48x24 at 16, 8) of a 64x32 capture in a 128x64 texture.
+        assert!(holds(&block, offsets::COVER_SCALE, [0.5, 0.5]) && holds(&block, offsets::COVER_OFFSET, [0.125, 0.125]));
+        let differing: Vec<usize> = (0..UNIFORM_BLOCK_SIZE / 4).map(|word| word * 4).filter(|&at| block[at..at + 4] != rounded_block[at..at + 4]).collect();
+        assert_eq!(differing, [offsets::COVER_SCALE, offsets::COVER_SCALE + 4, offsets::COVER_OFFSET, offsets::COVER_OFFSET + 4, flag], "only the coverage mapping and the flag differ");
+        for step in &masked.steps {
+            assert_eq!(step_uniforms(&frame, &masked, step, &allocations, &passes(1)[0]), step_uniforms(&frame, &rounded, step, &allocations, &passes(1)[0]));
+        }
+    }
+
+    /// The mesh locals: a layer point lands at `point * scale - origin`, the window origin
+    /// subtracted so the coverage texture holds the window at its origin; no dithering.
+    #[test]
+    fn coverage_locals_follow_the_mesh_shader_layout() {
+        let transform = MaskTransform { scale: 2.5, origin_px: [10.0, -4.0] };
+        let bytes = coverage_locals(&transform, &CoverageStep { used_px: [48, 24], window_origin: [16, 8] });
+        assert!((read(&bytes, 0) - 2.5).abs() < f32::EPSILON);
+        assert_eq!(u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 0, "coverage is never dithered");
+        assert!(holds(&bytes, 8, [26.0, 4.0]) && holds(&bytes, 16, [48.0, 24.0]));
+        assert!(bytes[24..].iter().all(|&byte| byte == 0));
     }
 
     #[test]

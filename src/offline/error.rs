@@ -105,6 +105,10 @@ pub enum OfflineError {
     /// filterable, [`StateError::UnsupportedFormat`](crate::StateError::UnsupportedFormat)).
     #[error("the chain's state is unusable: {0}")]
     State(#[from] crate::StateError),
+    /// The mask cannot be rasterized offline ([`Mask::check_offline`](crate::Mask::check_offline):
+    /// paint callbacks, text, textured meshes).
+    #[error("the mask is unusable offline: {0}")]
+    Mask(#[from] crate::MaskError),
     /// A user texture is larger than the device can hold.
     #[error("the texture at slot {slot} is {width}x{height} pixels, but this device allows at most {max} per side")]
     TextureTooLarge {

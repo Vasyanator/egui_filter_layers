@@ -27,6 +27,9 @@ requested a discard gets no filter output for that pass.
 The capture is cleared like eframe clears the viewport the layer was painted in: immediate
 viewports to transparent, all others to `WgpuOptions::clear_color()`.
 
+The textures a layer's shape mask samples (F9: the font atlas, a mask mesh's own texture) join
+the beneath textures; the layer is not planned when one is missing (an unknown user texture is
+reported through `Shared::fail_texture`, a stale font atlas only skips the frame).
 The layer's attached user textures (F8) are resolved here too, at the end of the pass that
 painted it, exactly like the textures of its beneath meshes (`textures.rs`); a layer attaching an
 id that cannot be resolved is not planned (it draws nothing) and the id is reported once
@@ -39,7 +42,7 @@ use std::sync::Arc;
 use egui::{FullOutput, Shape};
 
 use super::beneath::{capture_points, find_callback, select_beneath, strip_callbacks};
-use super::textures::{resolve_user_textures, snapshot_textures};
+use super::textures::{primitive_textures, resolve_user_textures, snapshot_textures};
 use super::{BeneathPlan, LoggedOnce, Pending, Shared};
 use crate::geometry::transform_scale;
 
@@ -151,7 +154,19 @@ fn plan_layer(ctx: &egui::Context, shared: &Shared, shapes: &[egui::epaint::Clip
     // closure clippy suggests removing is required.
     #[allow(clippy::redundant_closure_for_method_calls)]
     let font_size = ctx.fonts(|fonts| fonts.font_image_size());
-    let textures = snapshot_textures(shared, &primitives, font_size);
+    let mut used = primitive_textures(&primitives);
+    used.extend(pending.mask_textures.iter().copied());
+    let textures = snapshot_textures(shared, used, font_size);
+    // A shape mask needs every texture it samples: a missing one would change the coverage. An
+    // unknown user texture is a permanent failure of the layer (reported like an attached one);
+    // the font atlas can only be stale for a frame (an upload not observed), so that frame skips.
+    if let Some(&missing) = pending.mask_textures.iter().find(|id| !textures.contains_key(id)) {
+        // (`prepare` debug-logs the missing plan once.)
+        if missing != egui::TextureId::default() {
+            shared.fail_texture(missing);
+        }
+        return None;
+    }
     Some(BeneathPlan { callback_rect: callback.rect, clip_rect: clipped.clip_rect, transform_scale, primitives, textures, clear_color, user_textures })
 }
 

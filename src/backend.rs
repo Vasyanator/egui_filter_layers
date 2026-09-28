@@ -7,7 +7,8 @@ The crate-internal backend boundary and the per-`egui::Context` backend registry
 Key structures:
 - `Backend` (crate-internal trait): what a GPU backend must provide. Each backend module
   (`glow_backend`, and the `wgpu` backend) implements it; core code never names a backend type.
-- `LayerJob` (crate-internal): one `FilterLayer::paint` call, resolved for the backend.
+- `LayerJob` (crate-internal): one `FilterLayer::paint` call, resolved for the backend (its mask
+  is a `mask::JobMask`: rounded-rect radii or the shape tessellated on the GUI thread).
 - `FrameInput` / `PointerInput` (crate-internal): the per-frame input a layer reads on the GUI
   thread (`fl.delta_time`, `fl.frame`, `fl.pointer`), resolved per capture by `FrameInput::resolve`.
 - `BackendKind`, `BackendStatus`, `EffectFailure`, `InstallError` (public).
@@ -30,10 +31,11 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use egui::{Context, CornerRadius, Id, Painter, Pos2, Rect, TextureId, ViewportId};
+use egui::{Context, Id, Painter, Pos2, Rect, TextureId, ViewportId};
 
 use crate::effect::TEXTURE_SLOTS;
 use crate::geometry::{PxRect, pointer_uniform};
+use crate::mask::JobMask;
 use crate::pass::{InputUniforms, Pass};
 use crate::state::{StateFailure, StateOptions};
 
@@ -173,8 +175,8 @@ pub enum InstallError {
 pub(crate) struct LayerJob {
     /// The layer's rect in points (painter space, before layer transforms).
     pub rect: Rect,
-    /// Rounded-corner mask, in points.
-    pub corner_radius: CornerRadius,
+    /// The mask: rounded-rect radii (layer points), or the tessellated shape (F9).
+    pub mask: JobMask,
     /// The passes to run, in order (never empty).
     pub passes: Vec<Pass>,
     /// Total capture padding in points (`FilterChain::padding_points`).

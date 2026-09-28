@@ -20,6 +20,8 @@
 //! opt-in RGBA8), survives the per-frame target pool, is reset by `reset_state`, stepped once per
 //! frame when the id is painted twice, stretched (not reset) when the layer grows past its
 //! allocation, dropped by a re-install; a stateful layer without an id is refused.
+//! Shape masks (F9): a circle filters inside and leaves everything outside untouched, incl. a lower
+//! filter layer; the AA edge is monotonic; star, transformed-layer and text-galley masks.
 //!
 //! All tests share one wgpu device (`GPU`, a test-only static; see there) and run in parallel on it.
 //!
@@ -1097,4 +1099,152 @@ fn a_growing_layer_keeps_its_state_and_a_reinstall_drops_it() {
     });
     assert_grey(&pixels, 20, 15, accumulated(1), "a re-install starts every state over");
     assert_eq!(egui_filter_layers::state_count(&ctx), 1);
+}
+
+// ---- F9: shape masks ----
+
+/// The F9 test effect: paints its region opaque green, so the composite's coverage is visible
+/// as green over what the screen held.
+const GREEN_WGSL: &str = "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }";
+
+/// A five-pointed star centred at `center` (points), tips at `outer`, notches at `inner`, as
+/// convex pieces (egui fills convex paths only): the inner pentagon and one triangle per tip.
+fn star(center: Pos2, outer: f32, inner: f32) -> egui::Shape {
+    let at = |radius: f32, degrees: f32| center + radius * vec2(degrees.to_radians().cos(), degrees.to_radians().sin());
+    let notch = |k: u8| at(inner, -54.0 + 72.0 * f32::from(k));
+    let mut pieces = vec![egui::Shape::convex_polygon((0..5).map(notch).collect(), Color32::WHITE, egui::Stroke::NONE)];
+    for k in 0..5_u8 {
+        let tip = at(outer, -90.0 + 72.0 * f32::from(k));
+        pieces.push(egui::Shape::convex_polygon(vec![notch((k + 4) % 5), tip, notch(k)], Color32::WHITE, egui::Stroke::NONE));
+    }
+    egui::Shape::Vec(pieces)
+}
+
+/// The circle scene: red | blue halves, a lower invert layer, and an upper green layer masked by
+/// a circle (centre (215.3, 100.5), radius 20) that overlaps the lower layer's corner region.
+fn circle_mask_scene(painter: &egui::Painter, green: &Pass) {
+    halves(painter);
+    FilterLayer::new(Rect::from_min_max(pos2(4.0, 4.0), pos2(200.0, 100.0)), presets::invert(1.0)).paint(painter);
+    let circle = egui::Shape::circle_filled(pos2(215.3, 100.5), 20.0, Color32::WHITE);
+    FilterLayer::new(Rect::from_min_max(pos2(150.0, 60.0), pos2(250.0, 125.0)), green.clone()).mask(egui_filter_layers::Mask::Shape(circle)).paint(painter);
+}
+
+/// Inside the circle: green; outside it (also inside the layer rect): exactly what the screen
+/// held, including the lower filter's output in the upper layer's corner; along the row through
+/// the centre green falls and blue rises monotonically through at least one anti-aliased pixel.
+fn check_circle_mask(pixels: &[u8], what: &str) {
+    assert_near(pixels, 215, 100, [0, 255, 0], &format!("{what}: circle centre"));
+    assert_near(pixels, 215, 84, [0, 255, 0], &format!("{what}: inside the circle, over the lower filter's region"));
+    assert_near(pixels, 152, 62, [255, 255, 0], &format!("{what}: the upper layer's corner outside the circle keeps the lower filter"));
+    assert_near(pixels, 245, 66, [0, 0, 255], &format!("{what}: outside the circle, outside the lower filter"));
+    assert_near(pixels, 190, 100, [0, 0, 255], &format!("{what}: left of the circle, below the lower filter"));
+    assert_near(pixels, 100, 50, [0, 255, 255], &format!("{what}: the lower filter away from the upper layer"));
+    let row: Vec<[u8; 3]> = (215..=245).map(|x| rgb(pixels, x, 100)).collect();
+    assert!(row.windows(2).all(|pair| pair[1][1] <= pair[0][1] && pair[1][2] >= pair[0][2]), "{what}: the edge must be monotonic: {row:?}");
+    assert!(row.iter().any(|pixel| (8..248).contains(&pixel[1])), "{what}: an anti-aliased edge pixel: {row:?}");
+    assert!(row.iter().all(|pixel| pixel[0] <= 3), "{what}: no red on the row: {row:?}");
+}
+
+/// The star scene: red | blue halves and a green layer over the left half masked by a star.
+fn star_mask_scene(painter: &egui::Painter, green: &Pass) {
+    halves(painter);
+    FilterLayer::new(Rect::from_min_max(pos2(4.0, 4.0), pos2(124.0, 124.0)), green.clone()).mask(egui_filter_layers::Mask::Shape(star(pos2(64.0, 64.0), 56.0, 22.0))).paint(painter);
+}
+
+/// Green at the centre and along a tip, red in a notch and outside the layer.
+fn check_star_mask(pixels: &[u8], what: &str) {
+    assert_near(pixels, 64, 64, [0, 255, 0], &format!("{what}: star centre"));
+    assert_near(pixels, 63, 24, [0, 255, 0], &format!("{what}: along the top tip"));
+    // The tip at -18 degrees (right-upper), 40 points out.
+    assert_near(pixels, 101, 51, [0, 255, 0], &format!("{what}: along the right tip"));
+    // The notch at -54 degrees, 40 points out (the star's concave part).
+    assert_near(pixels, 87, 31, [255, 0, 0], &format!("{what}: in a notch"));
+    assert_near(pixels, 10, 120, [255, 0, 0], &format!("{what}: a layer corner outside the star"));
+    assert_near(pixels, 2, 2, [255, 0, 0], &format!("{what}: outside the layer"));
+}
+
+/// A shape mask in a transformed layer (translate (20, 10), scale 2): layer points follow the
+/// layer transform like the layer rect, so the circle (55, 30) r 15 lands at screen (130, 70) r 30.
+fn transformed_mask_scene(ui: &egui::Ui, green: &Pass) {
+    halves(ui.painter());
+    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("masked zoomed layer"));
+    ui.ctx().set_transform_layer(layer, TSTransform::new(vec2(20.0, 10.0), 2.0));
+    let painter = egui::Painter::new(ui.ctx().clone(), layer, Rect::EVERYTHING);
+    let circle = egui::Shape::circle_filled(pos2(55.0, 30.0), 15.0, Color32::WHITE);
+    FilterLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(100.0, 50.0)), green.clone()).mask(egui_filter_layers::Mask::Shape(circle)).paint(&painter);
+}
+
+fn check_transformed_mask(pixels: &[u8], what: &str) {
+    assert_near(pixels, 130, 70, [0, 255, 0], &format!("{what}: mapped centre"));
+    assert_near(pixels, 154, 70, [0, 255, 0], &format!("{what}: 24 px right (inside the scaled radius 30)"));
+    assert_near(pixels, 108, 70, [0, 255, 0], &format!("{what}: 22 px left"));
+    assert_near(pixels, 166, 70, [0, 0, 255], &format!("{what}: 36 px right: outside the circle, inside the layer rect"));
+    assert_near(pixels, 45, 35, [255, 0, 0], &format!("{what}: the layer rect's corner"));
+    assert_near(pixels, 130, 20, [0, 0, 255], &format!("{what}: above the layer (blue half)"));
+}
+
+/// A text mask ("MASK", 64-point monospace, UI only): green only where the glyphs are.
+fn text_mask_scene(ui: &egui::Ui, green: &Pass) -> Rect {
+    let painter = ui.painter();
+    halves(painter);
+    let galley = painter.layout_no_wrap("MASK".to_owned(), egui::FontId::monospace(64.0), Color32::WHITE);
+    let origin = pos2(24.0, 24.0);
+    let text_rect = galley.rect.translate(origin.to_vec2());
+    FilterLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(248.0, 120.0)), green.clone()).mask(egui_filter_layers::Mask::Shape(egui::Shape::galley(origin, galley, Color32::WHITE))).paint(painter);
+    text_rect
+}
+
+/// Many green pixels inside the text's rect, none outside it.
+fn check_text_mask(pixels: &[u8], text_rect: Rect, what: &str) {
+    let greenish = |x: u32, y: u32| rgb(pixels, x, y)[1] > 16;
+    let inside = |x: u32, y: u32| text_rect.expand(2.0).contains(pos2(f32::from(u16::try_from(x).unwrap_or(0)) + 0.5, f32::from(u16::try_from(y).unwrap_or(0)) + 0.5));
+    let mut green_inside = 0;
+    for y in 8..120 {
+        for x in 8..248 {
+            if !greenish(x, y) {
+                continue;
+            }
+            assert!(inside(x, y), "{what}: green at ({x}, {y}) outside the text rect {text_rect:?}");
+            green_inside += 1;
+        }
+    }
+    assert!(green_inside > 300, "{what}: only {green_inside} glyph pixels filtered");
+}
+
+/// F9 on wgpu: a circle mask filters inside only; outside it the BLENDED composite discards, so
+/// the screen keeps what egui drew there — including a lower filter layer's output in the upper
+/// layer's corner, which the re-rendered backdrop lacks; the anti-aliased edge is monotonic.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn a_circle_mask_filters_inside_and_keeps_the_screen_outside() {
+    let green = pass_of("green", GREEN_WGSL);
+    for format in [wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Rgba8UnormSrgb] {
+        let (ctx, state, _texture, target) = setup(format);
+        render_frame(&ctx, &state, &target, &mut |ui| circle_mask_scene(ui.painter(), &green));
+        let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| circle_mask_scene(ui.painter(), &green));
+        check_circle_mask(&pixels, &format!("{format:?}"));
+        assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    }
+}
+
+/// F9 on wgpu: a star built from convex paths (concave outline), a mask in a transformed layer
+/// (scale and translation), and a text galley mask (the font atlas is sampled by the rasterizer).
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn star_transformed_and_text_masks() {
+    let green = pass_of("green", GREEN_WGSL);
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    render_frame(&ctx, &state, &target, &mut |ui| star_mask_scene(ui.painter(), &green));
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| star_mask_scene(ui.painter(), &green));
+    check_star_mask(&pixels, "star");
+    render_frame(&ctx, &state, &target, &mut |ui| transformed_mask_scene(ui, &green));
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| transformed_mask_scene(ui, &green));
+    check_transformed_mask(&pixels, "transformed");
+    let mut text_rect = Rect::NOTHING;
+    for _ in 0..2 {
+        let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| text_rect = text_mask_scene(ui, &green));
+        check_text_mask(&pixels, text_rect, "text");
+    }
+    assert!(egui_filter_layers::failed_textures(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_textures(&ctx));
+    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
 }

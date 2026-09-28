@@ -72,6 +72,12 @@ frame stream needs (`video/` builds on exactly that).
   and `reset_state` start it over), dropped after a GPU error. Such a chain is never tiled
   (`NotTileable`); an RGBA16F state on a device that cannot render / filter it is
   `OfflineError::State`.
+- Shape masks (F9, `OfflineOptions::with_mask`): validated by `Mask::check_offline` (no text, no
+  textured meshes: no font atlas offline; `OfflineError::Mask`), tessellated once per run in frame
+  points with egui's default tessellation options, rasterized per tile window by the SAME
+  `wgpu_backend/coverage.rs` path as the UI (untextured meshes bind its white group). UI and offline
+  agree exactly where coverage is 0 or 1, within one step on the anti-aliased edge (UI blend vs
+  shader mix); tiled equals whole (tested).
 - Tiles overlap by the chain padding + 1 px; effects must read no further than their sample radius
   (the `lens` preset needs an explicit radius when tiled).
 - Every size is checked (`MAX_SIDE` = 2^24 - 1 per side, `usize` / `u32` / `u64` arithmetic);

@@ -7,7 +7,8 @@ beneath a rect through a chain of WGSL filter passes, on pluggable GPU backends.
 ## Architecture
 ```text
 user code ──► FilterLayer::paint (layer.rs)
-                 │  checks user textures (plan::check_textures) and the state id (check_state),
+                 │  checks user textures (plan::check_textures), the state id (check_state) and
+                 │  the mask (check_mask); tessellates a shape mask (mask.rs, GUI thread);
                  │  resolves FilterChain -> LayerJob (rect, mask, passes, padding, time,
                  │  frame_input, textures, id / viewport / state options / consumed reset)
                  ▼
@@ -26,7 +27,8 @@ user code ──► FilterLayer::paint (layer.rs)
   ping-pong into intermediates (the wiring — which slot each draw binds and writes, its viewport
   and complete uniform block — is `plan.rs`'s alone; backends map slots to objects and draw); run
   the internal composite pass (`shaders/composite.wgsl`) that
-  writes the result over the visible region by the rounded-rect mask. glow copies the backdrop
+  writes the result over the visible region by the mask (the rounded-rect SDF, or the alpha of a
+  shape mask's coverage texture, rasterized by the plan's coverage step before the passes). glow copies the backdrop
   out of the framebuffer and REPLACES the region (mixing with that exact copy); wgpu re-renders
   the beneath content offscreen (it cannot read its surface), so on wgpu that content is drawn
   twice, and the UI composite BLENDS over egui's pass by mask coverage (the re-render lacks paint
@@ -62,6 +64,10 @@ user code ──► FilterLayer::paint (layer.rs)
 - `geometry.rs`: `layer_geometry` — region / capture / UV / mask math (pure, unit-tested);
   `LayerGeometry::composite_params` (the composite pass's parameter block, every backend);
   `pointer_uniform` (the one screen-points -> capture-uv conversion of `fl.pointer`).
+- `mask.rs`: `Mask` (public: rounded rect / any egui `Shape` in layer points), `MaskError`,
+  `JobMask`, `tessellate` (the one tessellation, UI and offline: no pre-rasterized discs),
+  `CoverageMeshes::pack` -> `PackedCoverage` (egui vertex bytes, absolute `u32` indices, one draw
+  per texture run; every backend uploads exactly this), `MESH_WGSL`.
 - `layer.rs`: `FilterLayer` and its `paint` (skips a missing or failed backend, and a layer whose
   user textures fail `check_textures` (logged once per context and message); requests a repaint
   for animated chains only when the backend is usable; reads the per-frame input);
@@ -160,6 +166,18 @@ user code ──► FilterLayer::paint (layer.rs)
   for > 120 frames AND > 2 s: evicted. RGBA16F state requires renderable + filterable RGBA16F
   (else refused, `failed_states`; never downgraded); RGBA8 is opt-in. Stateful runs are never
   windowed (offline: `NotTileable`).
+- Shape masks (F9): a `Mask::Shape` is in LAYER points, tessellated where the job is built
+  (`FilterLayer::paint` on the GUI thread with the context's ppp / tessellation options / font
+  atlas size; offline per run with default options), without egui's pre-rasterized discs (only
+  text samples the font atlas). Coverage = the meshes' alpha (egui's premultiplied blend into a
+  cleared RGBA8 texture at capture resolution, the run's window at its origin), drawn by
+  `shaders/mesh.wgsl` on every backend (glow: naga-translated); the layer transform maps it at
+  paint time (`geometry::mask_transform`), so the feather scales with a zoom. The composite alone
+  binds it (`plan::ChainPlan::with_coverage`, `params[3].x = 1`); uncovered pixels keep the screen
+  on every backend (wgpu: discard). Paint callbacks in a mask are refused (`MaskError`, logged
+  once per message); offline also text and textured meshes (`OfflineError::Mask`). A mask texture
+  the renderer cannot resolve skips the layer (`failed_textures`; wgpu: a stale font atlas skips
+  only the frame).
 - Chain padding is the SUM of pass sample radii; a preset whose passes reach along different axes
   (separable blur) declares its reach on one pass only.
 - Backend-specific public API lives in its module behind its feature; core never names backend types.
@@ -180,3 +198,6 @@ user code ──► FilterLayer::paint (layer.rs)
 - New backend: implement `backend::Backend` in a feature-gated module, add its `install_*` API,
   register with `backend::register`.
 - Capture/padding/mask math: `geometry.rs`.
+- Shape masks: what is accepted / tessellation / packing `mask.rs`; the coverage step and its
+  uniform bytes `plan.rs`; rasterization wgpu `wgpu_backend/coverage.rs` (UI and offline), glow
+  `glow_backend/coverage.rs`; the composite's read `shaders/composite.wgsl` (`fl_coverage`).

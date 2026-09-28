@@ -249,6 +249,25 @@ is an explicit opt-in. It advances only on painted frames (request repaints whil
 Offline, the renderer carries the state from call to call (a video's frames); such chains are
 never tiled.
 
+### Masks
+
+A layer filters its rect, a rounded rect (`corner_radius`), or any egui shape — paths, circles,
+rects, meshes and text galleys, in the layer's points:
+
+```rust
+use egui_filter_layers::{FilterLayer, Mask, presets};
+
+let lens = egui::Shape::circle_filled(rect.center(), 60.0, egui::Color32::WHITE);
+FilterLayer::new(rect, presets::gaussian_blur(8.0)).mask(Mask::Shape(lens)).paint(ui.painter());
+```
+
+The shape's alpha is the coverage (paint it opaque; egui's feathered edge anti-aliases it, and a
+translucent fill filters partially); outside it — and outside the rect — the backdrop is untouched,
+on wgpu too (a lower filter layer shows through). The mask follows layer transforms; its feathered
+edge scales with a `Scene` zoom (it is tessellated before the zoom is known). egui fills convex
+paths only: build concave outlines from convex pieces or a mesh. Offline (`OfflineOptions::with_mask`)
+text masks and textured meshes are refused (`OfflineError::Mask`: there is no font atlas offline).
+
 ### Named parameters
 
 Declare `struct Params` in the snippet and read it as `p`; set values per pass by name. Types are
@@ -306,8 +325,8 @@ to named parameters.
   uninstall it.
 - **wgpu specifics**: the backdrop is re-rendered (see the warning above), so a filter over another
   filter sees the lower one's *unfiltered* backdrop, and paint callbacks beneath a filter are left
-  out of its backdrop. Outside a rounded mask (the corners of the layer's rect) the screen keeps
-  what is already there, so a lower filter does show through the corners. The beneath content is
+  out of its backdrop. Outside the mask (a rounded rect's corners, or anything outside a shape
+  mask) the screen keeps what is already there, so a lower filter does show through the corners. The beneath content is
   collected by an egui plugin at the end of every pass (`Context::run_ui` / `end_pass`, which
   eframe uses). On an `*Srgb` surface the backdrop is re-rendered with egui's linear blending,
   except on GL / WebGL2 (no texture view formats): there semi-transparent edges under a filter

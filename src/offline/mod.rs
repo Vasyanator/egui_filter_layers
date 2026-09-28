@@ -108,7 +108,8 @@ mod tiles;
 #[cfg(feature = "video")]
 pub mod video;
 
-use egui::{Rect, pos2};
+use egui::epaint::TessellationOptions;
+use egui::{CornerRadius, Rect, pos2};
 
 pub use error::OfflineError;
 pub use frame::{AlphaMode, FrameRef, RgbaFrame};
@@ -116,10 +117,12 @@ pub use options::{OfflineOptions, PointerState};
 pub use texture::OfflineTexture;
 
 use crate::effect::{TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING};
-use crate::geometry::{LayerGeometry, PxRect, layer_geometry, padding_px};
+use crate::geometry::{LayerGeometry, MaskTransform, PxRect, layer_geometry, mask_transform, padding_px};
+use crate::mask::{Mask, PackedCoverage, tessellate};
 use crate::pass::{FilterChain, InputUniforms};
 use crate::plan::{StatePlan, StatePlanInput, check_textures};
 use crate::state::{StateError, StateFormat};
+use crate::wgpu_backend::coverage::CoverageJob;
 use crate::wgpu_backend::chain::{ChainJob, ChainRecording, ChainResources, ChainSource, ChainState, ChainTargets, ChainWindow, draw_composite};
 use crate::wgpu_backend::gpu::{ErrorScopes, Target, begin_pass, egui_sampler_descriptor};
 use frame::{MAX_SIDE, convert_output, frame_bytes};
@@ -392,9 +395,19 @@ impl OfflineRenderer {
         }
         self.ensure_allocations(&plan).await?;
         self.ensure_user_textures(options).await?;
+        // A shape mask (F9), tessellated once per run like the UI does per paint: the frame is the
+        // layer (layer points = frame pixels / ppp, no transform) and the screen.
+        let coverage = match &options.mask {
+            Mask::RoundedRect(_) => None,
+            Mask::Shape(shape) => {
+                let frame_rect = frame_rect(size, options.pixels_per_point)?;
+                let meshes = tessellate(shape.clone(), frame_rect, options.pixels_per_point, TessellationOptions::default(), [1, 1]);
+                Some((meshes.pack(), mask_transform(frame_rect, frame_rect, options.pixels_per_point, geometry.capture)))
+            }
+        };
 
         for tile in &plan.tiles {
-            let run = TileRun { tile: *tile, geometry, image_width: size[0], time: options.time, input: options.input_uniforms(&geometry), state: state_input };
+            let run = TileRun { tile: *tile, geometry, image_width: size[0], time: options.time, input: options.input_uniforms(&geometry), state: state_input, coverage: coverage.as_ref() };
             let (layout, errors, state_plan) = self.record_tile(&run, pixels, chain, &pipelines)?;
             if let Some(error) = errors.await {
                 // Textures or the readback buffer may now be invalid objects: recreate them next run.
@@ -561,7 +574,7 @@ impl OfflineRenderer {
     /// readback buffer and submits — all inside [`ErrorScopes`]. Returns the readback layout of
     /// the tile, the future of the first GPU error of that work (await it before mapping) and, for
     /// a stateful run, where the latest state is afterwards.
-    fn record_tile(&mut self, run: &TileRun, pixels: &[u8], chain: &FilterChain, pipelines: &[wgpu::RenderPipeline]) -> Result<(RowLayout, impl Future<Output = Option<wgpu::Error>> + use<>, Option<StatePlan>), OfflineError> {
+    fn record_tile(&mut self, run: &TileRun<'_>, pixels: &[u8], chain: &FilterChain, pipelines: &[wgpu::RenderPipeline]) -> Result<(RowLayout, impl Future<Output = Option<wgpu::Error>> + use<>, Option<StatePlan>), OfflineError> {
         let (window, out) = (run.tile.window, run.tile.output);
         let [out_w, out_h] = [px_u32(out.w)?, px_u32(out.h)?];
         let layout = RowLayout::new(out_w, out_h)?;
@@ -594,6 +607,9 @@ impl OfflineRenderer {
                 pipelines,
                 user_textures,
                 state: run.state,
+                // Untextured meshes only (`Mask::check_offline`): the white group stands in for
+                // egui's white atlas pixel.
+                coverage: run.coverage.map(|(packed, transform)| CoverageJob { packed, transform: *transform, textures: vec![resources.coverage().white_group(); packed.draws.len()] }),
             };
             let recorded = resources.record(&mut ChainRecording { device, queue, encoder: &mut encoder }, &mut targets.chain, &job, state.as_mut());
             let Some((bind_group, planned_state)) = recorded else {
@@ -617,8 +633,9 @@ impl OfflineRenderer {
     }
 }
 
-/// What one tile's GPU run needs besides the renderer.
-struct TileRun {
+/// What one tile's GPU run needs besides the renderer (a shape mask is tessellated and packed
+/// once per `run`, each tile rasterizes its own window of it).
+struct TileRun<'a> {
     /// The tile.
     tile: Tile,
     /// The whole frame's geometry (every tile uses the same).
@@ -631,6 +648,8 @@ struct TileRun {
     input: InputUniforms,
     /// The renderer's state before this run (stateful chains, never tiled).
     state: Option<StatePlanInput>,
+    /// A shape mask's packed meshes and their layer-points -> frame-pixels transform.
+    coverage: Option<&'a (PackedCoverage, MaskTransform)>,
 }
 
 /// The layer geometry of a whole `size` frame: the layer rect covers the frame (in points at
@@ -644,10 +663,13 @@ fn frame_geometry(size: [u32; 2], padding_points: f32, options: &OfflineOptions)
     if size[0] > MAX_SIDE || size[1] > MAX_SIDE {
         return Err(OfflineError::TooLarge { width: size[0], height: size[1], max: MAX_SIDE });
     }
-    let points = |pixels: u32| i32::try_from(pixels).map(crate::geometry::px_f32).map_err(|_| OfflineError::SizeOverflow { what: "an image side" });
     let ppp = options.pixels_per_point;
-    let rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(points(size[0])? / ppp, points(size[1])? / ppp));
-    let geometry = layer_geometry(rect, Rect::EVERYTHING, ppp, size, padding_points, options.corner_radius, 1.0)
+    let rect = frame_rect(size, ppp)?;
+    let corner_radius = match &options.mask {
+        Mask::RoundedRect(radius) => *radius,
+        Mask::Shape(_) => CornerRadius::ZERO,
+    };
+    let geometry = layer_geometry(rect, Rect::EVERYTHING, ppp, size, padding_points, corner_radius, 1.0)
         .ok_or_else(|| OfflineError::InvalidOption { option: "pixels_per_point", reason: format!("{ppp} leaves no visible pixel of a {}x{} frame", size[0], size[1]) })?;
     // Tiles, uploads and the readback address the frame through `capture`: it must be the frame,
     // and the layer rect (`rect_uv`, the mask) must end exactly at its edges.
@@ -660,6 +682,16 @@ fn frame_geometry(size: [u32; 2], padding_points: f32, options: &OfflineOptions)
         });
     }
     Ok(geometry)
+}
+
+/// The layer rect of a whole `size` frame in points at `pixels_per_point` (the frame is the layer
+/// and the screen): `(0, 0)..(size / ppp)`. Shape masks are in these points.
+///
+/// # Errors
+/// [`OfflineError::SizeOverflow`] for a side beyond `i32`.
+fn frame_rect(size: [u32; 2], pixels_per_point: f32) -> Result<Rect, OfflineError> {
+    let points = |pixels: u32| i32::try_from(pixels).map(crate::geometry::px_f32).map_err(|_| OfflineError::SizeOverflow { what: "an image side" });
+    Ok(Rect::from_min_max(pos2(0.0, 0.0), pos2(points(size[0])? / pixels_per_point, points(size[1])? / pixels_per_point)))
 }
 
 /// An image side as `i32`.

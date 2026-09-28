@@ -5,7 +5,8 @@ Purpose:
 The ONE wgpu executor of a `FilterChain`: given an input texture that holds the capture (at its
 origin) and the layer's `LayerGeometry`, it runs the draws of the backend-neutral `plan::ChainPlan`
 (which slot each draw reads and writes, its viewport and uniform block are decided there, shared
-with glow) and prepares the composite that writes the result, masked by the rounded rect, into any
+with glow) and prepares the composite that writes the result, masked by the rounded rect or a
+rasterized shape (F9), into any
 render target. Holds no egui state: callers bring `&wgpu::Device`, `&wgpu::Queue` and a
 `CommandEncoder`, so both the UI paint callback (`render.rs`) and a standalone runner on its own
 device use exactly the same objects, formats, uniform layout and pass order.
@@ -16,7 +17,8 @@ Key structures:
   layout, groups 1..=3 of effect pipelines), dummies for bindings a draw leaves unused,
   intermediate format, uniform offset alignment, effect pipeline cache); builds composite
   pipelines for any output format.
-- `ChainTargets`: per-concurrent-run ping-pong intermediates and the uniform buffer.
+- `ChainTargets`: per-concurrent-run ping-pong intermediates, the uniform buffer and the shape
+  mask's coverage targets (F9).
 - `ChainSource`, `ChainRecording`, `ChainJob`, `ChainWindow`, `ChainState`: the inputs of one
   recorded run (`ChainState`: a stateful layer's two state textures, owned by the caller and kept
   across runs, F7).
@@ -40,6 +42,9 @@ One uniform buffer per run holds, for draw `i` (plan step `i`; draw `n` = the co
 slots (`@group(1 + i)`): each step binds the caller's bind group of the attached texture (egui's
 own in the UI, the renderer's in offline runs) where the plan says so, a dummy group elsewhere.
 Composite pipelines read no user texture and use the group-0-only layout.
+Shape mask (F9): a job with `coverage` (packed meshes, their transform, a texture group per
+draw) plans `with_coverage`; `record` rasterizes it (`coverage.rs`, before the passes) into the
+run's `ChainTargets` coverage texture and binds it at binding 6 of the composite only.
 State (F7): the caller owns a layer's two state textures (`ChainState`); `record` grows them to the
 plan's size KEEPING their content (`Target::ensure_kept`, a copy recorded first), clears the one
 the plan says, and maps `Slot::StateA` / `StateB` to them. A state pass's pipeline renders into
@@ -54,6 +59,7 @@ arithmetic does not depend on which window computed it.
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
+use super::coverage::{CoverageJob, CoverageRasterizer, CoverageTargets};
 use super::gpu::{GrowBuffer, Target, begin_pass, egui_texture_entries, pass_pipeline, renderable_and_filterable, sampler_entry, texture_entry, uniform_entry, with_error_scope};
 use crate::effect::{
     BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, CompiledModule, TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING, USER_TEXTURE_GROUP_BASE,
@@ -127,6 +133,8 @@ pub(crate) struct ChainResources {
     white: wgpu::TextureView,
     /// Effect pipelines by `CompiledModule::id` and output format (intermediate / state).
     pipelines: HashMap<(u64, wgpu::TextureFormat), CachedPipeline>,
+    /// The shape-mask coverage rasterizer (F9).
+    coverage: CoverageRasterizer,
 }
 
 impl ChainResources {
@@ -184,6 +192,8 @@ impl ChainResources {
             });
             let white_texture = dummy_texture(device, "egui_filter_layers white dummy");
             queue.write_texture(white_texture.as_image_copy(), &[u8::MAX; 4], wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) }, wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 });
+            let white = white_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let coverage = CoverageRasterizer::create(device, &user_layout, &white, &sampler);
             Self {
                 float_intermediates,
                 intermediate_format,
@@ -195,8 +205,9 @@ impl ChainResources {
                 effect_pipeline_layout,
                 dummy_user,
                 transparent,
-                white: white_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                white,
                 pipelines: HashMap::new(),
+                coverage,
             }
         })
     }
@@ -263,6 +274,12 @@ impl ChainResources {
         &self.user_layout
     }
 
+    /// The shape-mask coverage rasterizer (its white texture group serves untextured meshes).
+    #[cfg_attr(not(any(feature = "image", feature = "video")), allow(dead_code))] // Only offline runs need the white group.
+    pub(crate) fn coverage(&self) -> &CoverageRasterizer {
+        &self.coverage
+    }
+
     /// Drops pipelines of effects whose last clone was dropped.
     pub(crate) fn evict_dropped(&mut self) {
         self.pipelines.retain(|_, entry| entry.module.strong_count() > 0);
@@ -319,6 +336,13 @@ impl ChainResources {
         }
         let attached = job.user_textures.map(|texture| texture.is_some());
         let plan = plan(job.passes, job.geometry.capture.size(), job.window.rect, job.window.composite_origin, attached, job.state)?;
+        // A shape mask (F9): the plan's coverage step rasterizes it into the run's coverage
+        // texture before any pass (it only depends on the mask), and the composite reads it.
+        let plan = if job.coverage.is_some() { plan.with_coverage() } else { plan };
+        let coverage_target = match (&job.coverage, plan.coverage.as_ref()) {
+            (Some(coverage), Some(step)) => Some(self.coverage.record(rec, &mut targets.coverage, coverage, step)?),
+            _ => None,
+        };
         // The state textures: grown to the plan's size keeping the latest content, the empty one
         // cleared (both recorded before any pass of this run).
         let state_targets: Option<&[Option<Target>; 2]> = match (plan.state, state) {
@@ -351,7 +375,7 @@ impl ChainResources {
             return None;
         };
 
-        let allocations = Allocations { source: job.source.allocated, ping_pong: [first.size, second.size], state: state_views.map_or([[0, 0]; 2], |[a, b]| [a.size, b.size]) };
+        let allocations = Allocations { source: job.source.allocated, ping_pong: [first.size, second.size], state: state_views.map_or([[0, 0]; 2], |[a, b]| [a.size, b.size]), coverage: coverage_target.map_or([0, 0], |target| target.size) };
         let alignment = usize::try_from(self.uniform_alignment).unwrap_or(UNIFORM_BLOCK_SIZE);
         let uniforms = chain_uniforms(&frame_uniforms(&job.geometry, job.time).with_input(&job.input), &plan, job.passes, &job.geometry, &allocations, alignment);
         let uniform_buffer = targets.uniforms.write(rec.device, rec.queue, &uniforms.bytes).clone();
@@ -364,12 +388,16 @@ impl ChainResources {
             // No plan binds a state slot without `plan.state` (checked above): unreachable, and
             // the neutral dummy is what a stateless draw binds anyway.
             (Slot::StateA | Slot::StateB, None) => &self.transparent,
+            // Bound only by a plan `with_coverage`, whose texture was recorded above; the white
+            // dummy (full coverage) is what a draw without a shape mask binds anyway.
+            (Slot::Coverage, _) => coverage_target.map_or(&self.white, |target| &target.view),
         };
         let bind_group = |draw: &DrawUniforms, bindings: Bindings| {
             let fl = wgpu::BufferBinding { buffer: &uniform_buffer, offset: draw.fl.start, size: std::num::NonZeroU64::new(draw.fl.end - draw.fl.start) };
             let params = wgpu::BufferBinding { buffer: &uniform_buffer, offset: draw.params.start, size: std::num::NonZeroU64::new(draw.params.end - draw.params.start) };
             let original = bindings.original.map_or(&self.transparent, view_of);
             let state = bindings.state.map_or(&self.transparent, view_of);
+            let coverage = bindings.coverage.map_or(&self.white, view_of);
             rec.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("egui_filter_layers draw"),
                 layout: &self.layout,
@@ -380,7 +408,7 @@ impl ChainResources {
                     wgpu::BindGroupEntry { binding: BINDING_ORIGINAL_TEXTURE, resource: wgpu::BindingResource::TextureView(original) },
                     wgpu::BindGroupEntry { binding: BINDING_PARAMS, resource: wgpu::BindingResource::Buffer(params) },
                     wgpu::BindGroupEntry { binding: BINDING_STATE_TEXTURE, resource: wgpu::BindingResource::TextureView(state) },
-                    wgpu::BindGroupEntry { binding: BINDING_COVERAGE_TEXTURE, resource: wgpu::BindingResource::TextureView(&self.white) },
+                    wgpu::BindGroupEntry { binding: BINDING_COVERAGE_TEXTURE, resource: wgpu::BindingResource::TextureView(coverage) },
                 ],
             })
         };
@@ -444,12 +472,14 @@ pub(crate) struct ChainTargets {
     ping_pong: [Option<Target>; 2],
     /// Every draw's `fl` and named-parameter blocks (`chain_uniforms`).
     uniforms: GrowBuffer,
+    /// The shape-mask coverage texture and mesh buffers (F9).
+    coverage: CoverageTargets,
 }
 
 impl ChainTargets {
     /// Empty targets; textures and the buffer are allocated on first use.
     pub(crate) fn new() -> Self {
-        Self { ping_pong: [None, None], uniforms: GrowBuffer::new(wgpu::BufferUsages::UNIFORM, "egui_filter_layers uniforms") }
+        Self { ping_pong: [None, None], uniforms: GrowBuffer::new(wgpu::BufferUsages::UNIFORM, "egui_filter_layers uniforms"), coverage: CoverageTargets::new() }
     }
 }
 
@@ -518,6 +548,9 @@ pub(crate) struct ChainJob<'a> {
     pub user_textures: [Option<&'a wgpu::BindGroup>; TEXTURE_SLOTS],
     /// The layer's state (stateful chains; `record` then needs the `ChainState` too).
     pub state: Option<StatePlanInput>,
+    /// A shape mask (F9): its meshes are rasterized into the run's coverage texture; `None` =
+    /// the rounded-rect mask of `geometry`.
+    pub coverage: Option<CoverageJob<'a>>,
 }
 
 /// The layer's `FrameUniforms` with the wgpu flags: textures are stored top-down, like the effect
@@ -620,7 +653,7 @@ mod tests {
         let window = PxRect { x: 0, y: 0, w: 40, h: 30 };
         let Some(plan) = plan(&passes, window.size(), window, [5, 6], [false; TEXTURE_SLOTS], None) else { panic!("planned") };
         let geometry = LayerGeometry { region: window, capture: window, rect_uv: [0.0, 0.0, 1.0, 1.0], region_uv: [0.0, 0.0, 1.0, 1.0], mask_rect_px: [0.0, 0.0, 40.0, 30.0], mask_radii_px: [0.0; 4], pixels_per_layer_point: 1.0 };
-        let allocations = Allocations { source: [64, 64], ping_pong: [[40, 30], [128, 32]], state: [[0, 0]; 2] };
+        let allocations = Allocations { source: [64, 64], ping_pong: [[40, 30], [128, 32]], state: [[0, 0]; 2], coverage: [0, 0] };
         let frame = frame_uniforms(&geometry, 0.5);
         let alignment = 256;
         let uniforms = chain_uniforms(&frame, &plan, &passes, &geometry, &allocations, alignment);

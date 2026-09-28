@@ -32,6 +32,7 @@ TWICE per frame on wgpu.
 */
 
 mod beneath;
+pub(crate) mod coverage;
 // The chain executor and its wgpu helpers hold no egui state; crate-visible so a runner on its
 // own device can drive the same executor.
 pub(crate) mod chain;
@@ -257,6 +258,9 @@ struct Pending {
     viewport: egui::ViewportId,
     /// `LayerJob::textures`: resolved to bind groups when the layer is planned.
     textures: [Option<TextureId>; TEXTURE_SLOTS],
+    /// The textures a shape mask's meshes sample (F9; the font atlas for text and pre-rasterized
+    /// content, a mesh's own texture), resolved with the beneath textures.
+    mask_textures: Vec<TextureId>,
 }
 
 /// What the plugin hands to `prepare`: the beneath content of one layer, tessellated.
@@ -269,7 +273,8 @@ struct BeneathPlan {
     transform_scale: f32,
     /// Mesh primitives beneath the filter, clipped to the padded capture rect.
     primitives: Vec<ClippedPrimitive>,
-    /// A bind group for every texture the primitives reference (missing ones skipped).
+    /// A bind group for every texture the primitives reference (missing ones skipped) and for
+    /// every texture of the layer's shape mask (all present, else the layer is not planned).
     textures: HashMap<TextureId, wgpu::BindGroup>,
     /// Premultiplied gamma-space colour the layer's viewport is cleared to (see `plugin.rs`).
     clear_color: [f32; 4],
@@ -509,6 +514,9 @@ impl Backend for WgpuBackend {
         }
         let slot = Arc::new(LayerSlot::default());
         let (rect, padding_points, textures) = (job.rect, job.padding_points, job.textures);
+        let mut mask_textures: Vec<TextureId> = job.mask.coverage().map(|meshes| meshes.textures().collect()).unwrap_or_default();
+        mask_textures.sort_unstable();
+        mask_textures.dedup();
         // Read during the pass: after `end_pass` the context reports the parent viewport.
         let viewport = painter.ctx().viewport_id();
         let callback = FilterCallback::new(Arc::clone(&self.shared), Arc::clone(&slot), job);
@@ -519,7 +527,7 @@ impl Backend for WgpuBackend {
             // Entries whose callback died without being planned (discarded pass, other viewport
             // that never ended) are dropped here as well as in the plugin.
             pending.retain(|entry| entry.callback.strong_count() > 0);
-            pending.push(Pending { callback: weak, slot, rect, padding_points, viewport, textures });
+            pending.push(Pending { callback: weak, slot, rect, padding_points, viewport, textures, mask_textures });
         }
         painter.add(paint_callback);
     }

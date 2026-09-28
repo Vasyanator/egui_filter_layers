@@ -18,7 +18,8 @@ Key functions:
 
 Notes:
 Submodules: `glsl` (pure WGSL->GLSL translation), `resources` (GL objects), `render` (one layer
-per paint callback). Failure policy: a resource failure or an unexplained capture / composite GL
+per paint callback), `coverage` (shape-mask rasterizer, F9; a shape mask is packed on the GUI
+thread in `paint_layer`, its textures resolved in the callback like user textures). Failure policy: a resource failure or an unexplained capture / composite GL
 error latches the WHOLE backend (logged once at error level, reported by `status()`); a
 per-effect failure (GLSL translation, driver compile/link, or a GL error raised by that effect's
 draw) latches only that effect (layers using it are skipped, reported by `failed_effects()`); a
@@ -30,6 +31,7 @@ resolves to its current texture. Nothing is retried per frame. Re-installing on 
 previous glow backend's GL objects first.
 */
 
+mod coverage;
 mod glsl;
 mod render;
 mod resources;
@@ -42,6 +44,7 @@ use glow::HasContext as _;
 
 use crate::backend::{Backend, BackendKind, BackendStatus, EffectFailure, InstallError, LayerJob, TextureFailure, installed, register, uninstall};
 use crate::effect::{CompiledModule, TEXTURE_SLOTS};
+use crate::mask::CoverageMeshes;
 use crate::state::{StateError, StateFailure, StateFormat, StateRegistry};
 use glsl::{GlslTarget, glsl_target, translate};
 use resources::{GlError, RenderTarget, Resources, build_program};
@@ -307,8 +310,20 @@ impl Backend for GlowBackend {
         };
         let state = Arc::clone(&self.state);
         let rect = job.rect;
+        // A shape mask (F9) is packed once here, on the GUI thread; the callback only resolves
+        // the textures its draws sample.
+        let packed = job.mask.coverage().map(CoverageMeshes::pack);
         let callback = egui_glow::CallbackFn::new(move |info, glow_painter| {
             let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut mask_textures = Vec::with_capacity(packed.as_ref().map_or(0, |packed| packed.draws.len()));
+            for draw in packed.iter().flat_map(|packed| &packed.draws) {
+                let Some(texture) = glow_painter.texture(draw.texture) else {
+                    state.fail_texture(draw.texture);
+                    return;
+                };
+                mask_textures.push(texture);
+            }
+            let coverage = packed.as_ref().map(|packed| (packed, mask_textures.as_slice()));
             // egui_glow applied this frame's texture deltas before painting, so a live id maps to
             // its current texture; an unknown one skips the layer (no dummy stands in for it).
             let mut user_textures = [None; TEXTURE_SLOTS];
@@ -325,8 +340,8 @@ impl Backend for GlowBackend {
             // SAFETY: egui_glow invokes paint callbacks on the thread that owns the current
             // context, between its own draws; `render::paint_layer` restores the framebuffer
             // bindings and leaves none of its objects bound (egui re-runs prepare_painting). The
-            // user textures belong to `glow_painter`, alive for this callback.
-            unsafe { render::paint_layer(glow_painter.gl(), &mut state, target, &info, &job, user_textures) };
+            // user and mask textures belong to `glow_painter`, alive for this callback.
+            unsafe { render::paint_layer(glow_painter.gl(), &mut state, target, &info, &job, render::LayerTextures { user: user_textures, coverage }) };
         });
         painter.add(egui::PaintCallback { rect, callback: Arc::new(callback) });
     }

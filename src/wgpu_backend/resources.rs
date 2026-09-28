@@ -27,7 +27,8 @@ immediately, so a rejected shader becomes a latched failure instead of wgpu's de
 
 use super::WgpuOptions;
 use super::chain::{ChainResources, ChainTargets, CompositeOver};
-use super::gpu::{GrowBuffer, Target, egui_texture_entries, shader, uniform_entry, with_error_scope};
+use super::coverage::{MESH_WGSL, mesh_locals_layout, mesh_pipeline};
+use super::gpu::{GrowBuffer, Target, egui_texture_entries, shader, with_error_scope};
 use crate::state::StateRegistry;
 
 /// The two state textures of one stateful layer (`Slot::StateA` / `StateB`), created and grown by
@@ -42,12 +43,6 @@ pub(super) const CAPTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba
 /// the hardware then blends in linear and stores the sRGB encoding, as on a `*Srgb` screen.
 pub(super) const CAPTURE_SRGB_VIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
-
-/// Size of the mesh shader's `MeshLocals` uniform block (see `mesh.wgsl`).
-pub(super) const MESH_LOCALS_SIZE: usize = 32;
-
-/// Stride of one vertex of egui's `epaint::Vertex` (pos, uv: `f32x2` each; colour: `u32`).
-const VERTEX_STRIDE: u64 = 20;
 
 /// Everything ONE filter layer of the current frame renders into and draws from.
 #[derive(Debug)]
@@ -107,12 +102,6 @@ pub(super) struct WgpuResources {
     pub states: StateRegistry<StateTargets>,
 }
 
-/// egui-wgpu's premultiplied-alpha blend state (egui-wgpu 0.36 `renderer.rs`, `Renderer::new`).
-const EGUI_BLEND: wgpu::BlendState = wgpu::BlendState {
-    color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
-    alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::OneMinusDstAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
-};
-
 impl WgpuResources {
     /// Builds the chain objects, the blended composite pipelines for egui's pass and the mesh
     /// pipeline for one install.
@@ -151,7 +140,7 @@ impl WgpuResources {
         let (mesh_format, mesh_entry) = if srgb_capture { (CAPTURE_SRGB_VIEW_FORMAT, "fs_main_linear") } else { (CAPTURE_FORMAT, "fs_main") };
 
         let (mesh_locals_layout, mesh_pipeline) = with_error_scope(device, || {
-            let mesh_locals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers mesh locals"), entries: &[uniform_entry(0, Some(MESH_LOCALS_SIZE))] });
+            let mesh_locals_layout = mesh_locals_layout(device);
             // Identical descriptor to egui-wgpu's `egui_texture_bind_group_layout`: wgpu-core
             // deduplicates equal layouts and WebGPU treats them as group-equivalent, so egui's
             // own per-texture bind groups can be bound to this pipeline unchanged.
@@ -161,32 +150,8 @@ impl WgpuResources {
                 bind_group_layouts: &[Some(&mesh_locals_layout), Some(&texture_layout)],
                 immediate_size: 0,
             });
-            let mesh_shader = shader(device, "egui_filter_layers mesh", include_str!("mesh.wgsl"));
-            let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("egui_filter_layers mesh"),
-                layout: Some(&mesh_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &mesh_shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[Some(wgpu::VertexBufferLayout {
-                        array_stride: VERTEX_STRIDE,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32],
-                    })],
-                },
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &mesh_shader,
-                    entry_point: Some(mesh_entry),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format: mesh_format, blend: Some(EGUI_BLEND), write_mask: wgpu::ColorWrites::ALL })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
+            let mesh_shader = shader(device, "egui_filter_layers mesh", MESH_WGSL);
+            let mesh_pipeline = mesh_pipeline(device, &mesh_pipeline_layout, &mesh_shader, mesh_format, mesh_entry, "egui_filter_layers mesh");
             (mesh_locals_layout, mesh_pipeline)
         })?;
 
@@ -210,14 +175,14 @@ mod tests {
 
     #[test]
     fn the_mesh_shader_validates_and_matches_the_locals_size() {
-        let source = include_str!("mesh.wgsl");
+        let source = MESH_WGSL;
         let module = naga::front::wgsl::parse_str(source).map_err(|error| error.emit_to_string(source));
         let Ok(module) = module else { panic!("{module:?}") };
         let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty()).validate(&module);
         assert!(info.is_ok(), "{info:?}");
         let (_, ty) = module.types.iter().find(|(_, ty)| ty.name.as_deref() == Some("MeshLocals")).unwrap_or_else(|| panic!("MeshLocals missing"));
         let naga::TypeInner::Struct { span, .. } = &ty.inner else { panic!("MeshLocals is not a struct") };
-        assert_eq!(usize::try_from(*span).unwrap_or(0), MESH_LOCALS_SIZE);
+        assert_eq!(usize::try_from(*span).unwrap_or(0), crate::plan::MESH_LOCALS_SIZE);
         for entry in ["vs_main", "fs_main", "fs_main_linear"] {
             assert!(module.entry_points.iter().any(|point| point.name == entry), "entry point `{entry}` missing");
         }
