@@ -190,7 +190,8 @@ mod tests {
             let Ok(effect) = Effect::new(label, source) else { panic!("{label} must validate") };
             for target in TARGETS {
                 match translate(effect.module(), target) {
-                    Ok(program) => check_program(label, &program, target, &[0]),
+                    // Unit 0 = the pass input; built-ins reading `original()` (bloom) also unit 1.
+                    Ok(program) => check_program(label, &program, target, if source.contains("original(") { &[0, 1] } else { &[0] }),
                     Err(error) => panic!("{label} {target:?}: {error}"),
                 }
             }

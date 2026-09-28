@@ -16,8 +16,10 @@ Key functions:
   the parse (a snippet reading `p.x` does not parse without the appended declaration, so the
   declaration cannot be discovered from naga's IR first).
 - `ParamLayout::from_module()`: the layout of the parsed `Params` struct (naga's member offsets,
-  which equal GLSL std140 for every accepted type), with the WebGL2-safe size cap.
+  checked to equal GLSL std140, so `@size` / `@align` that move a member are rejected), with the
+  WebGL2-safe size cap.
 - `ParamValue::write()` / `ParamValue::read()`: native-endian (de)serialization of one element.
+- `From<egui::Color32>` (premultiplied gamma space, like `src()`) / `ParamValue::linear_rgba()`.
 
 Notes:
 Accepted member types: `f32`, `i32`, `u32`, `vec2/3/4<f32>`, `mat4x4<f32>` and fixed-size arrays
@@ -95,6 +97,26 @@ impl ParamType {
     }
 }
 
+impl ParamType {
+    /// Base alignment of a plain member of this type under GLSL std140 (which equals WGSL's
+    /// uniform-address-space alignment for every accepted type).
+    fn std140_align(self) -> u32 {
+        match self {
+            Self::F32 | Self::I32 | Self::U32 => 4,
+            Self::Vec2 => 8,
+            Self::Vec3 | Self::Vec4 | Self::Mat4 => 16,
+        }
+    }
+
+    /// Stride of an array of this type under GLSL std140: the element size rounded up to 16.
+    fn std140_array_stride(self) -> u32 {
+        match self {
+            Self::F32 | Self::I32 | Self::U32 | Self::Vec2 | Self::Vec3 | Self::Vec4 => 16,
+            Self::Mat4 => 64,
+        }
+    }
+}
+
 impl fmt::Display for ParamType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.wgsl())
@@ -132,7 +154,13 @@ impl ParamInfo {
 }
 
 /// A typed value for one named parameter (one element of an array member).
+///
+/// Colours: effects run on premultiplied-alpha, GAMMA-space values (what `src()` returns), so
+/// `ParamValue::from(egui::Color32)` yields premultiplied gamma-space floats in `0..=1`. A linear
+/// colour must be asked for by name ([`ParamValue::linear_rgba`]); there is deliberately no
+/// `From<egui::Rgba>`, whose linear values would silently shift a gamma-space effect's colours.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ParamValue {
     /// For an `f32` member.
     F32(f32),
@@ -151,6 +179,14 @@ pub enum ParamValue {
 }
 
 impl ParamValue {
+    /// A `vec4<f32>` holding `color` in LINEAR premultiplied RGBA — for effects that convert
+    /// their samples to linear light themselves. Effects work in gamma space by default; a colour
+    /// meant to match `src()` values comes from `ParamValue::from(Color32)` instead.
+    #[must_use]
+    pub fn linear_rgba(color: egui::Rgba) -> Self {
+        Self::Vec4(color.to_array())
+    }
+
     /// The member type this value fits.
     #[must_use]
     pub fn ty(&self) -> ParamType {
@@ -267,10 +303,11 @@ impl From<egui::Vec2> for ParamValue {
     }
 }
 
-impl From<egui::Rgba> for ParamValue {
-    /// Linear premultiplied RGBA as a `vec4<f32>`.
-    fn from(value: egui::Rgba) -> Self {
-        Self::Vec4(value.to_array())
+impl From<egui::Color32> for ParamValue {
+    /// Premultiplied GAMMA-space RGBA in `0..=1` as a `vec4<f32>` — the space `src()` returns and
+    /// effects work in, so `p.tint` compares and mixes directly with sampled pixels.
+    fn from(value: egui::Color32) -> Self {
+        Self::Vec4(value.to_normalized_gamma_f32())
     }
 }
 
@@ -339,7 +376,8 @@ impl ParamLayout {
     ///
     /// # Errors
     /// [`EffectError::Interface`] naming the member when a member type is not accepted (see the
-    /// file notes), an array has a stride uniform blocks cannot hold, or the block exceeds
+    /// file notes), an array has a stride uniform blocks cannot hold, a member's offset or the
+    /// struct's span differs from GLSL std140 (`@size` / `@align`), or the block exceeds
     /// [`MAX_PARAMS_BLOCK_SIZE`]; also when the module has no `Params` struct at all.
     pub(super) fn from_module(module: &naga::Module, label: &str, location: SnippetLocation) -> Result<Self, EffectError> {
         let error = |reason: String| EffectError::Interface { label: label.to_owned(), reason, location: Some(location) };
@@ -347,6 +385,10 @@ impl ParamLayout {
             return Err(error(format!("`{PARAMS_STRUCT}` must be a `struct` declared at module scope")));
         };
         let mut fields = Vec::with_capacity(members.len());
+        // End (in bytes) of the previous member under GLSL std140, the layout the glow backend's
+        // GL driver gives the block naga emits (naga's GLSL writer prints the members without the
+        // WGSL offsets, so a WGSL-only offset would silently desync glow from wgpu).
+        let mut std140_end: u32 = 0;
         for member in members {
             let name = member.name.clone().unwrap_or_default();
             let inner = |handle: naga::Handle<naga::Type>| module.types.get_handle(handle).ok().map(|ty| &ty.inner);
@@ -374,7 +416,26 @@ impl ParamLayout {
                     (ty, 1, false, u32::try_from(ty.size()).unwrap_or(u32::MAX))
                 }
             };
+            let too_big = || error(format!("`{PARAMS_STRUCT}` is larger than {MAX_PARAMS_BLOCK_SIZE} bytes (the WebGL2 / GLES 3.0 uniform block limit)"));
+            let std140_offset = std140_end.checked_next_multiple_of(if is_array { 16 } else { ty.std140_align() }).ok_or_else(too_big)?;
+            let std140_stride = if is_array { ty.std140_array_stride() } else { stride };
+            if member.offset != std140_offset || stride != std140_stride {
+                return Err(error(format!(
+                    "`{PARAMS_STRUCT}.{name}` lies at byte {} (stride {stride}), but the GL backend lays the block out by std140, which puts it at byte {std140_offset} (stride {std140_stride}); `@size` and `@align` are not supported on `{PARAMS_STRUCT}` members",
+                    member.offset
+                )));
+            }
+            std140_end = stride.checked_mul(count).and_then(|bytes| std140_offset.checked_add(bytes)).ok_or_else(too_big)?;
             fields.push(ParamInfo { name, ty, offset: member.offset, count, is_array, stride });
+        }
+        // std140 pads the block to a multiple of 16; WGSL's span exceeds that only through a
+        // `@size` on the last member, which GL would not honour either.
+        let std140_size = std140_end.checked_next_multiple_of(16).unwrap_or(u32::MAX);
+        if *span > std140_size {
+            let last = fields.last().map_or("", |field| field.name.as_str());
+            return Err(error(format!(
+                "`{PARAMS_STRUCT}` spans {span} bytes, but the GL backend lays the block out by std140, which ends at byte {std140_size}; `@size` and `@align` are not supported on `{PARAMS_STRUCT}` members (check `{PARAMS_STRUCT}.{last}`)"
+            )));
         }
         let span = usize::try_from(*span).unwrap_or(usize::MAX);
         let block_size = span.div_ceil(PARAMS_BLOCK_ALIGN).saturating_mul(PARAMS_BLOCK_ALIGN);
@@ -519,5 +580,16 @@ mod tests {
         assert_eq!(ParamValue::read(ParamType::Vec4, &[0; 12]), None, "too short");
         assert_eq!(ParamValue::from(egui::vec2(1.0, 2.0)), ParamValue::Vec2([1.0, 2.0]));
         assert_eq!(ParamValue::from(3_u32).ty(), ParamType::U32);
+    }
+
+    /// `Color32` becomes premultiplied GAMMA-space floats (the space of `src()`), a linear colour
+    /// only through the explicitly named constructor.
+    #[test]
+    fn colours_convert_in_an_explicit_space() {
+        let half_red = egui::Color32::from_rgba_premultiplied(128, 0, 0, 128);
+        assert_eq!(ParamValue::from(half_red), ParamValue::Vec4([128.0 / 255.0, 0.0, 0.0, 128.0 / 255.0]));
+        // Opaque mid-grey red: gamma 128/255 is linear ~0.216.
+        let ParamValue::Vec4([red, _, _, alpha]) = ParamValue::linear_rgba(egui::Rgba::from(egui::Color32::from_rgb(128, 0, 0))) else { panic!("a vec4") };
+        assert!((red - 0.216).abs() < 0.01 && (alpha - 1.0).abs() < 1e-6, "linear red {red}, alpha {alpha}");
     }
 }

@@ -73,6 +73,8 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   every draw binds its own `plan::params_block` range of the run's uniform buffer.
 - The mesh pipeline's group 1 layout is the SAME descriptor as egui-wgpu's texture layout, so
   egui's per-texture bind groups bind unchanged (wgpu-core dedups layouts; WebGPU group-equivalence).
+- Both ping-pong targets are grown to at least the plan's `target_px` (every scaled step's
+  image sits at the target origin; viewports and mappings come from the plan).
 - Every layer of a frame gets its own `LayerTargets` (pool index = prepare order, reset in
   `finish_prepare`): all prepares are recorded before the single egui pass. Likewise any caller of
   the executor needs one `ChainTargets` per run whose composite is still pending.

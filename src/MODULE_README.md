@@ -47,8 +47,9 @@ user code ──► FilterLayer::paint (layer.rs)
   `set_slice` / `get`), `FilterChain`, `PARAM_SLOTS`, uniform block layout (`offsets`, `pack_uniforms`),
   `FrameUniforms::for_layer` (the per-layer uniform values every backend uploads).
 - `plan.rs`: backend-neutral wiring of one chain run — `plan()` (steps: bindings by `Slot`,
-  output, viewport, fragment offset; the composite), `TextureMapping::of` (the one storage-uv
-  formula), `step_uniforms` / `composite_uniforms` / `params_block` / `composite_params_block`
+  what each slot holds (`Content`: resolution, window), output, viewport, fragment offset; the
+  composite; the ping-pong pool size `target_px`), `scaled_px` (per-pass scale sizes),
+  `TextureMapping::of` (the one storage-uv formula), `step_uniforms` / `composite_uniforms` / `params_block` / `composite_params_block`
   (every block a backend uploads, at bindings 0 and 4).
 - `geometry.rs`: `layer_geometry` — region / capture / UV / mask math (pure, unit-tested);
   `LayerGeometry::composite_params` (the composite pass's parameter block, every backend);
@@ -60,6 +61,10 @@ user code ──► FilterLayer::paint (layer.rs)
   lives in the `Context` and survives `Memory` resets), public `status`, `failed_effects`,
   `BackendStatus`, `EffectFailure`, `InstallError`.
 - `presets.rs`: built-in effects (compiled once in `OnceLock`s) and their constructors.
+- `impulses.rs`: `Impulses` (F3) — user-owned, bounded (16, oldest dropped first) timed impulses
+  in layer-rect uv; packs them into the named params `impulses` / `impulse_count` (`apply`), and
+  is the only thing that requests repaints for impulse-driven effects (`request_repaint_if_alive`,
+  only while one is alive). No egui memory, no global state; usable offline with any clock.
 - `shaders/`: the WGSL prelude and composite pass (see its readme).
 - `glow_backend/`: the `egui_glow` backend (see its readme).
 - `wgpu_backend/`: the `egui-wgpu` backend (see its readme); its `chain.rs` is the single, egui-free
@@ -71,7 +76,8 @@ user code ──► FilterLayer::paint (layer.rs)
 
 ## Contracts and invariants
 - Public API never panics on user input; the only panics are in `presets::builtin` for invalid
-  built-in WGSL, which tests exclude.
+  built-in WGSL and `presets::builtin_param` for a built-in rejecting its own named parameters,
+  both crate bugs that tests exclude.
 - `FlUniforms` byte layout: `pass::offsets` must match the WGSL struct (pinned by a naga-layout test).
   Members without a producer yet hold neutral values set in `FrameUniforms::for_layer`.
 - Per-frame input (`fl.delta_time`, `fl.frame`, `fl.pointer`): read on the GUI thread in
@@ -107,6 +113,12 @@ user code ──► FilterLayer::paint (layer.rs)
   `geometry::transform_scale`, the callback's rendered / painted width), converts padding, corner
   radii and `fl.pixels_per_point` (set only by `FrameUniforms::for_layer`). Untransformed layers
   get a scale of exactly 1.
+- Per-pass scale (F6, `Pass::with_scale`): a scaled step renders `plan::scaled_px(capture,
+  scale)` pixels of the WHOLE capture into its ping-pong slot; `uv`, `fl.texel`, `fl.size_px`,
+  `fl.pixels_per_point` stay the capture's, `internal_src_texel` / `internal_frag_texel` carry
+  the input / output pixel size (`src_px`, `src_texel()`, `out_texel()`). Scaled chains run
+  only over the whole capture (offline tiling refuses them: `OfflineError::NotTileable`); the
+  composite upsamples a scaled last output bilinearly.
 - Chain padding is the SUM of pass sample radii; a preset whose passes reach along different axes
   (separable blur) declares its reach on one pass only.
 - Backend-specific public API lives in its module behind its feature; core never names backend types.

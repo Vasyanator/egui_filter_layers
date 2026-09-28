@@ -15,6 +15,9 @@
 //!   lens, the custom wave, a Gaussian blur above `sigma * ppp = 32 / 3`) go through hardware bilinear filtering, whose sub-texel weights depend
 //!   (rarely) on the texture size and the window origin; they are bounded instead (2 steps,
 //!   under 0.1% of the values).
+//! * Reduced-resolution chains (F6: `with_scale`, `kawase_blur`, `bloom`): bit for bit with the
+//!   UI when processed whole; a frame that would need tiles is refused (`NotTileable`).
+//! * The GPU tests of this file run one at a time (`GPU_TESTS`, see there).
 //!
 //! Needs a GPU adapter, so the tests are ignored by default:
 //! `cargo test --all-features --test offline_equivalence -- --ignored --nocapture`.
@@ -31,13 +34,26 @@ const HEIGHT: u32 = 128;
 /// `fl.time` of every case (exact in `f32` and `f64`).
 const TIME: f32 = 0.375;
 
-/// Device, queue and adapter of any available GPU; panics with the reason otherwise.
-fn gpu() -> (wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue) {
+/// Serializes the GPU tests of this file, each for its whole duration. With wgpu's Vulkan
+/// validation layer (debug builds) on Mesa radv, tests running in parallel crashed with SIGSEGV
+/// inside `libVkLayer_khronos_validation` (e.g. in `vkSetDebugUtilsObjectNameEXT` of one test's
+/// buffer creation while others created or destroyed instances) in about half the runs; locking
+/// only instance creation (as `wgpu_headless.rs` does) was not enough here. Test-only.
+static GPU_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The lock of [`GPU_TESTS`], held by a test until it ends (a panicking test cannot corrupt
+/// `()`, so a poisoned lock is still usable).
+type Serialized = std::sync::MutexGuard<'static, ()>;
+
+/// Device, queue and adapter of any available GPU, and the lock serializing this file's GPU
+/// tests (keep it alive for the whole test); panics with the reason otherwise.
+fn gpu() -> (Serialized, wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue) {
+    let serialized = GPU_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap_or_else(|error| panic!("no wgpu adapter: {error}"));
     eprintln!("adapter: {:?}", adapter.get_info());
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap_or_else(|error| panic!("no wgpu device: {error}"));
-    (instance, adapter, device, queue)
+    (serialized, instance, adapter, device, queue)
 }
 
 /// A deterministic test image: gradients, hash noise and hard edges; `alpha(x, y)` per pixel.
@@ -146,11 +162,13 @@ struct Ui {
     texture: egui::TextureHandle,
     /// Pixels per point.
     ppp: f32,
+    /// This file's GPU-test lock, held while the `Ui` lives.
+    _serialized: Serialized,
 }
 
 impl Ui {
     fn new(format: wgpu::TextureFormat, dithering: bool, ppp: f32, image: &[u8]) -> Self {
-        let (instance, adapter, device, queue) = gpu();
+        let (serialized, instance, adapter, device, queue) = gpu();
         // One value feeds both, so egui's pass and the filter's pipelines cannot drift apart.
         let renderer_options = egui_wgpu::RendererOptions { dithering, ..Default::default() };
         let renderer = egui_wgpu::Renderer::new(&device, format, renderer_options);
@@ -179,7 +197,7 @@ impl Ui {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        Self { ctx, state, target, texture, ppp }
+        Self { ctx, state, target, texture, ppp, _serialized: serialized }
     }
 
     /// The image (1:1, the whole screen) under a layer covering it, as egui-wgpu draws it;
@@ -398,7 +416,7 @@ fn a_translucent_image_over_a_background_is_within_one_step() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn tiled_frames_equal_whole_frames() {
-    let (_instance, adapter, device, queue) = gpu();
+    let (_serialized, _instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let (width, height) = (300, 200);
     let image = test_image(width, height, |x, y| if (x + y) % 5 == 0 { 128 } else { 255 });
@@ -433,7 +451,7 @@ fn tiled_frames_equal_whole_frames() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn an_empty_chain_and_identity_effects_keep_the_frame() {
-    let (_instance, adapter, device, queue) = gpu();
+    let (_serialized, _instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let image = test_image(70, 33, |_, _| 255);
     let frame = FrameRef::new(&image, 70, 33, AlphaMode::Straight);
@@ -450,7 +468,7 @@ fn an_empty_chain_and_identity_effects_keep_the_frame() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn default_tiling_equals_an_untiled_run() {
-    let (_instance, adapter, device, queue) = gpu();
+    let (_serialized, _instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let (width, height) = (egui_filter_layers::offline::DEFAULT_MAX_TILE_SIZE + 200, 96);
     assert!(device.limits().max_texture_dimension_2d >= width, "the device cannot run the frame untiled");
@@ -469,7 +487,7 @@ fn default_tiling_equals_an_untiled_run() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn a_small_buffer_limit_is_respected_by_tiling() {
-    let (_instance, adapter, device, queue) = gpu();
+    let (_serialized, _instance, adapter, device, queue) = gpu();
     let limits = wgpu::Limits { max_buffer_size: 1 << 20, ..wgpu::Limits::default() };
     let (small_device, small_queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).unwrap_or_else(|error| panic!("no limited device: {error}"));
     let mut reference = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
@@ -489,7 +507,7 @@ fn a_small_buffer_limit_is_respected_by_tiling() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn a_cancelled_readback_does_not_brick_the_renderer() {
-    let (_instance, adapter, device, queue) = gpu();
+    let (_serialized, _instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let image = test_image(WIDTH, HEIGHT, |_, _| 255);
     let frame = FrameRef::new(&image, WIDTH, HEIGHT, AlphaMode::Straight);
@@ -512,7 +530,7 @@ fn a_cancelled_readback_does_not_brick_the_renderer() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn original_returns_the_input_in_every_pass_and_tile() {
-    let (_instance, adapter, device, queue) = gpu();
+    let (_serialized, _instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let (width, height) = (300, 200);
     let image = test_image(width, height, |_, _| 255);
@@ -542,7 +560,7 @@ fn offline_frame_input_follows_the_options_and_the_video_clock() {
     use egui_filter_layers::PointerState;
     use egui_filter_layers::offline::video::VideoProcessor;
 
-    let (_instance, adapter, device, queue) = gpu();
+    let (_serialized, _instance, adapter, device, queue) = gpu();
     let (width, height) = (96, 64);
     let image = test_image(width, height, |_, _| 255);
     let frame = FrameRef::new(&image, width, height, AlphaMode::Straight);
@@ -585,4 +603,66 @@ fn offline_frame_input_follows_the_options_and_the_video_clock() {
     }
     let invalid = OfflineOptions::default().with_delta_time(-1.0);
     assert!(offline.process(&frame, &chain, &invalid).is_err(), "a negative delta_time is rejected");
+}
+
+/// F6 chains: a kawase blur, a bloom, scaled identity passes ending at full resolution, and one
+/// ending scaled (the composite upsamples it). The UI allocates its intermediates at the capture
+/// size (the plan's pool), like the offline run, so both sample identical textures.
+fn scaled_cases() -> Vec<(&'static str, FilterChain)> {
+    let identity = Pass::new(&Effect::new("id", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }").unwrap_or_else(|error| panic!("{error}")));
+    vec![
+        ("kawase_blur", presets::kawase_blur(12.0)),
+        ("bloom", presets::bloom(0.4, 1.3, 10.0)),
+        ("half / quarter / invert", FilterChain::from(vec![identity.clone().with_scale(0.5), identity.clone().with_scale(0.25)]).then(presets::invert(1.0))),
+        ("invert at a third, upsampled by the composite", FilterChain::from(presets::invert(1.0).with_scale(1.0 / 3.0))),
+    ]
+}
+
+/// F6: offline equals the UI bit for bit for scaled chains (whole frame), at 1 and 2 pixels per
+/// point (the kawase tap spacing follows the pixels per point).
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn scaled_chains_offline_equal_the_ui() {
+    let image = test_image(WIDTH, HEIGHT, |_, _| 255);
+    let mut failures = Vec::new();
+    for ppp in [1.0, 2.0] {
+        let ui = Ui::new(wgpu::TextureFormat::Rgba8Unorm, false, ppp, &image);
+        let mut offline = OfflineRenderer::from_render_state(&ui.state).unwrap_or_else(|error| panic!("{error}"));
+        for (name, chain) in scaled_cases() {
+            let expected = ui.render(&chain, 0);
+            let options = OfflineOptions::default().with_pixels_per_point(ppp).with_time(TIME).with_output_alpha(AlphaMode::Premultiplied);
+            let result = offline.process(&FrameRef::new(&image, WIDTH, HEIGHT, AlphaMode::Straight), &chain, &options).unwrap_or_else(|error| panic!("{name}: {error}"));
+            let (count, max, first) = compare(&expected, result.pixels(), WIDTH, true);
+            eprintln!("scaled, ppp {ppp} | {name}: {count} differing channel values, max diff {max}, first at {first:?}");
+            if max > 0 {
+                failures.push(format!("ppp {ppp} {name}: max diff {max} ({count} values, first at {first:?})"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// F6: a scaled chain on a frame that needs tiles is refused with `NotTileable` (no
+/// approximation); the same frame processed whole works and equals an untiled default run; an
+/// unscaled chain still tiles.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn scaled_chains_refuse_tiling_and_run_whole() {
+    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
+    let (width, height) = (300, 200);
+    let image = test_image(width, height, |_, _| 255);
+    let frame = FrameRef::new(&image, width, height, AlphaMode::Straight);
+    for (name, chain) in scaled_cases() {
+        let tiled = offline.process(&frame, &chain, &OfflineOptions::default().with_max_tile_size(Some(128)));
+        match tiled {
+            Err(egui_filter_layers::OfflineError::NotTileable { reason }) => eprintln!("{name}: refused as expected: {reason}"),
+            other => panic!("{name}: a scaled chain must refuse tiling, got {:?}", other.map(|frame| frame.width())),
+        }
+        let whole = offline.process(&frame, &chain, &OfflineOptions::default().with_max_tile_size(None)).unwrap_or_else(|error| panic!("{name}: {error}"));
+        let default = offline.process(&frame, &chain, &OfflineOptions::default()).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(whole.pixels(), default.pixels(), "{name}: a frame under the default tile size runs whole");
+    }
+    // Refusal is about scaled passes only.
+    assert!(offline.process(&frame, &presets::gaussian_blur(2.0), &OfflineOptions::default().with_max_tile_size(Some(128))).is_ok());
 }

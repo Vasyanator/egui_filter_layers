@@ -8,6 +8,7 @@ documentation (semantics, shader model, backend matrix).
 Key items:
 - `FilterLayer`, `FilterChain`, `Pass`, `Effect` (re-exported from their modules)
 - `presets` module
+- `Impulses` (+ `Impulse`, `ImpulsePack`, param-name constants): input-driven transient effects
 - `install_glow()` / `destroy_glow()` (feature `glow`), `install_wgpu()` / `WgpuOptions`
   (feature `wgpu`), `status()`, `failed_effects()`
 - `offline` module and its re-exports (`OfflineRenderer`, ...; features `image` / `video`)
@@ -71,11 +72,12 @@ module names a backend type.
 //! | name | meaning |
 //! |---|---|
 //! | `src(uv)` | the pass input (bilinear, clamped to the captured region) |
-//! | `src_px(offset)` | the input at `offset` physical pixels from the current pixel |
+//! | `src_px(offset)` | the input at `offset` pixels OF THE INPUT from the current pixel (physical pixels unless the previous pass is scaled) |
+//! | `src_texel()`, `out_texel()` | one pixel of the pass's input / of its own output, in `uv` units (both `fl.texel` at full resolution) |
 //! | `original(uv)` | the untouched captured backdrop (before any pass), in every pass of the chain |
 //! | `p.<name>` | a named parameter: member `<name>` of the snippet's own `struct Params` (see below) |
 //! | `params(i)` | anonymous parameter slot `i` (`0..16`) of the [`Pass`], a `vec4<f32>` (the untyped block; prefer named parameters) |
-//! | `fl.texel` | size of one physical pixel in `uv` units |
+//! | `fl.texel` | size of one physical pixel in `uv` units (of the capture, also in scaled passes) |
 //! | `fl.size_px` | captured region size in physical pixels |
 //! | `fl.rect_uv` | the layer rect inside the capture (`xy` = min, `zw` = size), in `uv` units |
 //! | `fl.time` | seconds (egui input time); reading it makes the effect animated (see below) |
@@ -83,6 +85,7 @@ module names a backend type.
 //! | `fl.frame` | frame counter, `u32` (egui's `cumulative_frame_nr`, wrapping; offline: the video frame index) |
 //! | `fl.pointer` | the pointer: `xy` in `uv` units (outside `0..1` off the capture), `z` = 1 while the primary button is down, `w` = 1 when a pointer exists (`w = 0`: none, all zero) |
 //! | `fl.pixels_per_point` | physical pixels per layer point (egui's scale factor × the layer transform's zoom), to convert point distances to pixels |
+//! | `fl.pass_scale` | this pass's output resolution relative to the capture ([`Pass::with_scale`]; `1` = full) |
 //! | `to_linear(c)`, `to_gamma(c)` | sRGB transfer functions on `rgb` (alpha untouched) |
 //! | `premultiply(c)`, `unpremultiply(c)`, `luma(rgb)` | colour helpers |
 //!
@@ -131,10 +134,30 @@ module names a backend type.
 //! at the declaration. The snippet must not declare its own module-scope `p`. Named and
 //! anonymous (`params(i)`) parameters can be used together.
 //!
+//! ## Impulses: transient effects from input
+//!
+//! [`Impulses`] is a small collection you keep in your app state: push an impulse where the
+//! user clicked ([`Impulses::push_point`], positions relative to the layer rect), and every
+//! frame hand it to [`presets::click_ripples`] (rings expanding from each click) or to your own
+//! effect through [`Impulses::apply`], which fills the named parameters [`IMPULSES_PARAM`]
+//! (`impulses: array<vec4<f32>, 16>`, each `(uv.x, uv.y, age_seconds, strength)`) and
+//! [`IMPULSE_COUNT_PARAM`] (`impulse_count: u32`). Impulses age against the clock you pass
+//! (egui's `input.time` in the UI, frame time offline), expire after their life, and a full
+//! collection drops the oldest first ([`IMPULSE_SLOTS`] at most). Such effects are not animated by
+//! `fl.time`: call [`Impulses::request_repaint_if_alive`] each frame, so the app repaints while a
+//! ring is alive and stays idle afterwards.
+//!
 //! Colours are **premultiplied-alpha, gamma-space** RGBA in and out. Names starting with `fl_`
 //! and the prelude names above are reserved. An effect cannot declare its own bindings or entry
 //! points. If it reads further than the current pixel, declare how far with
 //! [`Effect::with_sample_radius`] (or per pass with [`Pass::with_sample_radius`]).
+//!
+//! **Reduced-resolution passes.** [`Pass::with_scale`] runs a pass over `ceil(capture * scale)`
+//! pixels; the next pass (or the final composite, bilinearly) reads that smaller image. `uv`,
+//! `src()`, `original()`, `fl.texel` and `fl.size_px` keep their capture meaning, so an
+//! effect's distance maths is the same at any scale; kernels that step in pixels use `src_px()`
+//! / `src_texel()` (input pixels) or `out_texel()`. [`presets::kawase_blur`] and
+//! [`presets::bloom`] are built from such passes. Offline, a scaled chain refuses tiling.
 //!
 //! **Distances are in layer points.** Sample radii, corner radii and every effect distance
 //! converted with `fl.pixels_per_point` are measured in the points of the layer the filter is
@@ -186,6 +209,7 @@ module names a backend type.
 mod backend;
 mod effect;
 mod geometry;
+mod impulses;
 mod layer;
 mod pass;
 mod plan;
@@ -203,8 +227,9 @@ pub mod offline;
 
 pub use backend::{BackendKind, BackendStatus, EffectFailure, InstallError, failed_effects, status};
 pub use effect::{Effect, EffectError, ParamError, ParamInfo, ParamType, ParamValue, SnippetLocation};
+pub use impulses::{IMPULSE_COUNT_PARAM, IMPULSE_SLOTS, IMPULSES_PARAM, Impulse, ImpulsePack, Impulses};
 pub use layer::FilterLayer;
-pub use pass::{FilterChain, PARAM_SLOTS, ParamIndexError, Params, Pass};
+pub use pass::{FilterChain, MIN_PASS_SCALE, PARAM_SLOTS, ParamIndexError, Params, Pass};
 
 #[cfg(feature = "glow")]
 pub use glow_backend::{destroy_glow, install_glow};

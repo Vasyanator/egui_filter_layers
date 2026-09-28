@@ -3,8 +3,8 @@ File: pass.rs
 
 Purpose:
 The per-frame description of a filter: a `Pass` is an `Effect` plus its 16 anonymous `vec4`
-parameters, its named-parameter block (`struct Params`, typed access by member name) and an
-optional sample-radius override; a `FilterChain` is an ordered list of passes run ping-pong. Also
+parameters, its named-parameter block (`struct Params`, typed access by member name), an
+optional sample-radius override and its output scale (`with_scale`, reduced-resolution passes); a `FilterChain` is an ordered list of passes run ping-pong. Also
 owns the byte layout of the `fl` uniform block shared by all backends.
 
 Key structures:
@@ -57,13 +57,53 @@ pub struct Pass {
     named: Vec<u8>,
     /// Overrides the effect's default sample radius when set.
     sample_radius_points: Option<f32>,
+    /// Output resolution relative to the capture, in `[MIN_PASS_SCALE, 1]` (`1` = full).
+    scale: f32,
 }
+
+/// The smallest output scale a pass accepts ([`Pass::with_scale`] clamps to it): 1/1024 of the
+/// capture per axis (a scaled output is never smaller than 1 pixel anyway).
+pub const MIN_PASS_SCALE: f32 = 1.0 / 1024.0;
 
 impl Pass {
     /// A pass running `effect` with all parameters (anonymous and named) zero.
     #[must_use]
     pub fn new(effect: &Effect) -> Self {
-        Self { effect: effect.clone(), params: [[0.0; 4]; PARAM_SLOTS], named: vec![0; effect.param_layout().block_size], sample_radius_points: None }
+        Self { effect: effect.clone(), params: [[0.0; 4]; PARAM_SLOTS], named: vec![0; effect.param_layout().block_size], sample_radius_points: None, scale: 1.0 }
+    }
+
+    /// Runs this pass at a reduced output resolution: it renders `ceil(capture * scale)` pixels
+    /// per axis (e.g. `0.5` = a quarter of the pixels), and the next pass (or the final composite,
+    /// which upsamples bilinearly) reads that smaller image. `uv`, `src()`, `original()`,
+    /// `fl.texel`, `fl.size_px` and `fl.pixels_per_point` keep their capture meaning, so distance
+    /// maths is unchanged; `src_px()` / `src_texel()` step one pixel of the pass's INPUT and
+    /// `out_texel()` is one pixel of its own output (`fl.pass_scale` = this value).
+    ///
+    /// `scale` is clamped to `[MIN_PASS_SCALE, 1]`; a non-finite value means `1`. A scaled pass
+    /// resamples: when this matters at the layer edge, its sample radius should include about
+    /// `1 / scale` capture pixels (the kawase / bloom presets declare theirs). Offline, a chain
+    /// with a scaled pass refuses tiling (`OfflineError::NotTileable`).
+    #[must_use]
+    pub fn with_scale(mut self, scale: f32) -> Self {
+        self.set_scale(scale);
+        self
+    }
+
+    /// [`Pass::with_scale`] in place.
+    pub fn set_scale(&mut self, scale: f32) {
+        self.scale = if scale.is_finite() { scale.clamp(MIN_PASS_SCALE, 1.0) } else { 1.0 };
+    }
+
+    /// The pass's output scale (`1` = full resolution), see [`Pass::with_scale`].
+    #[must_use]
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Whether the pass renders below full resolution.
+    #[must_use]
+    pub(crate) fn is_scaled(&self) -> bool {
+        self.scale < 1.0
     }
 
     /// The named parameter `name` of this pass's effect.
@@ -305,7 +345,7 @@ impl Extend<Pass> for FilterChain {
 }
 
 /// Size in bytes of the `FlUniforms` block (see `shaders/prelude.wgsl`).
-pub(crate) const UNIFORM_BLOCK_SIZE: usize = 416;
+pub(crate) const UNIFORM_BLOCK_SIZE: usize = 432;
 
 /// Byte offsets of the `FlUniforms` members; pinned against naga's computed layout by a test.
 pub(crate) mod offsets {
@@ -353,8 +393,10 @@ pub(crate) mod offsets {
     pub const PASS_INDEX: usize = 148;
     /// `internal_frag_texel: vec2<f32>`.
     pub const FRAG_TEXEL: usize = 152;
+    /// `internal_src_texel: vec2<f32>`.
+    pub const SRC_TEXEL: usize = 160;
     /// `params: array<vec4<f32>, 16>`.
-    pub const PARAMS: usize = 160;
+    pub const PARAMS: usize = 176;
 }
 
 /// The non-parameter uniforms of one pass.
@@ -402,6 +444,12 @@ pub(crate) struct FrameUniforms {
     pub pass_scale: f32,
     /// Index of the draw among the frame's draws of its kind (`fl.pass_index`).
     pub pass_index: u32,
+    /// One pixel of the draw's OUTPUT in capture uv (`internal_frag_texel`: fragment-mode-1 uv,
+    /// `out_texel()`); `texel` at full resolution.
+    pub frag_texel: [f32; 2],
+    /// One pixel of the draw's `src()` INPUT in capture uv (`internal_src_texel`: `src_px()`,
+    /// `src_texel()`, the `src()` edge clamp); `texel` for a full-resolution input.
+    pub src_texel: [f32; 2],
 }
 
 impl FrameUniforms {
@@ -411,7 +459,8 @@ impl FrameUniforms {
     /// points follow a layer transform's zoom exactly like the padding does). `src_scale` /
     /// `aux_scale` start at `1` and are set per draw by `plan.rs` (grow-only targets); the
     /// window fields (`frag_*`, `*_offset`) start in the interpolated, whole-capture state. The
-    /// remaining members hold their neutral values (see each field); the per-frame input members
+    /// remaining members hold their neutral values (see each field; `frag_texel` / `src_texel`
+    /// start at `texel`, full resolution, and `plan.rs` sets them for scaled draws); the per-frame input members
     /// are set by [`FrameUniforms::with_input`].
     ///
     /// `time` is seconds; `flip_y` whether the backend's texture storage is bottom-up (OpenGL).
@@ -438,6 +487,8 @@ impl FrameUniforms {
             cover: [[1.0, 1.0], [0.0, 0.0]],
             pass_scale: 1.0,
             pass_index: 0,
+            frag_texel: [1.0 / w, 1.0 / h],
+            src_texel: [1.0 / w, 1.0 / h],
         }
     }
 }
@@ -484,8 +535,7 @@ fn put_u32(bytes: &mut [u8; UNIFORM_BLOCK_SIZE], offset: usize, value: u32) {
 }
 
 /// Serializes one draw's uniforms into the `FlUniforms` byte layout (native endianness, as the
-/// GPU APIs expect for host-written buffers). `internal_frag_texel` is derived here as
-/// `texel / pass_scale` (the texel of the draw's own output resolution).
+/// GPU APIs expect for host-written buffers).
 #[must_use]
 pub(crate) fn pack_uniforms(frame: &FrameUniforms, params: &Params) -> [u8; UNIFORM_BLOCK_SIZE] {
     let mut bytes = [0_u8; UNIFORM_BLOCK_SIZE];
@@ -510,7 +560,8 @@ pub(crate) fn pack_uniforms(frame: &FrameUniforms, params: &Params) -> [u8; UNIF
     put_f32s(&mut bytes, offsets::COVER_OFFSET, &frame.cover[1]);
     put_f32s(&mut bytes, offsets::PASS_SCALE, &[frame.pass_scale]);
     put_u32(&mut bytes, offsets::PASS_INDEX, frame.pass_index);
-    put_f32s(&mut bytes, offsets::FRAG_TEXEL, &[frame.texel[0] / frame.pass_scale, frame.texel[1] / frame.pass_scale]);
+    put_f32s(&mut bytes, offsets::FRAG_TEXEL, &frame.frag_texel);
+    put_f32s(&mut bytes, offsets::SRC_TEXEL, &frame.src_texel);
     for (i, slot) in params.iter().enumerate() {
         put_f32s(&mut bytes, offsets::PARAMS + i * 16, slot);
     }
@@ -563,8 +614,9 @@ mod tests {
         assert_eq!(offset_of("pass_scale"), offsets::PASS_SCALE);
         assert_eq!(offset_of("pass_index"), offsets::PASS_INDEX);
         assert_eq!(offset_of("internal_frag_texel"), offsets::FRAG_TEXEL);
+        assert_eq!(offset_of("internal_src_texel"), offsets::SRC_TEXEL);
         assert_eq!(offset_of("params"), offsets::PARAMS);
-        assert_eq!(members.len(), 23, "every member is pinned above");
+        assert_eq!(members.len(), 24, "every member is pinned above");
         assert_eq!(usize::try_from(*span).unwrap_or(0), UNIFORM_BLOCK_SIZE);
     }
 
@@ -590,6 +642,8 @@ mod tests {
             cover: [[0.375, 1.0], [0.0, 0.5]],
             pass_scale: 0.5,
             pass_index: 3,
+            frag_texel: [1.0, 0.5],
+            src_texel: [0.0625, 0.125],
         };
         let mut params = [[0.0; 4]; PARAM_SLOTS];
         params[0] = [1.0, 2.0, 3.0, 4.0];
@@ -619,8 +673,8 @@ mod tests {
         assert!((read_f32(&bytes, offsets::COVER_OFFSET + 4) - 0.5).abs() < f32::EPSILON);
         assert!((read_f32(&bytes, offsets::PASS_SCALE) - 0.5).abs() < f32::EPSILON);
         assert_eq!(read_u32(offsets::PASS_INDEX), 3);
-        // texel / pass_scale.
         assert!((read_f32(&bytes, offsets::FRAG_TEXEL) - 1.0).abs() < f32::EPSILON && (read_f32(&bytes, offsets::FRAG_TEXEL + 4) - 0.5).abs() < f32::EPSILON);
+        assert!((read_f32(&bytes, offsets::SRC_TEXEL) - 0.0625).abs() < f32::EPSILON && (read_f32(&bytes, offsets::SRC_TEXEL + 4) - 0.125).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -631,6 +685,7 @@ mod tests {
         let bytes = pack_uniforms(&FrameUniforms::for_layer(&geometry, 1.0, false), &[[0.0; 4]; PARAM_SLOTS]);
         assert!((read_f32(&bytes, offsets::PASS_SCALE) - 1.0).abs() < f32::EPSILON);
         assert!((read_f32(&bytes, offsets::FRAG_TEXEL) - read_f32(&bytes, offsets::TEXEL)).abs() < f32::EPSILON, "full resolution: the draw's texel is the capture's");
+        assert_eq!(bytes[offsets::SRC_TEXEL..offsets::SRC_TEXEL + 8], bytes[offsets::TEXEL..offsets::TEXEL + 8], "full-resolution input: src texel = capture texel, bit for bit");
         assert!((read_f32(&bytes, offsets::STATE_SCALE) - 1.0).abs() < f32::EPSILON && (read_f32(&bytes, offsets::COVER_SCALE + 4) - 1.0).abs() < f32::EPSILON);
         assert!(read_f32(&bytes, offsets::POINTER + 12).abs() < f32::EPSILON, "no pointer present");
     }
@@ -666,6 +721,19 @@ mod tests {
             assert!((frame.size_px[0] - 200.0).abs() < f32::EPSILON && (frame.texel[1] - 0.01).abs() < 1e-6, "{frame:?}");
             assert!((frame.time - 3.0).abs() < f32::EPSILON && !frame.flip_y);
         }
+    }
+
+    #[test]
+    fn pass_scales_are_clamped() {
+        let Ok(effect) = Effect::new("id", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }") else { panic!("identity must compile") };
+        let pass = Pass::new(&effect);
+        assert!((pass.scale() - 1.0).abs() < f32::EPSILON && !pass.is_scaled(), "full resolution by default");
+        assert!((pass.clone().with_scale(0.5).scale() - 0.5).abs() < f32::EPSILON && pass.clone().with_scale(0.5).is_scaled());
+        assert!((pass.clone().with_scale(2.0).scale() - 1.0).abs() < f32::EPSILON, "never above full resolution");
+        for low in [0.0, -1.0, -5.0, 1e-9] {
+            assert!((pass.clone().with_scale(low).scale() - MIN_PASS_SCALE).abs() < f32::EPSILON, "{low}");
+        }
+        assert!((pass.clone().with_scale(f32::NAN).scale() - 1.0).abs() < f32::EPSILON && (pass.with_scale(f32::INFINITY).scale() - 1.0).abs() < f32::EPSILON, "non-finite = full");
     }
 
     #[test]

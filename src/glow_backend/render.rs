@@ -52,7 +52,7 @@ use crate::backend::LayerJob;
 use crate::effect::{BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_SOURCE_TEXTURE};
 use crate::geometry::{LayerGeometry, PxRect, layer_geometry, transform_scale};
 use crate::pass::{FrameUniforms, InputUniforms, UNIFORM_BLOCK_SIZE};
-use crate::plan::{Bindings, ChainPlan, Slot, SlotMappings, TextureMapping, composite_params_block, composite_uniforms, params_block, plan, step_uniforms};
+use crate::plan::{Allocations, Bindings, ChainPlan, Slot, composite_params_block, composite_uniforms, params_block, plan, step_uniforms};
 
 /// Stand-in key for rejections that have no known format (no colour buffer, or a driver that
 /// cannot report it), so they are still logged only once.
@@ -302,20 +302,22 @@ unsafe fn run_layer(gl: &glow::Context, resources: &mut Resources, run: &LayerRu
         }
 
         let capture = run.geometry.capture;
+        // glow always computes the whole capture (fragment mode 0 interpolates over the viewport);
+        // the composite's origin is the capture's screen position, as on the wgpu UI.
+        let Some(plan) = plan(&run.job.passes, capture.size(), PxRect { x: 0, y: 0, w: capture.w, h: capture.h }, [capture.x, capture.y]) else {
+            return LayerOutcome::Done;
+        };
+        // Both ping-pong targets hold every step's viewport (the plan's pool size).
+        let needed = plan.target_px.map(|side| i32::try_from(side).unwrap_or(i32::MAX));
         let max = resources.max_size;
         for target in &mut resources.ping_pong {
-            if let Err(error) = target.ensure_size(gl, capture.size(), max) {
+            if let Err(error) = target.ensure_size(gl, needed, max) {
                 return LayerOutcome::Latch { what: "allocating an intermediate target", error: error.to_string() };
             }
         }
-        // glow always computes the whole capture (fragment mode 0 interpolates over the viewport);
-        // the composite's origin is the capture's screen position, as on the wgpu UI.
-        let Some(plan) = plan(run.job.passes.len(), PxRect { x: 0, y: 0, w: capture.w, h: capture.h }, [capture.x, capture.y]) else {
-            return LayerOutcome::Done;
-        };
-        let maps = slot_mappings(resources, capture.size());
+        let allocations = allocations(resources);
 
-        if let Some((index, error)) = run_passes(gl, resources, run, &plan, &maps, programs, diagnose) {
+        if let Some((index, error)) = run_passes(gl, resources, run, &plan, &allocations, programs, diagnose) {
             return LayerOutcome::PassFailed { index, error };
         }
         let pass_error = gl.get_error();
@@ -325,7 +327,7 @@ unsafe fn run_layer(gl: &glow::Context, resources: &mut Resources, run: &LayerRu
             return LayerOutcome::PassesFailed { error: pass_error };
         }
 
-        composite(gl, resources, run, &plan, &maps);
+        composite(gl, resources, run, &plan, &allocations);
         let error = gl.get_error();
         if error != glow::NO_ERROR {
             return LayerOutcome::Latch { what: "compositing the filtered region", error: format!("GL error 0x{error:04x}") };
@@ -487,12 +489,10 @@ fn target_of(resources: &Resources, slot: Slot) -> &RenderTarget {
     }
 }
 
-/// The storage mappings of the capture and the ping-pong targets for a capture of `capture`
-/// pixels, each held at its target's `(0, 0)` corner.
-fn slot_mappings(resources: &Resources, capture: [i32; 2]) -> SlotMappings {
-    let capture = capture.map(|side| u32::try_from(side).unwrap_or(0));
-    let of = |target: &RenderTarget| TextureMapping::of(capture, target.allocated_px(), [0, 0]);
-    SlotMappings { source: of(&resources.capture), ping_pong: [of(&resources.ping_pong[0]), of(&resources.ping_pong[1])] }
+/// The allocated sizes of the capture and the ping-pong targets (the plan maps each step's
+/// content, held at its target's `(0, 0)` corner, through them).
+fn allocations(resources: &Resources) -> Allocations {
+    Allocations { source: resources.capture.allocated_px(), ping_pong: [resources.ping_pong[0].allocated_px(), resources.ping_pong[1].allocated_px()] }
 }
 
 /// Binds every `@group(0)` texture of one draw on its texture units (`glsl.rs`): the plan's slots
@@ -529,11 +529,11 @@ unsafe fn bind_textures(gl: &glow::Context, resources: &Resources, bindings: Bin
 /// returning `(pass index, error)`; otherwise the caller checks once after all passes.
 ///
 /// # Safety
-/// `gl` must be current on this thread; targets must be at least the capture size; `programs`
+/// `gl` must be current on this thread; targets must be at least `plan.target_px`; `programs`
 /// matches `run.job.passes`; no GL error may be pending on entry.
-unsafe fn run_passes(gl: &glow::Context, resources: &Resources, run: &LayerRun<'_>, plan: &ChainPlan, maps: &SlotMappings, programs: &[glow::Program], diagnose: bool) -> Option<(usize, u32)> {
+unsafe fn run_passes(gl: &glow::Context, resources: &Resources, run: &LayerRun<'_>, plan: &ChainPlan, allocations: &Allocations, programs: &[glow::Program], diagnose: bool) -> Option<(usize, u32)> {
     let frame = frame_uniforms(&run.geometry, run.job.time).with_input(&run.input);
-    // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); targets are at least the capture size and `programs` matches `run.job.passes` (caller contract); all objects are alive on this context.
+    // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); targets are at least the plan's pool size and `programs` matches `run.job.passes` (caller contract); all objects are alive on this context.
     unsafe {
         gl.bind_vertex_array(Some(resources.vertex_array));
         for step in &plan.steps {
@@ -545,7 +545,7 @@ unsafe fn run_passes(gl: &glow::Context, resources: &Resources, run: &LayerRun<'
             gl.viewport(0, 0, step.used_px[0], step.used_px[1]);
             gl.use_program(Some(*program));
             bind_textures(gl, resources, step.bindings);
-            upload_uniforms(gl, resources.uniform_buffer, &step_uniforms(&frame, step, maps, pass));
+            upload_uniforms(gl, resources.uniform_buffer, &step_uniforms(&frame, plan, step, allocations, pass));
             upload_params(gl, resources.params_buffer, params_block(pass));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             if diagnose {
@@ -564,9 +564,9 @@ unsafe fn run_passes(gl: &glow::Context, resources: &Resources, run: &LayerRun<'
 ///
 /// # Safety
 /// `gl` must be current on this thread; the passes of `plan` have run.
-unsafe fn composite(gl: &glow::Context, resources: &Resources, run: &LayerRun<'_>, plan: &ChainPlan, maps: &SlotMappings) {
+unsafe fn composite(gl: &glow::Context, resources: &Resources, run: &LayerRun<'_>, plan: &ChainPlan, allocations: &Allocations) {
     let geometry = &run.geometry;
-    let bytes = composite_uniforms(&frame_uniforms(geometry, run.job.time).with_input(&run.input), plan, maps, geometry);
+    let bytes = composite_uniforms(&frame_uniforms(geometry, run.job.time).with_input(&run.input), plan, allocations, geometry);
     let region = gl_rect(geometry.region, run.screen[1]);
     // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); the passes ran (caller contract), so the plan's composite source holds their output; all objects are alive on this context.
     unsafe {
@@ -625,21 +625,23 @@ mod tests {
         let named = Effect::new("named", "struct Params { tint: vec3<f32>, gain: f32 }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * vec4<f32>(p.tint * p.gain, 1.0); }");
         let Ok(named) = named else { panic!("{named:?}") };
         passes[2] = Pass::new(&named).with("tint", [0.25, 0.5, 0.75]).and_then(|pass| pass.with("gain", 2.0)).unwrap_or_else(|error| panic!("{error}"));
+        // F6: a scaled step's block (texels, mappings of a smaller image) is shared too.
+        passes[1] = passes[1].clone().with_scale(0.5);
         let rect = Rect::from_min_size(pos2(40.0, 30.0), vec2(120.0, 80.0));
         let Some(geometry) = layer_geometry(rect, Rect::EVERYTHING, 1.5, [800, 600], 6.0, CornerRadius::same(8), 1.0) else { panic!("visible") };
         let capture = geometry.capture;
-        let Some(glow_plan) = plan(passes.len(), PxRect { x: 0, y: 0, w: capture.w, h: capture.h }, [capture.x, capture.y]) else { panic!("planned") };
+        let Some(glow_plan) = plan(&passes, capture.size(), PxRect { x: 0, y: 0, w: capture.w, h: capture.h }, [capture.x, capture.y]) else { panic!("planned") };
         let window = ChainWindow::whole(&geometry, [capture.x, capture.y]);
-        let Some(wgpu_plan) = plan(passes.len(), window.rect, window.composite_origin) else { panic!("planned") };
+        let Some(wgpu_plan) = plan(&passes, capture.size(), window.rect, window.composite_origin) else { panic!("planned") };
         assert_eq!(glow_plan, wgpu_plan);
 
         let used = capture.size().map(|side| u32::try_from(side).unwrap_or(0));
-        let maps = SlotMappings { source: TextureMapping::of(used, [256, 256], [0, 0]), ping_pong: [TextureMapping::of(used, [320, 192], [0, 0]), TextureMapping::of(used, used, [0, 0])] };
+        let allocations = Allocations { source: [256, 256], ping_pong: [[320, 192], used] };
         let time = 1.25;
-        let wgpu_uniforms = chain_uniforms(&wgpu_frame_uniforms(&geometry, time), &wgpu_plan, &passes, &geometry, &maps, 256);
+        let wgpu_uniforms = chain_uniforms(&wgpu_frame_uniforms(&geometry, time), &wgpu_plan, &passes, &geometry, &allocations, 256);
         let glow_frame = frame_uniforms(&geometry, time);
-        let mut glow_blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = glow_plan.steps.iter().map(|step| step_uniforms(&glow_frame, step, &maps, &passes[step.pass])).collect();
-        glow_blocks.push(composite_uniforms(&glow_frame, &glow_plan, &maps, &geometry));
+        let mut glow_blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = glow_plan.steps.iter().map(|step| step_uniforms(&glow_frame, &glow_plan, step, &allocations, &passes[step.pass])).collect();
+        glow_blocks.push(composite_uniforms(&glow_frame, &glow_plan, &allocations, &geometry));
         assert_eq!(glow_blocks.len(), 4);
         let flags = [offsets::FLIP_Y, offsets::FRAG_MODE];
         let bytes_at = |range: &std::ops::Range<u64>| &wgpu_uniforms.bytes[usize::try_from(range.start).unwrap_or(0)..usize::try_from(range.end).unwrap_or(0)];

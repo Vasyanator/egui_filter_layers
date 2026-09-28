@@ -88,6 +88,15 @@ pub enum OfflineError {
         /// The largest tile (texture) side allowed.
         max_tile_px: u32,
     },
+    /// The frame needs tiling (it exceeds the tile size), but the chain cannot be split into
+    /// tiles exactly: e.g. a pass with [`Pass::with_scale`](crate::Pass::with_scale) below 1,
+    /// whose reduced-resolution pixels would not line up across tile edges. Process the frame
+    /// whole: `OfflineOptions::with_max_tile_size(None)` (it must then fit the device's limits).
+    #[error("the frame must be tiled, but the chain cannot be tiled exactly: {reason}; process it whole with `OfflineOptions::with_max_tile_size(None)`")]
+    NotTileable {
+        /// Why the chain cannot be tiled.
+        reason: String,
+    },
     /// The device rejected an effect's shader or pipeline.
     #[error("effect `{label}` was rejected by the GPU: {message}")]
     Effect {

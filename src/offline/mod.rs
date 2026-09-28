@@ -69,6 +69,10 @@ mapped.
 //! [`OfflineError::OutOfMemory`], never a panic.
 //! The [`lens`](crate::presets::lens) preset reads anywhere inside the layer and declares no
 //! radius; give it one (`Pass::with_sample_radius`) before tiling it.
+//! A chain with a reduced-resolution pass ([`Pass::with_scale`](crate::Pass::with_scale), the
+//! [`kawase_blur`](crate::presets::kawase_blur) and [`bloom`](crate::presets::bloom) presets)
+//! cannot be tiled exactly: a frame that would need tiles is refused with
+//! [`OfflineError::NotTileable`]; process it whole (`with_max_tile_size(None)`).
 //!
 //! The pipeline is 8-bit like the UI's capture: 16-bit input is converted to 8 bits first.
 //!
@@ -288,6 +292,14 @@ impl OfflineRenderer {
         let device_limit = self.max_texture_side.min(self.max_readback_side);
         let limit = options.max_tile_size.map_or(device_limit, |cap| cap.min(device_limit));
         let plan = tiles::plan(size, overlap, limit)?;
+        if plan.tiles.len() > 1
+            && let Some((index, pass)) = chain.passes().iter().enumerate().find(|(_, pass)| pass.is_scaled())
+        {
+            // A scaled pass renders ceil(capture * scale) pixels of the WHOLE frame: a tile's
+            // window would round its edges differently, so tiles would not match the whole-frame
+            // (= UI) result. Refuse instead of approximating.
+            return Err(OfflineError::NotTileable { reason: format!("pass {index} runs at scale {} (a reduced-resolution pass needs the whole frame; the frame is {}x{} and tiles are at most {limit} pixels)", pass.scale(), size[0], size[1]) });
+        }
         if plan.tiles.len() > 1 {
             log::debug!("egui_filter_layers (offline): {}x{} processed in {} tiles of {:?}", size[0], size[1], plan.tiles.len(), plan.alloc);
         }

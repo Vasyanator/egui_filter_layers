@@ -706,6 +706,35 @@ fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * p.a; }";
         }
     }
 
+    /// `@size` / `@align` move WGSL member offsets, but naga's GLSL writer drops them and GL lays
+    /// the block out by std140: any layout differing from std140 is rejected, naming the member.
+    #[test]
+    fn size_and_align_attributes_that_break_std140_are_rejected() {
+        let cases = [
+            ("@size(16) a: f32, b: f32", "Params.b"),
+            ("a: f32, @align(16) b: f32", "Params.b"),
+            ("a: vec4<f32>, @align(32) c: vec4<f32>", "Params.c"),
+            ("a: f32, @size(32) last: f32", "Params.last"),
+            ("@size(16) a: f32, @align(32) c: vec4<f32>", "Params.c"),
+        ];
+        for (members, name) in cases {
+            let snippet = format!("// params\nstruct Params {{ {members} }}\nfn effect(uv: vec2<f32>) -> vec4<f32> {{ return src(uv); }}");
+            match Effect::new("layout", &snippet) {
+                Err(error @ EffectError::Interface { .. }) => {
+                    let text = error.to_string();
+                    assert!(text.contains(name) && text.contains("std140") && text.contains("@align"), "{members}: {text}");
+                    assert_eq!(error.location(), Some(SnippetLocation { line: 2, column: 1 }), "{members}");
+                }
+                other => panic!("{members}: expected an interface error, got {other:?}"),
+            }
+        }
+        // Attributes that restate the std140 layout change nothing and are accepted.
+        for members in ["@size(4) a: f32, b: f32", "a: f32, @align(8) b: vec2<f32>", "a: f32, @align(16) b: vec4<f32>", "@size(12) a: vec3<f32>, b: f32"] {
+            let snippet = format!("struct Params {{ {members} }}\nfn effect(uv: vec2<f32>) -> vec4<f32> {{ return src(uv); }}");
+            assert!(Effect::new("layout", &snippet).is_ok(), "{members}");
+        }
+    }
+
     #[test]
     fn params_blocks_are_capped_at_the_webgl2_limit() {
         let fits = Effect::new("fits", "struct Params { v: array<vec4<f32>, 1024> }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return p.v[0]; }");

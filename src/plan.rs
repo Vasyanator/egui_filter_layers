@@ -3,22 +3,27 @@ File: plan.rs
 
 Purpose:
 The single, backend-neutral owner of HOW a chain is wired: which texture every draw of a run
-reads at each binding, which one it writes, its viewport, and the complete uniform blocks it
-uploads (binding 0: storage-uv mappings, fragment offsets, anonymous parameters; binding 4: the
-named-parameter block). Backends (wgpu `chain.rs`, glow
-`render.rs`) only create objects, bind the texture a `Slot` names, upload the bytes produced here
-and draw; they make no wiring decision of their own.
+reads at each binding, which one it writes, its viewport and output resolution (per-pass scale),
+the size the intermediates must have, and the complete uniform blocks each draw uploads
+(binding 0: storage-uv mappings, texel sizes, fragment offsets, anonymous parameters; binding 4:
+the named-parameter block). Backends (wgpu `chain.rs`, glow `render.rs`) only create objects,
+bind the texture a `Slot` names, upload the bytes produced here and draw; they make no wiring
+decision of their own.
 
 Key structures:
 - `Slot`: a texture of one run (the capture or a ping-pong intermediate).
+- `Content`: what a slot holds at one point of the run (the whole capture at some resolution, or
+  a window of it at the texture origin).
 - `Bindings`: the slots one draw binds at `fl_src_texture` / `fl_original_texture` (`None` = the
   backend's neutral dummy).
-- `PassStep`, `CompositeStep`, `ChainPlan`: the draws of one run, in order.
-- `TextureMapping`, `SlotMappings`: capture uv -> storage uv per slot (`clamp(uv) * scale -
+- `PassStep`, `CompositeStep`, `ChainPlan`: the draws of one run, in order, and the pool size.
+- `Allocations`: the allocated size of every slot's texture (backends report them).
+- `TextureMapping`: capture uv -> storage uv of one texture content (`clamp(uv) * scale -
   offset`, the prelude's `internal_*_scale` / `internal_*_offset`).
 
 Key functions:
 - `plan()`: the draws of a run over a window of the capture.
+- `scaled_px()`: the output size of a scaled pass (`ceil(side * scale)`, at least 1).
 - `TextureMapping::of()`: the ONE formula for a texture's storage-uv mapping.
 - `step_uniforms()` / `composite_uniforms()`: the full `FlUniforms` block of one draw.
 - `params_block()` / `composite_params_block()`: the bytes bound at binding 4 (`p: Params`) for a
@@ -32,6 +37,13 @@ storage mapping (`internal_aux_*`), which may differ from the ping-pong `src` ma
 targets of other sizes). Every other texture binding of the layout (state, coverage) is the
 backend's dummy. Backend-specific uniform flags (`flip_y`, fragment mode) stay in the
 `FrameUniforms` each backend passes in.
+Scale (F6): a pass with `scale < 1` renders `scaled_px(capture, scale)` pixels holding the WHOLE
+capture at that resolution (at the texture origin); readers map it with `TextureMapping::of(
+scaled, allocated, 0)`, so `uv` keeps its capture meaning and bilinear sampling resamples (the
+composite upsamples a scaled last output). A scaled chain runs only over the whole capture
+(window edges would not round consistently); `plan` refuses other windows. Every scaled size is
+at most the capture, so the two ping-pong targets sized `ChainPlan::target_px` (the window) hold
+every step.
 */
 
 use crate::geometry::{LayerGeometry, PxRect, px_f32};
@@ -59,6 +71,34 @@ pub(crate) struct Bindings {
     pub original: Option<Slot>,
 }
 
+/// What a slot's texture holds at one point of a run: the whole capture rendered at
+/// `logical_px` pixels, of which the window starting at `origin_px` (pixels of that resolution)
+/// lies at the texture origin. Full resolution: `logical_px` = the capture size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Content {
+    /// The whole capture's size at this content's resolution, in pixels.
+    pub logical_px: [u32; 2],
+    /// The window origin held at the texture origin, in pixels of this resolution.
+    pub origin_px: [u32; 2],
+    /// Whether this is the capture's own resolution (its texel is then exactly `fl.texel`).
+    pub full: bool,
+}
+
+impl Content {
+    /// The storage mapping of this content in a texture of `allocated` pixels.
+    #[must_use]
+    pub(crate) fn mapping(self, allocated: [u32; 2]) -> TextureMapping {
+        TextureMapping::of(self.logical_px, allocated, self.origin_px)
+    }
+
+    /// One pixel of this content in capture uv: `frame.texel` at full resolution (bit for bit
+    /// what every full-resolution draw uploaded before scales existed), else `1 / logical_px`.
+    #[must_use]
+    fn texel(self, frame: &FrameUniforms) -> [f32; 2] {
+        if self.full { frame.texel } else { self.logical_px.map(|side| 1.0 / to_f32_exact(side)) }
+    }
+}
+
 /// One effect pass of a run.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PassStep {
@@ -66,12 +106,19 @@ pub(crate) struct PassStep {
     pub pass: usize,
     /// The textures it reads.
     pub bindings: Bindings,
+    /// What its `src` slot holds when it runs.
+    pub input: Content,
     /// The intermediate it renders into (at the target's origin).
     pub output: Slot,
-    /// Viewport size in pixels, from the target's origin: the window of the capture it computes.
+    /// What it writes into `output`.
+    pub written: Content,
+    /// Its output scale (`fl.pass_scale`; `1` = full resolution).
+    pub scale: f32,
+    /// Viewport size in pixels, from the target's origin: the window of the capture it computes
+    /// (at its own resolution).
     pub used_px: [i32; 2],
-    /// Added to the fragment position (target pixels) to get capture pixels (`internal_frag_offset`,
-    /// read only in fragment mode 1).
+    /// Added to the fragment position (target pixels) to get pixels of the step's resolution
+    /// (`internal_frag_offset`, read only in fragment mode 1).
     pub frag_offset: [f32; 2],
 }
 
@@ -80,6 +127,8 @@ pub(crate) struct PassStep {
 pub(crate) struct CompositeStep {
     /// The textures it reads: the last pass output as `src`, the capture as the original.
     pub bindings: Bindings,
+    /// What its `src` slot holds (a scaled last pass is upsampled here, bilinearly).
+    pub input: Content,
     /// Added to the fragment position (target pixels) to get capture pixels.
     pub frag_offset: [f32; 2],
 }
@@ -91,35 +140,106 @@ pub(crate) struct ChainPlan {
     pub steps: Vec<PassStep>,
     /// The composite that writes the result.
     pub composite: CompositeStep,
+    /// What [`Slot::Source`] holds: the run's window of the capture at full resolution. It is
+    /// every draw's original.
+    pub source: Content,
+    /// The smallest allocation BOTH ping-pong targets need: the window, which holds every
+    /// step's viewport (scaled images are never larger). Also for a chain of scaled passes only,
+    /// so every caller that allocates a window's targets gets the same sizes (and so the same
+    /// bilinear weights) whatever the scales; larger (grow-only) targets are fine, the mappings
+    /// use the actual allocation.
+    pub target_px: [u32; 2],
 }
 
-/// Plans a run of `pass_count` passes over `window` (capture pixels; the whole capture when not
-/// tiled), whose composite puts capture pixel `(0, 0)` at `composite_origin` of its render target
-/// (target pixels, top-left origin).
-///
-/// Returns `None` when there is nothing to draw: no passes, or an empty / negative window.
+/// The allocated size of every slot's texture in one run, in pixels (reported by the backend
+/// after it made the targets at least [`ChainPlan::target_px`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Allocations {
+    /// Of [`Slot::Source`].
+    pub source: [u32; 2],
+    /// Of [`Slot::Ping`] and [`Slot::Pong`].
+    pub ping_pong: [[u32; 2]; 2],
+}
+
+impl Allocations {
+    /// The allocated size of `slot`.
+    #[must_use]
+    pub(crate) fn of(&self, slot: Slot) -> [u32; 2] {
+        match slot {
+            Slot::Source => self.source,
+            Slot::Ping => self.ping_pong[0],
+            Slot::Pong => self.ping_pong[1],
+        }
+    }
+}
+
+/// The output size of a pass at `scale` over a capture side of `side` pixels:
+/// `ceil(side * scale)`, at least 1 and at most `side`. `scale` is a [`Pass::scale`] value
+/// (finite, in `(0, 1]`). The product is exact in `f64`; the `f32` scale's own rounding error
+/// (at most `2^-24` relative) is taken off first, so `0.1` over 10 pixels is 1 pixel, not 2.
 #[must_use]
-pub(crate) fn plan(pass_count: usize, window: PxRect, composite_origin: [i32; 2]) -> Option<ChainPlan> {
-    if pass_count == 0 || window.w <= 0 || window.h <= 0 || window.x < 0 || window.y < 0 {
+pub(crate) fn scaled_px(side: u32, scale: f32) -> u32 {
+    let side = side.min(1 << 24);
+    let tolerance = f64::from(side) * f64::from(f32::EPSILON) * 0.5;
+    let product = (f64::from(side) * f64::from(scale) - tolerance).ceil();
+    // `product` lies in `[0, 2^24]` for the scales `Pass` stores (a NaN / negative saturates to
+    // 0 and is clamped up below), so the conversion is exact.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // In-range by the bound above; `as` saturates otherwise.
+    let pixels = product as u32;
+    pixels.clamp(1, side.max(1))
+}
+
+/// Plans a run of `passes` over `window` (capture pixels; the whole capture when not tiled) of
+/// a capture of `capture` pixels, whose composite puts capture pixel `(0, 0)` at
+/// `composite_origin` of its render target (target pixels, top-left origin).
+///
+/// Returns `None` when there is nothing to draw (no passes, an empty / negative window) or the
+/// run cannot be planned: a chain with a scaled pass ([`Pass::is_scaled`]) over anything but the
+/// whole capture (callers that tile refuse such chains first, `OfflineError::NotTileable`).
+#[must_use]
+pub(crate) fn plan(passes: &[Pass], capture: [i32; 2], window: PxRect, composite_origin: [i32; 2]) -> Option<ChainPlan> {
+    if passes.is_empty() || window.w <= 0 || window.h <= 0 || window.x < 0 || window.y < 0 {
         return None;
     }
+    let whole = window.x == 0 && window.y == 0 && window.size() == capture;
+    if !whole && passes.iter().any(Pass::is_scaled) {
+        return None;
+    }
+    let capture_px = capture.map(|side| u32::try_from(side).unwrap_or(0));
+    let origin = [u32::try_from(window.x).ok()?, u32::try_from(window.y).ok()?];
+    let source = Content { logical_px: capture_px, origin_px: origin, full: true };
     let output_of = |index: usize| if index.is_multiple_of(2) { Slot::Ping } else { Slot::Pong };
-    let pass_frag_offset = [px_f32(window.x), px_f32(window.y)];
-    let steps = (0..pass_count)
-        .map(|index| PassStep {
+    let mut steps = Vec::with_capacity(passes.len());
+    let mut input = source;
+    for (index, pass) in passes.iter().enumerate() {
+        let (written, used_px, frag_offset) = if pass.is_scaled() {
+            // Whole capture only (checked above): the smaller image starts at capture uv 0.
+            let logical = capture_px.map(|side| scaled_px(side, pass.scale()));
+            let used = logical.map(|side| i32::try_from(side).unwrap_or(i32::MAX));
+            (Content { logical_px: logical, origin_px: [0, 0], full: false }, used, [0.0, 0.0])
+        } else {
+            (source, window.size(), [px_f32(window.x), px_f32(window.y)])
+        };
+        steps.push(PassStep {
             pass: index,
             // Every pass may read the untouched capture through `original()` (F1).
             bindings: Bindings { src: if index == 0 { Slot::Source } else { output_of(index - 1) }, original: Some(Slot::Source) },
+            input,
             output: output_of(index),
-            used_px: window.size(),
-            frag_offset: pass_frag_offset,
-        })
-        .collect();
+            written,
+            scale: pass.scale(),
+            used_px,
+            frag_offset,
+        });
+        input = written;
+    }
     let composite = CompositeStep {
-        bindings: Bindings { src: output_of(pass_count - 1), original: Some(Slot::Source) },
+        bindings: Bindings { src: output_of(passes.len() - 1), original: Some(Slot::Source) },
+        input,
         frag_offset: [-px_f32(composite_origin[0]), -px_f32(composite_origin[1])],
     };
-    Some(ChainPlan { steps, composite })
+    let target_px = window.size().map(|side| u32::try_from(side).unwrap_or(0));
+    Some(ChainPlan { steps, composite, source, target_px })
 }
 
 /// How capture uv maps into one texture's storage uv: `clamp(uv) * scale - offset` (the
@@ -145,27 +265,6 @@ impl TextureMapping {
     }
 }
 
-/// The storage mapping of every slot of one run.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct SlotMappings {
-    /// Of [`Slot::Source`].
-    pub source: TextureMapping,
-    /// Of [`Slot::Ping`] and [`Slot::Pong`].
-    pub ping_pong: [TextureMapping; 2],
-}
-
-impl SlotMappings {
-    /// The mapping of `slot`.
-    #[must_use]
-    pub(crate) fn of(&self, slot: Slot) -> TextureMapping {
-        match slot {
-            Slot::Source => self.source,
-            Slot::Ping => self.ping_pong[0],
-            Slot::Pong => self.ping_pong[1],
-        }
-    }
-}
-
 /// `used / allocated` as one correctly rounded `f32` division of the exact sizes (`1` when
 /// `allocated` is 0). Sizes are exact below 2^24 (a whole image may exceed any texture limit when
 /// the offline tiler splits it); larger values saturate there. With a power-of-two `allocated`
@@ -187,35 +286,59 @@ fn to_f32_exact(value: u32) -> f32 {
     f32::from(high) * 65536.0 + f32::from(low)
 }
 
-/// The uniform block of one draw: `frame` (the layer's values and the backend's flags) with the
-/// `src` / original mappings of `bindings` and the draw's fragment offset, plus `params`.
-fn draw_uniforms(frame: &FrameUniforms, bindings: Bindings, frag_offset: [f32; 2], maps: &SlotMappings, params: &Params) -> [u8; UNIFORM_BLOCK_SIZE] {
-    let mut frame = *frame;
-    let src = maps.of(bindings.src);
-    frame.src_scale = src.scale;
-    frame.src_offset = src.offset;
-    // A dummy original is never sampled; its mapping keeps the frame's identity value.
-    if let Some(original) = bindings.original {
-        let aux = maps.of(original);
-        frame.aux_scale = aux.scale;
-        frame.aux_offset = aux.offset;
-    }
-    frame.frag_offset = frag_offset;
-    pack_uniforms(&frame, params)
+/// Everything that varies between the draws of one run besides the parameters.
+#[derive(Clone, Copy, Debug)]
+struct Draw {
+    /// The slots it binds.
+    bindings: Bindings,
+    /// What its `src` slot holds.
+    input: Content,
+    /// What its original slot holds (the capture window).
+    original: Content,
+    /// `internal_frag_offset`.
+    frag_offset: [f32; 2],
+    /// Its output resolution: `None` = the capture's (the composite), else what it writes.
+    written: Option<Content>,
+    /// `fl.pass_scale`.
+    scale: f32,
 }
 
-/// The complete `FlUniforms` block of `step`, which runs `pass`. `frame` is the backend's
-/// `FrameUniforms::for_layer` value (with its `flip_y` / fragment-mode flags).
+/// The uniform block of one draw: `frame` (the layer's values and the backend's flags) with the
+/// `src` / original mappings and texels of `draw` in the textures `allocations` describes, its
+/// fragment offset, output texel and scale, plus `params`.
+fn draw_uniforms(frame: &FrameUniforms, draw: &Draw, allocations: &Allocations, params: &Params) -> [u8; UNIFORM_BLOCK_SIZE] {
+    let mut out = *frame;
+    let src = draw.input.mapping(allocations.of(draw.bindings.src));
+    out.src_scale = src.scale;
+    out.src_offset = src.offset;
+    out.src_texel = draw.input.texel(frame);
+    // A dummy original is never sampled; its mapping keeps the frame's identity value.
+    if let Some(original) = draw.bindings.original {
+        let aux = draw.original.mapping(allocations.of(original));
+        out.aux_scale = aux.scale;
+        out.aux_offset = aux.offset;
+    }
+    out.frag_offset = draw.frag_offset;
+    out.frag_texel = draw.written.map_or(frame.texel, |written| written.texel(frame));
+    out.pass_scale = draw.scale;
+    pack_uniforms(&out, params)
+}
+
+/// The complete `FlUniforms` block of `step` of `plan`, which runs `pass`. `frame` is the
+/// backend's `FrameUniforms::for_layer` value (with its `flip_y` / fragment-mode flags).
 #[must_use]
-pub(crate) fn step_uniforms(frame: &FrameUniforms, step: &PassStep, maps: &SlotMappings, pass: &Pass) -> [u8; UNIFORM_BLOCK_SIZE] {
-    draw_uniforms(frame, step.bindings, step.frag_offset, maps, pass.params())
+pub(crate) fn step_uniforms(frame: &FrameUniforms, plan: &ChainPlan, step: &PassStep, allocations: &Allocations, pass: &Pass) -> [u8; UNIFORM_BLOCK_SIZE] {
+    let draw = Draw { bindings: step.bindings, input: step.input, original: plan.source, frag_offset: step.frag_offset, written: Some(step.written), scale: step.scale };
+    draw_uniforms(frame, &draw, allocations, pass.params())
 }
 
 /// The complete `FlUniforms` block of `plan`'s composite: its bindings' mappings and the mask /
 /// region parameters of `geometry` (`LayerGeometry::composite_params`).
 #[must_use]
-pub(crate) fn composite_uniforms(frame: &FrameUniforms, plan: &ChainPlan, maps: &SlotMappings, geometry: &LayerGeometry) -> [u8; UNIFORM_BLOCK_SIZE] {
-    draw_uniforms(frame, plan.composite.bindings, plan.composite.frag_offset, maps, &geometry.composite_params())
+pub(crate) fn composite_uniforms(frame: &FrameUniforms, plan: &ChainPlan, allocations: &Allocations, geometry: &LayerGeometry) -> [u8; UNIFORM_BLOCK_SIZE] {
+    let composite = &plan.composite;
+    let draw = Draw { bindings: composite.bindings, input: composite.input, original: plan.source, frag_offset: composite.frag_offset, written: None, scale: 1.0 };
+    draw_uniforms(frame, &draw, allocations, &geometry.composite_params())
 }
 
 /// The binding-4 bytes of a draw whose module declares no `struct Params`: 16 zero bytes, the
@@ -249,10 +372,27 @@ mod tests {
         (read(offset) - expected[0]).abs() < f32::EPSILON && (read(offset + 4) - expected[1]).abs() < f32::EPSILON
     }
 
+    fn identity() -> Effect {
+        match Effect::new("id", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }") {
+            Ok(effect) => effect,
+            Err(error) => panic!("identity must compile: {error}"),
+        }
+    }
+
+    /// `count` identity passes at full resolution.
+    fn passes(count: usize) -> Vec<Pass> {
+        vec![Pass::new(&identity()); count]
+    }
+
+    /// Reads the `f32` at `offset`.
+    fn read(bytes: &[u8], offset: usize) -> f32 {
+        f32::from_ne_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
+    }
+
     #[test]
     fn steps_follow_the_ping_pong_order() {
         let window = PxRect { x: 16, y: 32, w: 100, h: 50 };
-        let Some(plan) = plan(3, window, [4, 8]) else { panic!("three passes over a non-empty window") };
+        let Some(plan) = plan(&passes(3), [200, 100], window, [4, 8]) else { panic!("three passes over a non-empty window") };
         let reads: Vec<Slot> = plan.steps.iter().map(|step| step.bindings.src).collect();
         let writes: Vec<Slot> = plan.steps.iter().map(|step| step.output).collect();
         assert_eq!(reads, [Slot::Source, Slot::Ping, Slot::Pong]);
@@ -261,33 +401,40 @@ mod tests {
         assert_eq!(plan.composite.bindings, Bindings { src: Slot::Ping, original: Some(Slot::Source) });
         assert_eq!(plan.composite.frag_offset.map(f32::to_bits), [-4.0_f32, -8.0].map(f32::to_bits));
         assert_eq!(plan.steps[0].frag_offset.map(f32::to_bits), [16.0_f32, 32.0].map(f32::to_bits));
+        assert_eq!(plan.target_px, [100, 50], "the pool holds the window");
+        let window_content = Content { logical_px: [200, 100], origin_px: [16, 32], full: true };
+        assert_eq!(plan.source, window_content);
+        assert!(plan.steps.iter().all(|step| step.input == window_content && step.written == window_content && (step.scale - 1.0).abs() < f32::EPSILON));
 
-        let Some(single) = super::plan(1, window, [0, 0]) else { panic!("one pass") };
+        let Some(single) = super::plan(&passes(1), [200, 100], window, [0, 0]) else { panic!("one pass") };
         assert_eq!(single.composite.bindings.src, Slot::Ping);
-        assert!(super::plan(0, window, [0, 0]).is_none(), "no passes, nothing to draw");
-        assert!(super::plan(1, PxRect { x: 0, y: 0, w: 0, h: 5 }, [0, 0]).is_none(), "empty window");
-        assert!(super::plan(1, PxRect { x: -1, y: 0, w: 5, h: 5 }, [0, 0]).is_none(), "negative origin");
+        assert!(super::plan(&[], [200, 100], window, [0, 0]).is_none(), "no passes, nothing to draw");
+        assert!(super::plan(&passes(1), [200, 100], PxRect { x: 0, y: 0, w: 0, h: 5 }, [0, 0]).is_none(), "empty window");
+        assert!(super::plan(&passes(1), [200, 100], PxRect { x: -1, y: 0, w: 5, h: 5 }, [0, 0]).is_none(), "negative origin");
     }
 
     #[test]
     fn uniform_blocks_carry_the_mappings_of_their_bindings() {
-        let Ok(effect) = Effect::new("id", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }") else { panic!("identity must compile") };
+        let effect = identity();
         let passes: Vec<Pass> = (0..3).map(|index| Pass::new(&effect).with_param(0, [f32::from(u8::try_from(index).unwrap_or(0)); 4]).unwrap_or_else(|error| panic!("{error}"))).collect();
-        let map = |scale: [f32; 2], offset: [f32; 2]| TextureMapping { scale, offset };
-        let maps = SlotMappings { source: map([0.5, 0.25], [0.125, 0.0]), ping_pong: [map([0.75, 0.75], [0.25, 0.5]), map([1.0, 0.5], [0.0, 0.25])] };
-        let Some(plan) = plan(3, PxRect { x: 16, y: 32, w: 10, h: 10 }, [4, 8]) else { panic!("planned") };
-        let frame = FrameUniforms { aux_scale: [3.0, 3.0], ..FrameUniforms::default() };
-        let blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = plan.steps.iter().map(|step| step_uniforms(&frame, step, &maps, &passes[step.pass])).collect();
-        // Pass 0 reads the source, pass 1 ping, pass 2 pong.
-        assert!(holds(&blocks[0], offsets::SRC_SCALE, [0.5, 0.25]) && holds(&blocks[0], offsets::SRC_OFFSET, [0.125, 0.0]));
-        assert!(holds(&blocks[1], offsets::SRC_SCALE, [0.75, 0.75]) && holds(&blocks[1], offsets::SRC_OFFSET, [0.25, 0.5]));
-        assert!(holds(&blocks[2], offsets::SRC_SCALE, [1.0, 0.5]) && holds(&blocks[2], offsets::SRC_OFFSET, [0.0, 0.25]));
+        // Capture 64x32; window (16, 8) 16x16; textures: source 32x32, ping 64x16, pong 32x64.
+        let allocations = Allocations { source: [32, 32], ping_pong: [[64, 16], [32, 64]] };
+        let Some(plan) = plan(&passes, [64, 32], PxRect { x: 16, y: 8, w: 16, h: 16 }, [4, 8]) else { panic!("planned") };
+        let frame = FrameUniforms { aux_scale: [3.0, 3.0], texel: [0.25, 0.5], ..FrameUniforms::default() };
+        let blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = plan.steps.iter().map(|step| step_uniforms(&frame, &plan, step, &allocations, &passes[step.pass])).collect();
+        // Pass 0 reads the source, pass 1 ping, pass 2 pong: capture / allocated, origin / allocated.
+        assert!(holds(&blocks[0], offsets::SRC_SCALE, [2.0, 1.0]) && holds(&blocks[0], offsets::SRC_OFFSET, [0.5, 0.25]));
+        assert!(holds(&blocks[1], offsets::SRC_SCALE, [1.0, 2.0]) && holds(&blocks[1], offsets::SRC_OFFSET, [0.25, 0.5]));
+        assert!(holds(&blocks[2], offsets::SRC_SCALE, [2.0, 0.5]) && holds(&blocks[2], offsets::SRC_OFFSET, [0.5, 0.125]));
         // Every pass maps its original through the SOURCE's mapping, not its `src` slot's.
-        assert!(blocks.iter().all(|block| holds(block, offsets::AUX_SCALE, [0.5, 0.25]) && holds(block, offsets::AUX_OFFSET, [0.125, 0.0])));
-        let dummy = draw_uniforms(&frame, Bindings { src: Slot::Ping, original: None }, [0.0; 2], &maps, passes[0].params());
+        assert!(blocks.iter().all(|block| holds(block, offsets::AUX_SCALE, [2.0, 1.0]) && holds(block, offsets::AUX_OFFSET, [0.5, 0.25])));
+        // Full resolution: both texels are the frame's, the pass scale 1.
+        assert!(blocks.iter().all(|block| holds(block, offsets::SRC_TEXEL, [0.25, 0.5]) && holds(block, offsets::FRAG_TEXEL, [0.25, 0.5]) && (read(block, offsets::PASS_SCALE) - 1.0).abs() < f32::EPSILON));
+        let dummy_draw = Draw { bindings: Bindings { src: Slot::Ping, original: None }, input: plan.source, original: plan.source, frag_offset: [0.0; 2], written: None, scale: 1.0 };
+        let dummy = draw_uniforms(&frame, &dummy_draw, &allocations, passes[0].params());
         assert!(holds(&dummy, offsets::AUX_SCALE, [3.0, 3.0]), "a dummy original keeps the frame's aux mapping");
         assert!(holds(&blocks[2], offsets::PARAMS, [2.0, 2.0]));
-        assert!(holds(&blocks[1], offsets::FRAG_OFFSET, [16.0, 32.0]));
+        assert!(holds(&blocks[1], offsets::FRAG_OFFSET, [16.0, 8.0]));
 
         let geometry = LayerGeometry {
             region: PxRect { x: 0, y: 0, w: 10, h: 10 },
@@ -298,10 +445,10 @@ mod tests {
             mask_radii_px: [0.0; 4],
             pixels_per_layer_point: 1.0,
         };
-        let composite = composite_uniforms(&frame, &plan, &maps, &geometry);
+        let composite = composite_uniforms(&frame, &plan, &allocations, &geometry);
         // The composite reads pass 2's output (ping) and the source as the original.
-        assert!(holds(&composite, offsets::SRC_SCALE, [0.75, 0.75]) && holds(&composite, offsets::SRC_OFFSET, [0.25, 0.5]));
-        assert!(holds(&composite, offsets::AUX_SCALE, [0.5, 0.25]) && holds(&composite, offsets::AUX_OFFSET, [0.125, 0.0]));
+        assert!(holds(&composite, offsets::SRC_SCALE, [1.0, 2.0]) && holds(&composite, offsets::SRC_OFFSET, [0.25, 0.5]));
+        assert!(holds(&composite, offsets::AUX_SCALE, [2.0, 1.0]) && holds(&composite, offsets::AUX_OFFSET, [0.5, 0.25]));
         assert!(holds(&composite, offsets::PARAMS + 2 * 16, [9.0, 9.0]), "composite params slot 2 = region uv");
         assert!(holds(&composite, offsets::FRAG_OFFSET, [-4.0, -8.0]));
     }
@@ -312,12 +459,82 @@ mod tests {
     fn every_step_binds_the_capture_as_its_original() {
         for pass_count in 1..=5 {
             for window in [PxRect { x: 0, y: 0, w: 64, h: 32 }, PxRect { x: 16, y: 8, w: 7, h: 9 }] {
-                let Some(plan) = plan(pass_count, window, [3, 5]) else { panic!("{pass_count} passes over a non-empty window") };
+                let Some(plan) = plan(&passes(pass_count), [64, 32], window, [3, 5]) else { panic!("{pass_count} passes over a non-empty window") };
                 assert_eq!(plan.steps.len(), pass_count);
                 assert!(plan.steps.iter().all(|step| step.bindings.original == Some(Slot::Source)), "{pass_count} passes: every step maps the original");
                 assert_eq!(plan.composite.bindings.original, Some(Slot::Source));
             }
         }
+    }
+
+    /// F6: scaled sizes round UP (a partial pixel still covers capture), never reach 0 and never
+    /// exceed the capture.
+    #[test]
+    fn scaled_sizes_round_up_at_odd_sizes() {
+        assert_eq!(scaled_px(100, 0.5), 50);
+        assert_eq!(scaled_px(101, 0.5), 51);
+        assert_eq!(scaled_px(1, 0.5), 1);
+        assert_eq!(scaled_px(7, 0.25), 2);
+        assert_eq!(scaled_px(1000, crate::pass::MIN_PASS_SCALE), 1);
+        assert_eq!(scaled_px(3000, crate::pass::MIN_PASS_SCALE), 3);
+        assert_eq!(scaled_px(333, 1.0), 333);
+        // 0.1_f32 is slightly above 1/10; its rounding error must not add a pixel.
+        assert_eq!(scaled_px(10, 0.1), 1);
+        assert_eq!(scaled_px(30, 0.1), 3);
+        assert_eq!(scaled_px(31, 0.1), 4);
+    }
+
+    /// F6: per-step output sizes, what each step reads and writes, the mappings and texels its
+    /// block carries, and the pool size, for a down / down / up / full chain over an odd capture.
+    #[test]
+    fn scaled_steps_map_their_inputs_and_outputs() {
+        let effect = identity();
+        let scales = [0.5, 0.25, 0.5, 1.0];
+        let chain: Vec<Pass> = scales.iter().map(|&scale| Pass::new(&effect).with_scale(scale)).collect();
+        let capture = [101, 51];
+        let whole = PxRect { x: 0, y: 0, w: 101, h: 51 };
+        let Some(plan) = plan(&chain, capture, whole, [7, 9]) else { panic!("a scaled chain over the whole capture") };
+        let used: Vec<[i32; 2]> = plan.steps.iter().map(|step| step.used_px).collect();
+        assert_eq!(used, [[51, 26], [26, 13], [51, 26], [101, 51]]);
+        assert_eq!(plan.target_px, [101, 51]);
+        assert!(plan.steps.iter().take(3).all(|step| step.frag_offset == [0.0, 0.0] && !step.written.full && step.written.origin_px == [0, 0]));
+        assert_eq!(plan.steps[1].input, plan.steps[0].written, "each step reads what the previous one wrote");
+        assert_eq!(plan.steps[3].written, plan.source, "a full step after scaled ones writes the capture resolution");
+        assert_eq!(plan.composite.input, plan.source);
+
+        let allocations = Allocations { source: [101, 51], ping_pong: [[128, 64], [101, 51]] };
+        let frame = FrameUniforms { texel: [1.0 / 101.0, 1.0 / 51.0], ..FrameUniforms::default() };
+        let blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = plan.steps.iter().map(|step| step_uniforms(&frame, &plan, step, &allocations, &chain[step.pass])).collect();
+        // Step 0: full-resolution input (the source), 51x26 output.
+        assert!(holds(&blocks[0], offsets::SRC_TEXEL, frame.texel) && holds(&blocks[0], offsets::FRAG_TEXEL, [1.0 / 51.0, 1.0 / 26.0]));
+        assert!((read(&blocks[0], offsets::PASS_SCALE) - 0.5).abs() < f32::EPSILON);
+        // Step 1 reads step 0's 51x26 image from ping (128x64): src_px = one pixel of THAT image.
+        assert!(holds(&blocks[1], offsets::SRC_SCALE, [51.0 / 128.0, 26.0 / 64.0]) && holds(&blocks[1], offsets::SRC_OFFSET, [0.0, 0.0]));
+        assert!(holds(&blocks[1], offsets::SRC_TEXEL, [1.0 / 51.0, 1.0 / 26.0]) && holds(&blocks[1], offsets::FRAG_TEXEL, [1.0 / 26.0, 1.0 / 13.0]));
+        // Step 3 (full) reads step 2's 51x26 image from ping (128x64) and writes full resolution.
+        assert_eq!(plan.steps[3].bindings.src, Slot::Ping);
+        assert!(holds(&blocks[3], offsets::SRC_SCALE, [51.0 / 128.0, 26.0 / 64.0]) && holds(&blocks[3], offsets::FRAG_TEXEL, frame.texel));
+        // Step 2 reads step 1's 26x13 image from pong (101x51).
+        assert!(holds(&blocks[2], offsets::SRC_SCALE, [26.0 / 101.0, 13.0 / 51.0]) && holds(&blocks[2], offsets::SRC_TEXEL, [1.0 / 26.0, 1.0 / 13.0]));
+        // The original is always the capture at full resolution.
+        assert!(blocks.iter().all(|block| holds(block, offsets::AUX_SCALE, [1.0, 1.0])));
+
+        // Ending on a scaled pass: the composite upsamples it (maps the small image, full texel).
+        let Some(ending) = super::plan(&chain[..2], capture, whole, [0, 0]) else { panic!("planned") };
+        assert_eq!(ending.composite.input, ending.steps[1].written);
+        assert_eq!(ending.target_px, [101, 51], "the pool is the window, also without a full-resolution step");
+        assert!(ending.steps.iter().all(|step| step.used_px[0] <= 101 && step.used_px[1] <= 51));
+        let geometry = LayerGeometry { region: whole, capture: whole, rect_uv: [0.0; 4], region_uv: [0.0; 4], mask_rect_px: [0.0; 4], mask_radii_px: [0.0; 4], pixels_per_layer_point: 1.0 };
+        let composite = composite_uniforms(&frame, &ending, &allocations, &geometry);
+        assert_eq!(ending.composite.bindings.src, Slot::Pong);
+        assert!(holds(&composite, offsets::SRC_SCALE, [26.0 / 101.0, 13.0 / 51.0]) && holds(&composite, offsets::SRC_TEXEL, [1.0 / 26.0, 1.0 / 13.0]));
+        assert!(holds(&composite, offsets::FRAG_TEXEL, frame.texel) && (read(&composite, offsets::PASS_SCALE) - 1.0).abs() < f32::EPSILON);
+
+        // A scaled chain over a window of the capture cannot be planned (tiling refuses it).
+        assert!(super::plan(&chain, capture, PxRect { x: 0, y: 0, w: 50, h: 51 }, [0, 0]).is_none());
+        assert!(super::plan(&chain, capture, PxRect { x: 1, y: 0, w: 100, h: 51 }, [0, 0]).is_none());
+        // Unscaled chains keep planning windows.
+        assert!(super::plan(&passes(2), capture, PxRect { x: 1, y: 0, w: 100, h: 51 }, [0, 0]).is_some());
     }
 
     /// F4: a step binds its pass's named block (layout-sized), a module without `struct Params`

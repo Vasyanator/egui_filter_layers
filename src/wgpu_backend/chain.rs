@@ -51,7 +51,7 @@ use crate::effect::{
 };
 use crate::geometry::{LayerGeometry, PxRect, px_f32};
 use crate::pass::{FrameUniforms, InputUniforms, Pass, UNIFORM_BLOCK_SIZE};
-use crate::plan::{Bindings, ChainPlan, Slot, SlotMappings, TextureMapping, composite_params_block, composite_uniforms, params_block, plan, step_uniforms};
+use crate::plan::{Allocations, Bindings, ChainPlan, Slot, composite_params_block, composite_uniforms, params_block, plan, step_uniforms};
 
 /// Blend of the blended composite's erase draw: `dst * (1 - src.a)` on colour and alpha (the
 /// shader outputs `(0, 0, 0, coverage)`, so the source term is zero).
@@ -238,20 +238,18 @@ impl ChainResources {
     /// `passes` one to one, or the window is empty. Uniforms are uploaded with
     /// `rec.queue.write_buffer`, so they take effect at the next submission of `rec.queue`;
     /// `targets` must not be reused by another run before this run's composite has been drawn.
-    /// Every pass renders `job.window.rect` (at its target's origin); pixels of the window
-    /// within the chain's reach of a window edge that is not a capture edge are only as exact as
-    /// the data the window holds there (the offline tiler overlaps windows by the padding).
+    /// Every full-resolution pass renders `job.window.rect` (at its target's origin), a scaled
+    /// pass the plan's smaller viewport; pixels of the window within the chain's reach of a
+    /// window edge that is not a capture edge are only as exact as the data the window holds
+    /// there (the offline tiler overlaps windows by the padding). A chain with a scaled pass over
+    /// a partial window is not planned (`None`; tiling callers refuse such chains first).
     pub(crate) fn record(&self, rec: &mut ChainRecording<'_>, targets: &mut ChainTargets, job: &ChainJob<'_>) -> Option<wgpu::BindGroup> {
         if job.pipelines.len() != job.passes.len() {
             return None;
         }
-        let window = job.window.rect;
-        let plan = plan(job.passes.len(), window, job.window.composite_origin)?;
-        // `plan` rejected empty and negative windows, so these conversions cannot fail.
-        let (Ok(window_w), Ok(window_h), Ok(window_x), Ok(window_y)) = (u32::try_from(window.w), u32::try_from(window.h), u32::try_from(window.x), u32::try_from(window.y)) else {
-            return None;
-        };
-        let needed = [window_w.max(job.window.min_target_size[0]), window_h.max(job.window.min_target_size[1])];
+        let plan = plan(job.passes, job.geometry.capture.size(), job.window.rect, job.window.composite_origin)?;
+        // Both ping-pong targets hold every step's viewport (the plan's pool size) at least.
+        let needed = [plan.target_px[0].max(job.window.min_target_size[0]), plan.target_px[1].max(job.window.min_target_size[1])];
         for (index, slot) in targets.ping_pong.iter_mut().enumerate() {
             Target::ensure(slot, rec.device, self.intermediate_format, None, if index == 0 { "egui_filter_layers ping" } else { "egui_filter_layers pong" }, needed);
         }
@@ -259,11 +257,9 @@ impl ChainResources {
             return None;
         };
 
-        let capture = job.geometry.capture.size().map(|extent| u32::try_from(extent).unwrap_or(1));
-        let origin = [window_x, window_y];
-        let maps = SlotMappings { source: TextureMapping::of(capture, job.source.allocated, origin), ping_pong: [TextureMapping::of(capture, first.size, origin), TextureMapping::of(capture, second.size, origin)] };
+        let allocations = Allocations { source: job.source.allocated, ping_pong: [first.size, second.size] };
         let alignment = usize::try_from(self.uniform_alignment).unwrap_or(UNIFORM_BLOCK_SIZE);
-        let uniforms = chain_uniforms(&frame_uniforms(&job.geometry, job.time).with_input(&job.input), &plan, job.passes, &job.geometry, &maps, alignment);
+        let uniforms = chain_uniforms(&frame_uniforms(&job.geometry, job.time).with_input(&job.input), &plan, job.passes, &job.geometry, &allocations, alignment);
         let uniform_buffer = targets.uniforms.write(rec.device, rec.queue, &uniforms.bytes).clone();
         let view_of = |slot: Slot| match slot {
             Slot::Source => job.source.view,
@@ -428,7 +424,7 @@ pub(crate) struct ChainUniforms {
 /// `fl` block then the named-parameter block, each at an offset that is a multiple of
 /// `alignment` (the device's `min_uniform_buffer_offset_alignment`; values below 1 count as 1).
 #[must_use]
-pub(crate) fn chain_uniforms(frame: &FrameUniforms, plan: &ChainPlan, passes: &[Pass], geometry: &LayerGeometry, maps: &SlotMappings, alignment: usize) -> ChainUniforms {
+pub(crate) fn chain_uniforms(frame: &FrameUniforms, plan: &ChainPlan, passes: &[Pass], geometry: &LayerGeometry, allocations: &Allocations, alignment: usize) -> ChainUniforms {
     let alignment = alignment.max(1);
     let mut bytes = Vec::new();
     // Appends `block` at the next aligned offset, returning its byte range.
@@ -444,12 +440,12 @@ pub(crate) fn chain_uniforms(frame: &FrameUniforms, plan: &ChainPlan, passes: &[
         // `plan` indexes the `passes` it was built from; a mismatch would be a crate bug, and the
         // draw then gets zero blocks of the right sizes rather than another pass's values.
         let (fl, params) = match passes.get(step.pass) {
-            Some(pass) => (push(&step_uniforms(frame, step, maps, pass)), push(params_block(pass))),
+            Some(pass) => (push(&step_uniforms(frame, plan, step, allocations, pass)), push(params_block(pass))),
             None => (push(&[0; UNIFORM_BLOCK_SIZE]), push(composite_params_block())),
         };
         draws.push(DrawUniforms { fl, params });
     }
-    let fl = push(&composite_uniforms(frame, plan, maps, geometry));
+    let fl = push(&composite_uniforms(frame, plan, allocations, geometry));
     let params = push(composite_params_block());
     draws.push(DrawUniforms { fl, params });
     ChainUniforms { bytes, draws }
@@ -494,12 +490,12 @@ mod tests {
         let mut passes: Vec<Pass> = (0..3).map(|index| Pass::new(&effect).with_param(0, [f32::from(u8::try_from(index).unwrap_or(0)); 4]).unwrap_or_else(|error| panic!("{error}"))).collect();
         passes[1] = Pass::new(&named).with("color", [1.0, 2.0, 3.0, 4.0]).unwrap_or_else(|error| panic!("{error}"));
         let window = PxRect { x: 0, y: 0, w: 40, h: 30 };
-        let Some(plan) = plan(passes.len(), window, [5, 6]) else { panic!("planned") };
+        let Some(plan) = plan(&passes, window.size(), window, [5, 6]) else { panic!("planned") };
         let geometry = LayerGeometry { region: window, capture: window, rect_uv: [0.0, 0.0, 1.0, 1.0], region_uv: [0.0, 0.0, 1.0, 1.0], mask_rect_px: [0.0, 0.0, 40.0, 30.0], mask_radii_px: [0.0; 4], pixels_per_layer_point: 1.0 };
-        let maps = SlotMappings { source: TextureMapping::of([40, 30], [64, 64], [0, 0]), ping_pong: [TextureMapping::of([40, 30], [40, 30], [0, 0]), TextureMapping::of([40, 30], [128, 32], [0, 0])] };
+        let allocations = Allocations { source: [64, 64], ping_pong: [[40, 30], [128, 32]] };
         let frame = frame_uniforms(&geometry, 0.5);
         let alignment = 256;
-        let uniforms = chain_uniforms(&frame, &plan, &passes, &geometry, &maps, alignment);
+        let uniforms = chain_uniforms(&frame, &plan, &passes, &geometry, &allocations, alignment);
         assert_eq!(uniforms.draws.len(), 4);
         let at = |range: &std::ops::Range<u64>| &uniforms.bytes[usize::try_from(range.start).unwrap_or(0)..usize::try_from(range.end).unwrap_or(0)];
         let mut previous_end = 0;
@@ -508,8 +504,8 @@ mod tests {
             assert!(draw.fl.start >= previous_end && draw.params.start >= draw.fl.end, "draw {index}: ordered, disjoint {draw:?}");
             previous_end = draw.params.end;
             let expected_fl = match plan.steps.get(index) {
-                Some(step) => step_uniforms(&frame, step, &maps, &passes[step.pass]),
-                None => composite_uniforms(&frame, &plan, &maps, &geometry),
+                Some(step) => step_uniforms(&frame, &plan, step, &allocations, &passes[step.pass]),
+                None => composite_uniforms(&frame, &plan, &allocations, &geometry),
             };
             assert_eq!(at(&draw.fl), &expected_fl[..], "draw {index}: fl block");
             let expected_params = plan.steps.get(index).map_or(composite_params_block(), |step| params_block(&passes[step.pass]));

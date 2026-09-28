@@ -11,6 +11,9 @@
 //! partly covered edge are checked over a transparent frame against CPU references, and the
 //! rounded-corner scene runs in MSAA / depth / stencil passes (pipeline-pass compatibility).
 //! `original(uv)` after passes that changed the image must give the backdrop back in every pass.
+//! Reduced-resolution passes (F6): a scaled identity chain matches the unscaled one on a smooth
+//! backdrop; `kawase_blur` spreads a dot symmetrically and normalized; `bloom` glows around a
+//! bright spot only.
 //!
 //! Needs a GPU adapter (Vulkan, Metal, DX12 or GL), so it is ignored by default:
 //! `cargo test --all-features -- --ignored`.
@@ -631,4 +634,197 @@ fn named_params_reach_each_pass() {
     assert_near(&pixels, 60, 60, [64, 96, 64], "named params over red");
     assert_near(&pixels, 200, 60, [128, 96, 0], "named params over blue");
     assert_near(&pixels, 10, 10, [255, 0, 0], "outside the layer");
+}
+
+/// Vertical stripes, 4 points wide, alternating red / blue over the whole frame: any horizontal
+/// displacement of a read changes the pixel.
+fn ripple_stripes(painter: &egui::Painter) {
+    for i in 0..64_u8 {
+        let x = f32::from(i) * 4.0;
+        let colour = if i % 2 == 0 { Color32::RED } else { Color32::BLUE };
+        painter.rect_filled(Rect::from_min_max(pos2(x, 0.0), pos2(x + 4.0, 128.0)), 0.0, colour);
+    }
+}
+
+/// Compares a `click_ripples` frame with the same layer without impulses (pixel-identical
+/// backdrop pass-through): pixels in the ring band around (128, 64) must move, pixels farther
+/// than two wavelengths from the front (the window's compact support) must not.
+fn check_click_ripples(rippled: &[u8], still: &[u8]) {
+    let (mut moved_in_band, mut moved_elsewhere) = (0_usize, Vec::new());
+    // Inside the layer rect (40, 4) .. (216, 124), keeping 2 px off its edges.
+    for y in 6..122_u32 {
+        for x in 42..214_u32 {
+            let dist = (f32::from(u16::try_from(x).unwrap_or(0)) + 0.5 - 128.0).hypot(f32::from(u16::try_from(y).unwrap_or(0)) + 0.5 - 64.0);
+            let [a, b] = [rgb(rippled, x, y), rgb(still, x, y)];
+            let moved = a.iter().zip(b).any(|(a, b)| a.abs_diff(b) > 1);
+            // Front at 40 px, wavelength 8 px: non-zero displacement only for 24 < dist < 56.
+            if (26.0..54.0).contains(&dist) {
+                moved_in_band += usize::from(moved);
+            } else if !(22.0..58.0).contains(&dist) && moved {
+                moved_elsewhere.push((x, y, a, b));
+            }
+        }
+    }
+    assert!(moved_in_band > 100, "the ring must displace pixels near its front: {moved_in_band} moved");
+    assert!(moved_elsewhere.is_empty(), "pixels away from the ring must stay exactly: {:?}", &moved_elsewhere[..moved_elsewhere.len().min(8)]);
+}
+
+/// F3: `presets::click_ripples` driven by `Impulses` — one impulse at the layer centre, 1 s old,
+/// travelling 40 points per second — displaces the ring around its front and leaves the centre
+/// and the far field untouched.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn click_ripples_displace_the_ring_only() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let rect = Rect::from_min_max(pos2(40.0, 4.0), pos2(216.0, 124.0));
+    let mut impulses = egui_filter_layers::Impulses::new(4.0);
+    assert!(impulses.push_point(pos2(128.0, 64.0), rect, 1.0, 0.0));
+    let rippled = presets::click_ripples(&impulses, 1.0, 6.0, 8.0, 40.0);
+    let still = presets::click_ripples(&egui_filter_layers::Impulses::new(4.0), 1.0, 6.0, 8.0, 40.0);
+    let frame = |pass: &Pass| {
+        let mut paint = |ui: &mut egui::Ui| {
+            ripple_stripes(ui.painter());
+            FilterLayer::new(rect, pass.clone()).paint(ui.painter());
+        };
+        render_frame(&ctx, &state, &target, &mut paint);
+        render_frame(&ctx, &state, &target, &mut paint).0
+    };
+    let (rippled, still) = (frame(&rippled), frame(&still));
+    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(egui_filter_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&ctx));
+    assert_near(&still, 130, 64, [255, 0, 0], "no impulses: the stripes pass through");
+    check_click_ripples(&rippled, &still);
+}
+
+// ---- F6: scaled passes, kawase blur, bloom ----
+
+/// A smooth backdrop over the whole frame: a mesh whose vertex colours ramp red left -> right
+/// and green top -> bottom (blue constant).
+fn smooth_ramp(painter: &egui::Painter) {
+    let mut mesh = egui::Mesh::default();
+    let corners = [(pos2(0.0, 0.0), Color32::from_rgb(0, 0, 64)), (pos2(256.0, 0.0), Color32::from_rgb(255, 0, 64)), (pos2(0.0, 128.0), Color32::from_rgb(0, 255, 64)), (pos2(256.0, 128.0), Color32::from_rgb(255, 255, 64))];
+    for (pos, color) in corners {
+        mesh.colored_vertex(pos, color);
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(1, 3, 2);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// The largest channel difference between `a` and `b` inside `rect` (pixels, exclusive max).
+fn max_diff_in(a: &[u8], b: &[u8], rect: [u32; 4]) -> (u8, (u32, u32)) {
+    let mut worst = (0, (0, 0));
+    for y in rect[1]..rect[3] {
+        for x in rect[0]..rect[2] {
+            let diff = rgb(a, x, y).iter().zip(rgb(b, x, y)).map(|(a, b)| a.abs_diff(b)).max().unwrap_or(0);
+            if diff > worst.0 {
+                worst = (diff, (x, y));
+            }
+        }
+    }
+    worst
+}
+
+/// The red channel along a row / column through `(x, y)`, `reach` pixels each way.
+fn profiles(pixels: &[u8], x: u32, y: u32, reach: u32) -> (Vec<u8>, Vec<u8>) {
+    ((x - reach..x + reach).map(|x| rgb(pixels, x, y)[0]).collect(), (y - reach..y + reach).map(|y| rgb(pixels, x, y)[0]).collect())
+}
+
+/// Checks a blurred 8x8 white dot centred on the pixel corner (128, 64) over black: the blur is
+/// mirror-symmetric about the dot's centre in both axes, spreads beyond the dot, keeps its
+/// energy (the kernel is normalized), and reaches no further than `reach` pixels.
+fn check_blurred_dot(pixels: &[u8], reach: u32, what: &str) {
+    let (row, column) = profiles(pixels, 128, 64, 30);
+    for k in 0..30 {
+        // Pixel 128 + k mirrors pixel 127 - k (the dot is centred on the corner between them).
+        let (right, left) = (row[30 + k], row[29 - k]);
+        let (down, up) = (column[30 + k], column[29 - k]);
+        assert!(right.abs_diff(left) <= 3 && down.abs_diff(up) <= 3, "{what}: asymmetric at {k}: row {row:?} column {column:?}");
+    }
+    let centre = rgb(pixels, 128, 64)[0];
+    assert!((40..250).contains(&centre), "{what}: the dot must be spread out, centre {centre}");
+    assert!(rgb(pixels, 128 + 8, 64)[0] > 8 && rgb(pixels, 128, 64 + 8)[0] > 8, "{what}: light 4 px beyond the dot's edge: {row:?}");
+    let far = 132 + reach + 2;
+    assert!(rgb(pixels, far, 64)[0] <= 1 && rgb(pixels, 128, 68 + reach.min(50) + 2)[0] <= 1, "{what}: nothing beyond the reach ({reach} px): {row:?}");
+    // 64 white pixels of energy (8-bit rounding of many small values: within 12%).
+    let energy: u32 = (64 - 50..64 + 50).flat_map(|y| (128 - 60..128 + 60).map(move |x| (x, y))).map(|(x, y)| u32::from(rgb(pixels, x, y)[0])).sum();
+    assert!((64 * 255 * 88 / 100..64 * 255 * 112 / 100).contains(&energy), "{what}: energy {energy}, expected about {}", 64 * 255);
+}
+
+/// Paints black, an 8x8 white dot at (124, 60) .. (132, 68), and `chain` over (32, 4) .. (224, 124).
+fn dot_scene(painter: &egui::Painter, chain: &FilterChain, background: Color32) {
+    painter.rect_filled(Rect::from_min_max(pos2(0.0, 0.0), pos2(256.0, 128.0)), 0.0, background);
+    painter.rect_filled(Rect::from_min_max(pos2(124.0, 60.0), pos2(132.0, 68.0)), 0.0, Color32::WHITE);
+    FilterLayer::new(Rect::from_min_max(pos2(32.0, 4.0), pos2(224.0, 124.0)), chain.clone()).paint(painter);
+}
+
+/// F6: an identity pass at half resolution (upsampled by the composite) over a smooth backdrop
+/// equals the full-resolution identity within 3 steps, over an odd-sized layer (rounding of the
+/// scaled size); a half / quarter / full chain too.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn a_scaled_identity_chain_matches_the_unscaled_one() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let identity = Pass::new(&Effect::new("id", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }").unwrap_or_else(|error| panic!("{error}")));
+    // 217 x 109 pixels: odd sizes, scaled sizes rounded up.
+    let rect = Rect::from_min_max(pos2(17.0, 9.0), pos2(234.0, 118.0));
+    let frame = |chain: &FilterChain| {
+        let mut paint = |ui: &mut egui::Ui| {
+            smooth_ramp(ui.painter());
+            FilterLayer::new(rect, chain.clone()).paint(ui.painter());
+        };
+        render_frame(&ctx, &state, &target, &mut paint);
+        render_frame(&ctx, &state, &target, &mut paint).0
+    };
+    let full = frame(&FilterChain::from(identity.clone()));
+    let half = frame(&FilterChain::from(identity.clone().with_scale(0.5)));
+    let pyramid = frame(&FilterChain::from(vec![identity.clone().with_scale(0.5), identity.clone().with_scale(0.25), identity.clone()]));
+    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(egui_filter_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&ctx));
+    let inside = [19, 11, 232, 116];
+    let (worst, at) = max_diff_in(&full, &half, inside);
+    assert!(worst <= 3, "half resolution: max diff {worst} at {at:?}");
+    let (worst, at) = max_diff_in(&full, &pyramid, inside);
+    assert!(worst <= 4, "half / quarter / full: max diff {worst} at {at:?}");
+    assert_near(&half, 5, 5, rgb(&full, 5, 5), "outside the layer");
+}
+
+/// F6: `presets::kawase_blur` spreads a bright dot symmetrically, normalized, within its reach.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn a_kawase_blur_spreads_a_dot_symmetrically() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let chain = presets::kawase_blur(16.0);
+    let mut paint = |ui: &mut egui::Ui| dot_scene(ui.painter(), &chain, Color32::BLACK);
+    render_frame(&ctx, &state, &target, &mut paint);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(egui_filter_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&ctx));
+    check_blurred_dot(&pixels, 16, "kawase_blur(16)");
+}
+
+/// F6: `presets::bloom` adds light around a bright spot, keeps the spot, and leaves dark areas
+/// (below the threshold, beyond the reach) and the outside of the layer untouched.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn bloom_brightens_around_a_bright_spot_only() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let dark = Color32::from_gray(40);
+    let chain = presets::bloom(0.5, 1.0, 16.0);
+    let mut paint = |ui: &mut egui::Ui| dot_scene(ui.painter(), &chain, dark);
+    render_frame(&ctx, &state, &target, &mut paint);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(egui_filter_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&ctx));
+    assert_near(&pixels, 128, 64, [255, 255, 255], "the spot stays white");
+    let (row, _) = profiles(&pixels, 128, 64, 30);
+    eprintln!("bloom row through the spot: {row:?}");
+    // Light falls off with the distance from the spot's edge (x = 132) and is grey (a white spot).
+    let glow = |x: u32| rgb(&pixels, x, 64);
+    assert!(glow(134).iter().all(|&value| value >= 52) && glow(134)[0] == glow(134)[2], "2 px from the spot must glow: {row:?}");
+    assert!(glow(134)[0] > glow(138)[0] && glow(138)[0] >= glow(142)[0] && glow(138)[0] > 40, "the glow falls off: {row:?}");
+    assert!(glow(136)[0].abs_diff(glow(119)[0]) <= 3, "symmetric glow: {row:?}");
+    assert_near(&pixels, 60, 30, [40, 40, 40], "dark area beyond the reach");
+    assert_near(&pixels, 200, 110, [40, 40, 40], "dark area beyond the reach");
+    assert_near(&pixels, 10, 64, [40, 40, 40], "outside the layer");
 }

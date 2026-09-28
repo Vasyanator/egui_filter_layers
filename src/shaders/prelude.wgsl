@@ -2,12 +2,16 @@
 //
 // Public surface for effect authors (see the crate docs, "Writing an effect"):
 //   fl.rect_uv, fl.texel, fl.size_px, fl.time, fl.pixels_per_point,
-//   fl.delta_time, fl.frame, fl.pointer,
-//   src(), src_px(), original(), params(), to_linear(), to_gamma(), premultiply(),
-//   unpremultiply(), luma(), and `p` (the snippet's own `struct Params`, see below).
+//   fl.delta_time, fl.frame, fl.pointer, fl.pass_scale,
+//   src(), src_px(), src_texel(), out_texel(), original(), params(), to_linear(), to_gamma(),
+//   premultiply(), unpremultiply(), luma(), and `p` (the snippet's own `struct Params`, see below).
 // Every other `fl_*` / `internal_*` name, and every `fl` member not listed in the crate docs
-// (`pass_scale`, `pass_index` hold neutral values until they are documented there), is private
-// to the crate and may change.
+// (`pass_index` holds a neutral value until it is documented there), is private to the crate and
+// may change.
+// Scaled passes (`Pass::with_scale`): a pass may render a smaller image that spans the whole
+// capture (`fl.pass_scale` < 1). `uv`, `fl.texel`, `fl.size_px` stay the CAPTURE's; the pass's
+// input and output resolutions are `internal_src_texel` (`src_texel()`, `src_px()`, the `src()`
+// edge clamp) and `internal_frag_texel` (`out_texel()`, the mode-1 fragment uv).
 // Per-frame input (the same for every layer of a frame): `fl.delta_time` = seconds since the
 // previous frame (UI: egui's stable_dt clamped to 0..=0.1; offline: options / video frame times),
 // `fl.frame` = frame counter (u32, wrapping), `fl.pointer` = pointer in capture uv (`xy`, the
@@ -45,6 +49,7 @@ struct FlUniforms {
     pass_scale: f32,
     pass_index: u32,
     internal_frag_texel: vec2<f32>,
+    internal_src_texel: vec2<f32>,
     params: array<vec4<f32>, 16>,
 }
 
@@ -68,25 +73,38 @@ struct FlVertexOutput {
     @location(0) uv: vec2<f32>,
 }
 
-fn fl_storage_uv(uv: vec2<f32>, scale: vec2<f32>, offset: vec2<f32>) -> vec2<f32> {
-    let half_texel = 0.5 * fl.texel;
+// `texel` = one pixel of the sampled image in capture uv: the clamp keeps bilinear reads inside
+// its used region (a grow-only texture holds garbage beyond it).
+fn fl_storage_uv(uv: vec2<f32>, texel: vec2<f32>, scale: vec2<f32>, offset: vec2<f32>) -> vec2<f32> {
+    let half_texel = 0.5 * texel;
     let c = clamp(uv, half_texel, vec2<f32>(1.0) - half_texel);
     let y = select(c.y, 1.0 - c.y, fl.internal_flip_y > 0.5);
     return vec2<f32>(c.x, y) * scale - offset;
 }
 
 fn src(uv: vec2<f32>) -> vec4<f32> {
-    return textureSampleLevel(fl_src_texture, fl_sampler, fl_storage_uv(uv, fl.internal_src_scale, fl.internal_src_offset), 0.0);
+    return textureSampleLevel(fl_src_texture, fl_sampler, fl_storage_uv(uv, fl.internal_src_texel, fl.internal_src_scale, fl.internal_src_offset), 0.0);
 }
 
+// `offset_px` in pixels of the pass's INPUT (capture pixels unless the previous pass is scaled).
 fn src_px(offset_px: vec2<f32>) -> vec4<f32> {
-    return src(fl_frag_uv + offset_px * fl.texel);
+    return src(fl_frag_uv + offset_px * fl.internal_src_texel);
+}
+
+// One pixel of the pass's input (`src`) in `uv` units.
+fn src_texel() -> vec2<f32> {
+    return fl.internal_src_texel;
+}
+
+// One pixel of the pass's own output in `uv` units (`fl.texel / fl.pass_scale`, up to rounding).
+fn out_texel() -> vec2<f32> {
+    return fl.internal_frag_texel;
 }
 
 // The untouched capture (the backdrop before any pass), in every pass and the composite: the
 // plan binds the capture at `fl_original_texture` for every draw, mapped by `internal_aux_*`.
 fn original(uv: vec2<f32>) -> vec4<f32> {
-    return textureSampleLevel(fl_original_texture, fl_sampler, fl_storage_uv(uv, fl.internal_aux_scale, fl.internal_aux_offset), 0.0);
+    return textureSampleLevel(fl_original_texture, fl_sampler, fl_storage_uv(uv, fl.texel, fl.internal_aux_scale, fl.internal_aux_offset), 0.0);
 }
 
 fn params(i: u32) -> vec4<f32> {
@@ -133,9 +151,10 @@ fn fl_vertex(@builtin(vertex_index) index: u32) -> FlVertexOutput {
 }
 
 // The fragment's capture uv: interpolated over the viewport (mode 0, OpenGL), or from the pixel
-// position (mode 1, wgpu), which is exact for any window of the capture.
+// position (mode 1, wgpu), which is exact for any window of the capture. A scaled pass's pixels
+// are `internal_frag_texel` wide (the whole capture over its output).
 fn fl_capture_uv(in: FlVertexOutput) -> vec2<f32> {
-    let from_position = (in.position.xy + fl.internal_frag_offset) * fl.texel;
+    let from_position = (in.position.xy + fl.internal_frag_offset) * fl.internal_frag_texel;
     return select(in.uv, from_position, fl.internal_frag_mode > 0.5);
 }
 

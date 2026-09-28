@@ -5,7 +5,10 @@ already painted beneath a rect and redraws that region through a chain of filter
 blur, colour adjustments, refraction, or your own WGSL shader.
 
 - Presets: Gaussian blur, brightness/contrast, saturation, grayscale, invert, tint, sharpen,
-  pixelate, ripple (animated), lens, vignette, frosted glass.
+  pixelate, ripple (animated), lens, vignette, frosted glass, click ripples (rings from
+  clicks, driven by the `Impulses` helper; repaints only while a ring is alive), a fast large
+  blur (`kawase_blur`, a dual-Kawase pyramid) and `bloom`.
+- Reduced-resolution passes (`Pass::with_scale(0.5)`): cheap large kernels, upsampled back.
 - Custom effects: write one WGSL function; it is validated by [naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga)
   when you build it, with errors pointing at your snippet.
 - Named, typed effect parameters: declare `struct Params { ... }` in WGSL, set values by name
@@ -151,11 +154,13 @@ Prelude available to every effect:
 | Name | Meaning |
 |---|---|
 | `src(uv)` | pass input, bilinear, clamped to the captured region |
-| `src_px(offset)` | input at `offset` physical pixels from the current pixel |
+| `src_px(offset)` | input at `offset` pixels of the input from the current pixel (physical pixels unless the previous pass is scaled) |
+| `src_texel()`, `out_texel()` | one pixel of the pass's input / its own output, in `uv` units |
 | `original(uv)` | the untouched captured backdrop (before any pass), readable in every pass |
 | `p.<name>` | named parameter: member of the snippet's `struct Params` (below) |
 | `params(i)` | `vec4<f32>` anonymous parameter slot `i` (`0..16`) of the pass (untyped; prefer named) |
-| `fl.texel`, `fl.size_px` | one pixel in `uv` units; capture size in pixels |
+| `fl.texel`, `fl.size_px` | one capture pixel in `uv` units; capture size in pixels (also in scaled passes) |
+| `fl.pass_scale` | the pass's output resolution relative to the capture (`Pass::with_scale`, 1 = full) |
 | `fl.rect_uv` | the layer rect inside the capture (`xy` min, `zw` size) |
 | `fl.time`, `fl.pixels_per_point` | egui time in seconds; physical pixels per layer point (egui scale factor × layer zoom) |
 | `to_linear`, `to_gamma`, `premultiply`, `unpremultiply`, `luma` | colour helpers |
@@ -175,6 +180,13 @@ blur covers 8 pixels at zoom 2 — and the capture padding follows.
 numbers match `EffectError::location()`.
 
 Chains run pass by pass (ping-pong): `presets::gaussian_blur(6.0).then(Pass::new(&wave))`.
+
+A pass can run at reduced resolution: `Pass::new(&effect).with_scale(0.5)` renders
+`ceil(capture * 0.5)` pixels per axis, and the next pass (or the final composite, bilinearly)
+reads that smaller image. `uv`, `src()`, `original()`, `fl.texel` and `fl.size_px` keep their
+capture meaning, so distance maths is unchanged; kernels that step in pixels use `src_px()` /
+`src_texel()` (input pixels) or `out_texel()`. `presets::kawase_blur(radius)` and
+`presets::bloom(threshold, intensity, radius)` are built from such passes.
 
 ### Named parameters
 
@@ -321,7 +333,9 @@ except for the rare sub-texel differences above — so a frame larger than 4096 
 UI shows untiled matches it bit for bit only with `with_max_tile_size(None)`. A device that runs
 out of memory yields `OfflineError::OutOfMemory` (retry with smaller tiles), never a panic. Effects must not read further than their
 declared sample radius — the `lens` preset reads anywhere in the layer, so give a tiled lens
-`Pass::with_sample_radius`. At the frame border sampling clamps to the edge, exactly as the UI
+`Pass::with_sample_radius`. Chains with a reduced-resolution pass (`with_scale`, `kawase_blur`,
+`bloom`) cannot be tiled exactly: a frame that would need tiles fails with
+`OfflineError::NotTileable`; process it whole with `with_max_tile_size(None)`. At the frame border sampling clamps to the edge, exactly as the UI
 clamps at the screen edge.
 
 ### Video

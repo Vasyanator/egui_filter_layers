@@ -33,14 +33,18 @@ appended `var<uniform> p: Params;`; naga's IR then confirms it (the struct is fo
 ## Contracts and invariants
 - The prelude comes first and the tail last: naga line `n` is snippet line `n - prelude_lines`;
   errors located in the tail point at the `struct Params` declaration with `TAIL_HINT`.
-- `ParamLayout` offsets ARE naga's member offsets; for every accepted type they equal GLSL
-  std140 (pinned by `named_params_are_reflected_in_the_std140_layout`), so glow and wgpu upload
-  the same bytes. `block_size` = struct span rounded up to 16 (0 = no named parameters),
+- `ParamLayout` offsets ARE naga's member offsets, and `from_module` rejects the struct when any
+  offset, array stride or the span differs from GLSL std140 (naga's GLSL writer drops WGSL
+  offsets, so `@size` / `@align` that move a member would desync glow from wgpu). Pinned by
+  `named_params_are_reflected_in_the_std140_layout` and
+  `size_and_align_attributes_that_break_std140_are_rejected`. `block_size` = struct span rounded up to 16 (0 = no named parameters),
   at most `MAX_PARAMS_BLOCK_SIZE` (16 KiB, the WebGL2 / GLES 3.0 uniform block minimum).
 - Accepted member types: `f32`, `i32`, `u32`, `vec2/3/4<f32>`, `mat4x4<f32>`, constant-size arrays
   of `vec3/vec4<f32>` / `mat4x4<f32>` (stride a multiple of 16). Everything else is an
   `EffectError::Interface` naming the member, located at the struct.
 - Values are native-endian, like `pass::pack_uniforms`. No implicit type conversions.
+- Colour values are premultiplied gamma space (`From<Color32>`, matching `src()`); linear only via
+  `ParamValue::linear_rgba`. `ParamValue` is `#[non_exhaustive]`.
 - Public API never panics on user input.
 
 ## Editing map

@@ -6,7 +6,7 @@ WGSL sources compiled into the crate with `include_str!` (by `effect.rs`).
 ## Files
 - `prelude.wgsl`: prepended to every effect. Declares `FlUniforms` / `fl`, the WHOLE `@group(0)`
   resource layout (bindings 0-3 and 5-7; 4 is the named-parameter block `p: Params`, which
-  `effect/` appends AFTER a snippet declaring `struct Params`), the public helpers (`src`, `src_px`, `original`, `params`, colour helpers), and both entry points
+  `effect/` appends AFTER a snippet declaring `struct Params`), the public helpers (`src`, `src_px`, `src_texel`, `out_texel`, `original`, `params`, colour helpers), and both entry points
   (`fl_vertex`: attribute-less full-viewport triangle; `fl_fragment`: computes the fragment's
   capture uv with `fl_capture_uv` and calls the user's `effect`).
   It must stay BEFORE user code so snippet line numbers are a plain offset.
@@ -29,9 +29,11 @@ WGSL sources compiled into the crate with `include_str!` (by `effect.rs`).
   texture must be read through ONE sampler per module (naga's GLSL writer rejects a texture used
   with two samplers).
 - Two fragment-uv modes (`internal_frag_mode`): 0 = interpolated over the viewport (glow), 1 =
-  `(position + internal_frag_offset) * texel` (wgpu). Mode 1 makes a pixel's uv independent of
+  `(position + internal_frag_offset) * internal_frag_texel` (wgpu; the draw's OUTPUT pixel,
+  `fl.texel` at full resolution, larger for a scaled pass). Mode 1 makes a pixel's uv independent of
   which window of the capture a pass renders (offline tiles). Storage uv is always
   `clamp(uv) * internal_*_scale - internal_*_offset`; offsets are 0 for a whole-capture window, so
-  glow and the UI see exactly the pre-window arithmetic.
+  glow and the UI see exactly the pre-window arithmetic. The edge clamp uses the SAMPLED image's
+  pixel: `internal_src_texel` for `src` (a scaled input), `fl.texel` for `original`.
 - Only `textureSampleLevel` is used (valid in non-uniform control flow, translates to `textureLod`).
 - Public names listed in the crate docs are API; `fl_*` / `internal_*` names are private.

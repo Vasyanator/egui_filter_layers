@@ -15,8 +15,9 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
    the layer for non-normalized formats; multisampled -> resolve with identical rects into a
    renderbuffer of the SAME internal format, then blit the padded capture rect into the RGBA8
    capture texture;
-5. plan the run (`plan::plan`, whole capture) and run its pass steps into the ping-pong targets
-   at `(0, 0, w, h)`, binding every `@group(0)` texture unit per draw (the plan's slots, dummies
+5. plan the run (`plan::plan`, whole capture), grow the ping-pong targets to the plan's
+   `target_px`, and run its pass steps into them at `(0, 0, used_px)` (smaller for scaled
+   passes; mode-0 uv interpolation over that viewport needs nothing else), binding every `@group(0)` texture unit per draw (the plan's slots, dummies
    elsewhere) and uploading `plan::step_uniforms` (binding point 0) and `plan::params_block`
    (binding point 1, `glBufferData` per draw: the size varies by effect);
 6. composite back into the original framebuffer over the visible region, scissor re-enabled

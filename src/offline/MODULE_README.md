@@ -55,6 +55,10 @@ frame stream needs (`video/` builds on exactly that).
   (like a freshly allocated UI capture). Hardware bilinear sampling BETWEEN texel centres depends
   rarely (<= 2 steps) on texture size / window origin: tiles and a UI capture that grew larger
   than the layer are exact only for texel-centre sampling (tested in `tests/offline_equivalence.rs`).
+- A chain with a scaled pass (`Pass::with_scale`) is never tiled: when the plan needs more than
+  one tile, `run` returns `OfflineError::NotTileable` before any GPU work (scaled sizes are
+  rounded over the WHOLE frame; tile windows cannot reproduce them). Whole-frame runs equal the
+  UI bit for bit (same targets, same plan).
 - Tiles overlap by the chain padding + 1 px; effects must read no further than their sample radius
   (the `lens` preset needs an explicit radius when tiled).
 - Every size is checked (`MAX_SIDE` = 2^24 - 1 per side, `usize` / `u32` / `u64` arithmetic);

@@ -99,9 +99,10 @@ Today: 352 bytes, `params` at 96 (`pass.rs:211,240`). New (naga std140-like unif
 | 128 / 136 | `internal_cover_scale`, `internal_cover_offset` | vec2 | F9 |
 | 144 | `pass_scale` | f32 | F6 (1.0 for full-res passes) |
 | 148 | `pass_index` | u32 | F7 substeps (index of this step within the frame's steps of its kind) |
-| 152 | `internal_frag_texel` | vec2 (= `texel / pass_scale`) | F6: mode-1 uv derivation |
-| 160 | `params` | array<vec4, 16> | — (kept, §5) |
-| 416 | (size) | | |
+| 152 | `internal_frag_texel` | vec2 (one OUTPUT pixel of the draw; `texel` at full res) | F6: mode-1 uv derivation, `out_texel()` |
+| 160 | `internal_src_texel` | vec2 (one pixel of the draw's `src` input) | F6 (phase 3b): `src_px`, `src_texel()`, `src()` edge clamp |
+| 176 | `params` | array<vec4, 16> | — (kept, §5) |
+| 432 | (size) | | |
 
 User-texture mappings (F8) are not needed: user textures are sampled in THEIR OWN uv (0..1 of
 the texture), never in capture uv. State (F7) and coverage (F9) use capture uv like `src`.
@@ -485,6 +486,8 @@ Each phase is marked done here in the same commit that lands it.
 - Phase 2a (F1 `original(uv)` in every pass: prelude helper, the plan binds the capture as every draw's original with its own `aux` mapping; GPU tests UI + offline incl. tiles): done.
 - Phase 2b (F2: `LayerJob::frame_input` read in `FilterLayer::paint`; `geometry::pointer_uniform` the one pointer -> capture-uv conversion, resolved per paint callback on both backends; `pass::InputUniforms` + `FrameUniforms::with_input`; `OfflineOptions::with_delta_time` / `with_frame` / `with_pointer` + `PointerState` in `offline/options.rs`; `VideoProcessor` frame clock, explicit options win; not animation triggers): done.
 - Phase 2c (F4 named parameters: `struct Params` detected by a pre-parse token scan, crate tail `@group(0) @binding(4) var<uniform> p: Params;`, `ParamLayout` = naga offsets (= std140), unsupported members / arrays with a non-16 stride / > 16 KiB rejected as located `EffectError::Interface`; `Effect::params()` / `param()`, `Pass::set` / `with` / `set_slice` / `get` / `get_slice`, `ParamError`; `plan::params_block` owns binding 4's bytes; wgpu `[fl_i, p_i]` at offset alignment, glow second UBO at binding point 1; `effect.rs` split into `src/effect/`): done.
+- Phase 3b (F6: `Pass::with_scale` clamped to `[MIN_PASS_SCALE = 1/1024, 1]`, non-finite = 1; `plan.rs` owns per-step `Content` (resolution + window), viewports `scaled_px = ceil(capture * s)` (f32 rounding error removed), the pool size `target_px`, per-step `src_texel` / `frag_texel` / `pass_scale`; the composite upsamples a scaled last output; `internal_src_texel` added to `FlUniforms` (432 bytes); prelude `src_texel()` / `out_texel()`, `src_px` in input pixels; both backends size targets and viewports from the plan; offline `OfflineError::NotTileable` when a scaled chain would need tiles; presets `kawase_blur(radius)` (dual-Kawase pyramid, up to 8 levels) and `bloom(threshold, intensity, radius)`; GPU tests wgpu + glow + offline, UI == offline bit for bit for scaled chains): done.
+- Phase 3a (F3 `Impulses` in `src/impulses.rs` + `presets::click_ripples`: layer-rect uv, oldest-first drop at 16 / `with_capacity`, `pack` / `apply` into named params `impulses` / `impulse_count`, `request_repaint_if_alive` the only `Context` use; compact-support wave packet clamped to `|amplitude|` = sample radius; GPU tests wgpu + glow): done.
 
 ## 18. Findings during execution
 - Phase 1: naga's GLSL writer rejects one texture read through two samplers in one module
@@ -507,8 +510,42 @@ Each phase is marked done here in the same commit that lands it.
   array strides itself so most of them are reported by member name. `EffectError::Interface`
   gained `location`. API additions beyond §5: `ParamError::Array` (single value on an array
   member), `Pass::get_slice`, `set_slice` zeroes the unset tail, `ParamInfo::{is_array,
-  stride}`, `From<egui::Vec2 | egui::Rgba> for ParamValue`; no default values (WGSL has none).
+  stride}`, `From<egui::Vec2 | egui::Color32> for ParamValue` (gamma, premultiplied) plus `ParamValue::linear_rgba`; no default values (WGSL has none).
 - Phase 2c: `tests/wgpu_headless.rs` with 14 parallel tests crashed (SIGSEGV inside `libvulkan`
   / `libVkLayer_khronos_validation`, concurrent `vkCreateInstance`, Mesa radv, debug build with
   wgpu's validation layer). The test helper `gpu()` now serializes instance / device creation
   with a test-only mutex; rendering still runs in parallel.
+- Phase 3a (F3): API deviations from §4, all additive or safer. `is_alive(now)` takes the clock
+  (true iff an impulse's age < life at `now`), so a caller that forgets `retire` cannot keep
+  repainting; `pack` also skips expired impulses. `request_repaint_if_alive(ctx, now)` is the one
+  method touching a `Context` (per the phase brief; `pack` / `apply` stay `Context`-free, so the
+  §4 offline guarantee holds). `push` / `push_point` return `bool` (false: non-finite input or a
+  rect without area, nothing stored). `with_capacity(1..=16)`, `IMPULSE_SLOTS`,
+  `IMPULSES_PARAM` / `IMPULSE_COUNT_PARAM` constants. No existing geometry helper fits the
+  point -> layer-rect-uv conversion (`pointer_uniform` targets capture uv, which depends on the
+  chain's padding), so it is a private helper in `impulses.rs`. `click_ripples` takes `life` from
+  the `Impulses` as a named param; the ring fades by `(1 - age/life)^2`, so expiry never pops.
+- Phase 3b (F6): §7's "`fl.texel` stays the capture's, kernels step with `out_texel()`" left
+  `src_px` stepping CAPTURE pixels, which on a scaled INPUT is a fraction of an input pixel and
+  whose `src()` edge clamp (half a capture texel) read past the used region of a smaller image
+  (garbage of the grow-only target). Resolution: `fl.texel` / `fl.size_px` /
+  `fl.pixels_per_point` stay the capture's (effect distance maths is scale-invariant; the
+  `original()` clamp stays right), and a new member `internal_src_texel` (one pixel of the
+  draw's input) drives `src_px`, `src_texel()` and the `src()` clamp. At full resolution it is
+  `fl.texel` bit for bit, so unscaled chains are unchanged (bit-identity suites green).
+  `gaussian_blur` / `ripple` now offset by `d * fl.texel` instead of `src_px(d)` (same float
+  operations, capture-pixel distances under any scale).
+- Phase 3b: the kawase level count is fixed when the chain is built, but the pixels per point
+  is known only at paint time. The tap offset adapts at runtime (`o = radius_px / span - 1`,
+  clamped to `0..4`), so the reach is `radius` points from about 0.75 to 3 pixels per point;
+  outside that range the blur is slightly wider (the pyramid's own reach) or narrower (taps
+  capped). Declared sample radius = `max(radius, span)` (pixels = points at >= 1 px/pt).
+- Phase 3b: `tests/offline_equivalence.rs` crashed (SIGSEGV inside
+  `libVkLayer_khronos_validation`, `vkSetDebugUtilsObjectNameEXT` during a buffer creation)
+  in about half the `--ignored` runs, ALSO without the new tests (reproduced 5/6 with them
+  skipped). Locking only instance creation did not help; its `gpu()` now returns a lock held
+  for the whole test (the file runs serially, ~6 s).
+- Phase 3b: the ping-pong pool of a plan (`ChainPlan::target_px`) is the WINDOW even for a chain
+  of scaled passes only: sizing it to the largest scaled viewport would let the UI allocate
+  smaller targets than the offline run (which pins them to the frame), changing the bilinear
+  weights of the upsample; with the window both match bit for bit (tested).
