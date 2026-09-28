@@ -7,8 +7,9 @@ beneath a rect through a chain of WGSL filter passes, on pluggable GPU backends.
 ## Architecture
 ```text
 user code ──► FilterLayer::paint (layer.rs)
-                 │  checks user textures (plan::check_textures), resolves FilterChain -> LayerJob
-                 │  (rect, mask, passes, padding, time, frame_input, textures)
+                 │  checks user textures (plan::check_textures) and the state id (check_state),
+                 │  resolves FilterChain -> LayerJob (rect, mask, passes, padding, time,
+                 │  frame_input, textures, id / viewport / state options / consumed reset)
                  ▼
           backend registry plugin (backend.rs)       ──►  Arc<dyn Backend>
                  │                                         ├─ glow_backend/  (feature "glow")
@@ -47,6 +48,11 @@ user code ──► FilterLayer::paint (layer.rs)
 - `pass.rs`: `Pass` (anonymous `params(i)` block and typed named parameters: `set` / `with` /
   `set_slice` / `get`), `FilterChain`, `PARAM_SLOTS`, uniform block layout (`offsets`, `pack_uniforms`),
   `FrameUniforms::for_layer` (the per-layer uniform values every backend uploads).
+- `state.rs`: persistent state (F7), the backend-neutral half: public `StateOptions`,
+  `StateFormat`, `StateError`, `StateFailure`, `reset_state` / `state_count` / `failed_states`;
+  per-context reset requests (`take_reset`, consumed by `FilterLayer::paint`); `StateRegistry<T>`
+  (per `(viewport, id)` entry: the backend's targets `T`, which one holds the latest state and its
+  size, one step per frame, eviction), used by both UI backends.
 - `plan.rs`: backend-neutral wiring of one chain run — `plan()` (steps: bindings by `Slot`,
   what each slot holds (`Content`: resolution, window), output, viewport, fragment offset; the
   composite; the ping-pong pool size `target_px`; which user texture slots each draw binds),
@@ -59,7 +65,8 @@ user code ──► FilterLayer::paint (layer.rs)
 - `layer.rs`: `FilterLayer` and its `paint` (skips a missing or failed backend, and a layer whose
   user textures fail `check_textures` (logged once per context and message); requests a repaint
   for animated chains only when the backend is usable; reads the per-frame input);
-  `FilterLayer::texture` attaches user textures (F8).
+  `FilterLayer::texture` attaches user textures (F8); `FilterLayer::id` / `state` /
+  `check_state` (F7: a stateful chain without an id is skipped, logged once per message).
 - `backend.rs`: crate-internal `Backend` trait, `LayerJob` (backend-neutral: rect, mask, passes,
   padding, time, `FrameInput`, attached texture ids), registry (`register`, `installed`, `uninstall`; a hook-less egui plugin, so it
   lives in the `Context` and survives `Memory` resets), public `status`, `failed_effects`,
@@ -102,7 +109,8 @@ user code ──► FilterLayer::paint (layer.rs)
   composite share one layout): 0 = `fl`, 1 = pass input, 2 = linear sampler, 3 = original
   capture, 4 = the named-parameter block `p: Params` (appended by the crate after a snippet that
   declares `struct Params`; every draw binds `plan::params_block`, 16 zero bytes without one),
-  5 = state, 6 = mask coverage. There is no nearest sampler: every texture is read through ONE
+  5 = state (the layer's latest state for every pass step of a stateful run; a 1x1 zero dummy
+  otherwise and for the composite), 6 = mask coverage. There is no nearest sampler: every texture is read through ONE
   sampler (naga's GLSL writer rejects two per texture); exact reads use `textureLoad`.
   A binding a draw does not use gets a neutral dummy (transparent / white texture, zero buffer);
   every pass and the composite bind the capture as the original (`original()`, mapped by the
@@ -139,6 +147,19 @@ user code ──► FilterLayer::paint (layer.rs)
   the input / output pixel size (`src_px`, `src_texel()`, `out_texel()`). Scaled chains run
   only over the whole capture (offline tiling refuses them: `OfflineError::NotTileable`); the
   composite upsamples a scaled last output bilinearly.
+- Persistent state (F7): a pass whose effect is `Effect::new_state` is a STATE step (`plan.rs`):
+  it reads the display chain's current input as `src`, the latest state at binding 5, and writes
+  the other of the layer's two state textures (`Slot::StateA` / `StateB`), `ceil(capture * scale)`
+  texels over the whole capture; display steps bind the latest state. Stateful chains need
+  `FilterLayer::id`; states are kept per `(ViewportId, Id)` (egui counts frames per viewport) in
+  each backend's `StateRegistry` (wgpu: `WgpuResources::states`, outside the per-frame pool, dropped
+  on re-install; glow: `GlowState::states`, freed by eviction / `destroy_glow`; offline: the
+  renderer's one state). The first paint of a key in a frame steps it; a repeat skips the state
+  steps. A new / reset state is cleared before use; growth keeps the content (backends copy); the
+  read mapping uses the stored content's size, so a resized layer reads it stretched. Unpainted
+  for > 120 frames AND > 2 s: evicted. RGBA16F state requires renderable + filterable RGBA16F
+  (else refused, `failed_states`; never downgraded); RGBA8 is opt-in. Stateful runs are never
+  windowed (offline: `NotTileable`).
 - Chain padding is the SUM of pass sample radii; a preset whose passes reach along different axes
   (separable blur) declares its reach on one pass only.
 - Backend-specific public API lives in its module behind its feature; core never names backend types.
@@ -153,6 +174,9 @@ user code ──► FilterLayer::paint (layer.rs)
   setters: `pass.rs`; which bytes each draw binds: `plan.rs`.
 - A new texture a draw reads, a new kind of step, per-step sizes: `plan.rs` first, then each
   backend's slot -> object mapping (wgpu `chain.rs`, glow `render.rs` + `glsl.rs` units).
+- State lifetime (reset, eviction, repeat paints, keys): `state.rs`; which step reads / writes
+  which state texture: `plan.rs`; state objects: wgpu `chain.rs` (`ChainState`) + `render.rs`,
+  glow `render.rs` + `resources.rs` (`ensure_kept`), offline `offline/mod.rs`.
 - New backend: implement `backend::Backend` in a feature-gated module, add its `install_*` API,
   register with `backend::register`.
 - Capture/padding/mask math: `geometry.rs`.

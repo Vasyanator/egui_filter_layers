@@ -17,7 +17,9 @@ Key structures:
   intermediate format, uniform offset alignment, effect pipeline cache); builds composite
   pipelines for any output format.
 - `ChainTargets`: per-concurrent-run ping-pong intermediates and the uniform buffer.
-- `ChainSource`, `ChainRecording`, `ChainJob`, `ChainWindow`: the inputs of one recorded run.
+- `ChainSource`, `ChainRecording`, `ChainJob`, `ChainWindow`, `ChainState`: the inputs of one
+  recorded run (`ChainState`: a stateful layer's two state textures, owned by the caller and kept
+  across runs, F7).
 
 Key functions:
 - `ChainResources::create()`, `effect_pipeline()`, `composite_pipeline()` (replace),
@@ -38,6 +40,10 @@ One uniform buffer per run holds, for draw `i` (plan step `i`; draw `n` = the co
 slots (`@group(1 + i)`): each step binds the caller's bind group of the attached texture (egui's
 own in the UI, the renderer's in offline runs) where the plan says so, a dummy group elsewhere.
 Composite pipelines read no user texture and use the group-0-only layout.
+State (F7): the caller owns a layer's two state textures (`ChainState`); `record` grows them to the
+plan's size KEEPING their content (`Target::ensure_kept`, a copy recorded first), clears the one
+the plan says, and maps `Slot::StateA` / `StateB` to them. A state pass's pipeline renders into
+the state format, so the pipeline cache is keyed by module AND output format.
 Textures are stored top-down on wgpu, so `flip_y` is false.
 A run computes a WINDOW of the capture (`ChainWindow`): the UI always uses the whole capture; the
 offline tiler runs one window per tile. Fragments derive their capture uv from their pixel
@@ -55,7 +61,8 @@ use crate::effect::{
 };
 use crate::geometry::{LayerGeometry, PxRect, px_f32};
 use crate::pass::{FrameUniforms, InputUniforms, Pass, UNIFORM_BLOCK_SIZE};
-use crate::plan::{Allocations, Bindings, ChainPlan, Slot, composite_params_block, composite_uniforms, params_block, plan, step_uniforms};
+use crate::state::StateFormat;
+use crate::plan::{Allocations, Bindings, ChainPlan, Slot, StatePlan, StatePlanInput, composite_params_block, composite_uniforms, params_block, plan, step_uniforms};
 
 /// Blend of the blended composite's erase draw: `dst * (1 - src.a)` on colour and alpha (the
 /// shader outputs `(0, 0, 0, coverage)`, so the source term is zero).
@@ -118,8 +125,8 @@ pub(crate) struct ChainResources {
     transparent: wgpu::TextureView,
     /// Bound where a draw has no mask coverage texture: 1x1 opaque white.
     white: wgpu::TextureView,
-    /// Effect pipelines by `CompiledModule::id`.
-    pipelines: HashMap<u64, CachedPipeline>,
+    /// Effect pipelines by `CompiledModule::id` and output format (intermediate / state).
+    pipelines: HashMap<(u64, wgpu::TextureFormat), CachedPipeline>,
 }
 
 impl ChainResources {
@@ -206,18 +213,46 @@ impl ChainResources {
         self.intermediate_format
     }
 
-    /// The pipeline of `module`, building and caching it on first use.
+    /// The pipeline of `module` rendering into `format` (the intermediate format for display
+    /// passes, [`state_texture_format`] for state passes), building and caching it on first use.
     ///
     /// # Errors
     /// The device's validation message when it rejects the shader or pipeline.
-    pub(crate) fn effect_pipeline(&mut self, device: &wgpu::Device, module: &Arc<CompiledModule>) -> Result<wgpu::RenderPipeline, String> {
-        if let Some(entry) = self.pipelines.get(&module.id) {
+    pub(crate) fn effect_pipeline(&mut self, device: &wgpu::Device, module: &Arc<CompiledModule>, format: wgpu::TextureFormat) -> Result<wgpu::RenderPipeline, String> {
+        if let Some(entry) = self.pipelines.get(&(module.id, format)) {
             return Ok(entry.pipeline.clone());
         }
-        let pipeline = with_error_scope(device, || pass_pipeline(device, &self.effect_pipeline_layout, module, self.intermediate_format, None, wgpu::MultisampleState::default(), None))?;
-        log::debug!("egui_filter_layers (wgpu): built pipeline for effect `{}`", module.label);
-        self.pipelines.insert(module.id, CachedPipeline { module: Arc::downgrade(module), pipeline: pipeline.clone() });
+        let pipeline = with_error_scope(device, || pass_pipeline(device, &self.effect_pipeline_layout, module, format, None, wgpu::MultisampleState::default(), None))?;
+        log::debug!("egui_filter_layers (wgpu): built pipeline for effect `{}` ({format:?})", module.label);
+        self.pipelines.insert((module.id, format), CachedPipeline { module: Arc::downgrade(module), pipeline: pipeline.clone() });
         Ok(pipeline)
+    }
+
+    /// The pipelines of every pass of `passes`, in order: display passes render into the
+    /// intermediate format, state passes into `state_format`. Stops at the first failure.
+    ///
+    /// # Errors
+    /// The module whose pipeline the device rejected, and why.
+    pub(crate) fn pass_pipelines(&mut self, device: &wgpu::Device, passes: &[Pass], state_format: StateFormat) -> Result<Vec<wgpu::RenderPipeline>, (Arc<CompiledModule>, String)> {
+        let state_format = state_texture_format(state_format);
+        passes
+            .iter()
+            .map(|pass| {
+                let module = pass.effect().module();
+                let format = if pass.effect().is_state() { state_format } else { self.intermediate_format };
+                self.effect_pipeline(device, module, format).map_err(|error| (Arc::clone(module), error))
+            })
+            .collect()
+    }
+
+    /// Why `format` cannot hold a state on this device (`None`: it can). RGBA16F needs the
+    /// adapter to render AND filter it — exactly when intermediates are RGBA16F.
+    #[must_use]
+    pub(crate) fn state_format_problem(&self, format: StateFormat) -> Option<String> {
+        match format {
+            StateFormat::Rgba16Float if !self.float_intermediates => Some("the adapter cannot render to and linearly filter Rgba16Float textures".to_owned()),
+            StateFormat::Rgba16Float | StateFormat::Rgba8Unorm => None,
+        }
     }
 
     /// The layout of a user texture group (egui-wgpu's texture layout: texture at
@@ -275,12 +310,38 @@ impl ChainResources {
     /// window edge that is not a capture edge are only as exact as the data the window holds
     /// there (the offline tiler overlaps windows by the padding). A chain with a scaled pass over
     /// a partial window is not planned (`None`; tiling callers refuse such chains first).
-    pub(crate) fn record(&self, rec: &mut ChainRecording<'_>, targets: &mut ChainTargets, job: &ChainJob<'_>) -> Option<wgpu::BindGroup> {
+    ///
+    /// A stateful job (`job.state`) needs `state` (the layer's two state textures, grown here
+    /// keeping their content); the returned [`StatePlan`] says where the latest state is afterwards.
+    pub(crate) fn record(&self, rec: &mut ChainRecording<'_>, targets: &mut ChainTargets, job: &ChainJob<'_>, state: Option<&mut ChainState<'_>>) -> Option<(wgpu::BindGroup, Option<StatePlan>)> {
         if job.pipelines.len() != job.passes.len() {
             return None;
         }
         let attached = job.user_textures.map(|texture| texture.is_some());
-        let plan = plan(job.passes, job.geometry.capture.size(), job.window.rect, job.window.composite_origin, attached)?;
+        let plan = plan(job.passes, job.geometry.capture.size(), job.window.rect, job.window.composite_origin, attached, job.state)?;
+        // The state textures: grown to the plan's size keeping the latest content, the empty one
+        // cleared (both recorded before any pass of this run).
+        let state_targets: Option<&[Option<Target>; 2]> = match (plan.state, state) {
+            (Some(state_plan), Some(state)) => {
+                let format = state_texture_format(state.format);
+                for (index, slot) in state.targets.iter_mut().enumerate() {
+                    Target::ensure_kept(slot, rec.device, rec.encoder, format, if index == 0 { "egui_filter_layers state A" } else { "egui_filter_layers state B" }, state_plan.target_px);
+                }
+                if let Some(clear) = state_plan.clear
+                    && let Some(target) = state.targets.get(usize::from(clear == Slot::StateB)).and_then(Option::as_ref)
+                {
+                    drop(begin_pass(rec.encoder, &target.view, "egui_filter_layers state clear", wgpu::Color::TRANSPARENT));
+                }
+                Some(&*state.targets)
+            }
+            (Some(_), None) => return None,
+            (None, _) => None,
+        };
+        let state_views = match state_targets {
+            Some([Some(a), Some(b)]) => Some([a, b]),
+            Some(_) => return None,
+            None => None,
+        };
         // Both ping-pong targets hold every step's viewport (the plan's pool size) at least.
         let needed = [plan.target_px[0].max(job.window.min_target_size[0]), plan.target_px[1].max(job.window.min_target_size[1])];
         for (index, slot) in targets.ping_pong.iter_mut().enumerate() {
@@ -290,19 +351,25 @@ impl ChainResources {
             return None;
         };
 
-        let allocations = Allocations { source: job.source.allocated, ping_pong: [first.size, second.size] };
+        let allocations = Allocations { source: job.source.allocated, ping_pong: [first.size, second.size], state: state_views.map_or([[0, 0]; 2], |[a, b]| [a.size, b.size]) };
         let alignment = usize::try_from(self.uniform_alignment).unwrap_or(UNIFORM_BLOCK_SIZE);
         let uniforms = chain_uniforms(&frame_uniforms(&job.geometry, job.time).with_input(&job.input), &plan, job.passes, &job.geometry, &allocations, alignment);
         let uniform_buffer = targets.uniforms.write(rec.device, rec.queue, &uniforms.bytes).clone();
-        let view_of = |slot: Slot| match slot {
-            Slot::Source => job.source.view,
-            Slot::Ping => &first.view,
-            Slot::Pong => &second.view,
+        let view_of = |slot: Slot| match (slot, state_views) {
+            (Slot::Source, _) => job.source.view,
+            (Slot::Ping, _) => &first.view,
+            (Slot::Pong, _) => &second.view,
+            (Slot::StateA, Some([a, _])) => &a.view,
+            (Slot::StateB, Some([_, b])) => &b.view,
+            // No plan binds a state slot without `plan.state` (checked above): unreachable, and
+            // the neutral dummy is what a stateless draw binds anyway.
+            (Slot::StateA | Slot::StateB, None) => &self.transparent,
         };
         let bind_group = |draw: &DrawUniforms, bindings: Bindings| {
             let fl = wgpu::BufferBinding { buffer: &uniform_buffer, offset: draw.fl.start, size: std::num::NonZeroU64::new(draw.fl.end - draw.fl.start) };
             let params = wgpu::BufferBinding { buffer: &uniform_buffer, offset: draw.params.start, size: std::num::NonZeroU64::new(draw.params.end - draw.params.start) };
             let original = bindings.original.map_or(&self.transparent, view_of);
+            let state = bindings.state.map_or(&self.transparent, view_of);
             rec.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("egui_filter_layers draw"),
                 layout: &self.layout,
@@ -312,7 +379,7 @@ impl ChainResources {
                     wgpu::BindGroupEntry { binding: BINDING_SAMPLER, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                     wgpu::BindGroupEntry { binding: BINDING_ORIGINAL_TEXTURE, resource: wgpu::BindingResource::TextureView(original) },
                     wgpu::BindGroupEntry { binding: BINDING_PARAMS, resource: wgpu::BindingResource::Buffer(params) },
-                    wgpu::BindGroupEntry { binding: BINDING_STATE_TEXTURE, resource: wgpu::BindingResource::TextureView(&self.transparent) },
+                    wgpu::BindGroupEntry { binding: BINDING_STATE_TEXTURE, resource: wgpu::BindingResource::TextureView(state) },
                     wgpu::BindGroupEntry { binding: BINDING_COVERAGE_TEXTURE, resource: wgpu::BindingResource::TextureView(&self.white) },
                 ],
             })
@@ -332,8 +399,27 @@ impl ChainResources {
             }
             pass.draw(0..3, 0..1);
         }
-        Some(bind_group(uniforms.draws.get(plan.steps.len())?, plan.composite.bindings))
+        Some((bind_group(uniforms.draws.get(plan.steps.len())?, plan.composite.bindings), plan.state))
     }
+}
+
+/// The wgpu format of a state texture.
+#[must_use]
+pub(crate) fn state_texture_format(format: StateFormat) -> wgpu::TextureFormat {
+    match format {
+        StateFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
+        StateFormat::Rgba8Unorm => wgpu::TextureFormat::Rgba8Unorm,
+    }
+}
+
+/// A stateful layer's state textures for one run: the two targets (kept by the caller across
+/// runs; `record` grows them) and their format.
+#[derive(Debug)]
+pub(crate) struct ChainState<'a> {
+    /// `Slot::StateA` / `Slot::StateB`.
+    pub targets: &'a mut [Option<Target>; 2],
+    /// Their storage format.
+    pub format: StateFormat,
 }
 
 /// A 1x1 `Rgba8Unorm` texture bound where a draw has no texture of its own.
@@ -430,6 +516,8 @@ pub(crate) struct ChainJob<'a> {
     /// The bind group of the texture attached at each user texture slot, in the layout of
     /// [`ChainResources::user_layout`] (egui's own bind groups in the UI); `None` = nothing attached.
     pub user_textures: [Option<&'a wgpu::BindGroup>; TEXTURE_SLOTS],
+    /// The layer's state (stateful chains; `record` then needs the `ChainState` too).
+    pub state: Option<StatePlanInput>,
 }
 
 /// The layer's `FrameUniforms` with the wgpu flags: textures are stored top-down, like the effect
@@ -530,9 +618,9 @@ mod tests {
         let mut passes: Vec<Pass> = (0..3).map(|index| Pass::new(&effect).with_param(0, [f32::from(u8::try_from(index).unwrap_or(0)); 4]).unwrap_or_else(|error| panic!("{error}"))).collect();
         passes[1] = Pass::new(&named).with("color", [1.0, 2.0, 3.0, 4.0]).unwrap_or_else(|error| panic!("{error}"));
         let window = PxRect { x: 0, y: 0, w: 40, h: 30 };
-        let Some(plan) = plan(&passes, window.size(), window, [5, 6], [false; TEXTURE_SLOTS]) else { panic!("planned") };
+        let Some(plan) = plan(&passes, window.size(), window, [5, 6], [false; TEXTURE_SLOTS], None) else { panic!("planned") };
         let geometry = LayerGeometry { region: window, capture: window, rect_uv: [0.0, 0.0, 1.0, 1.0], region_uv: [0.0, 0.0, 1.0, 1.0], mask_rect_px: [0.0, 0.0, 40.0, 30.0], mask_radii_px: [0.0; 4], pixels_per_layer_point: 1.0 };
-        let allocations = Allocations { source: [64, 64], ping_pong: [[40, 30], [128, 32]] };
+        let allocations = Allocations { source: [64, 64], ping_pong: [[40, 30], [128, 32]], state: [[0, 0]; 2] };
         let frame = frame_uniforms(&geometry, 0.5);
         let alignment = 256;
         let uniforms = chain_uniforms(&frame, &plan, &passes, &geometry, &allocations, alignment);

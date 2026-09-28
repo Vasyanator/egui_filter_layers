@@ -12,6 +12,8 @@ Key items:
 - `install_glow()` / `destroy_glow()` (feature `glow`), `install_wgpu()` / `WgpuOptions`
   (feature `wgpu`), `status()`, `failed_effects()`, `failed_textures()`
 - user textures: `TEXTURE_SLOTS`, `TextureError`, `TextureFailure` (`FilterLayer::texture`)
+- persistent state (F7): `StateOptions`, `StateFormat`, `StateError`, `StateFailure`,
+  `reset_state()`, `state_count()`, `failed_states()` (`Effect::new_state`, `FilterLayer::id`)
 - `offline` module and its re-exports (`OfflineRenderer`, ...; features `image` / `video`)
 - `HotEffect`, `rebind` (+ options, events, errors; feature `hot-reload`, native only)
 
@@ -93,6 +95,10 @@ module names a backend type.
 //! | `tex(i, uv)` | user texture `i` (`0..`[`TEXTURE_SLOTS`], attached with [`FilterLayer::texture`]) at `uv` in the TEXTURE's own `0..1` coordinates (top-left origin), through its own sampler (its egui `TextureOptions`: filters, wrap mode; mip level 0) |
 //! | `tex_size(i)` | size of user texture `i` in texels (`vec2<f32>`) |
 //! | `tex_load(i, px)` | the exact texel `px` (`vec2<i32>`, clamped to the texture) of user texture `i`, no filtering |
+//! | `state(uv)` | the layer's persistent state at `uv` (bilinear; see [Persistent state](#persistent-state)); zero without a state pass |
+//! | `state_load(px)`, `state_px(offset)` | the exact state texel `px` (`vec2<i32>`, (0, 0) top-left, clamped) / the one under the current pixel offset by `offset` texels, no filtering |
+//! | `state_size()`, `state_texel()` | the state's size in texels / one state texel in `uv` units |
+//! | `fl.pass_index` | index of this pass among the chain's passes of its kind (state or display), `u32`: the substep number of consecutive state passes |
 //!
 //! An effect whose code reads `fl.time` is **animated**: painting a layer that uses it requests
 //! an egui repaint every frame, so it keeps moving in an otherwise idle app. The detection walks
@@ -187,6 +193,50 @@ module names a backend type.
 //! points. If it reads further than the current pixel, declare how far with
 //! [`Effect::with_sample_radius`] (or per pass with [`Pass::with_sample_radius`]).
 //!
+//! ## Persistent state
+//!
+//! A **state pass** ([`Effect::new_state`]) writes the layer's persistent state instead of the
+//! next image: two RGBA textures per layer (ping-pong) that survive from frame to frame —
+//! simulations (water, [`presets::wave_sim`]), trails ([`presets::trails`]), accumulation.
+//!
+//! * **Reading.** Every pass reads the latest state with `state(uv)` (bilinear), `state_load(px)` /
+//!   `state_px(offset)` (exact texels) — a display pass sees what the last state pass BEFORE it
+//!   wrote (or last frame's state), a state pass the state it steps. Inside a state pass `src()` is
+//!   the display chain's input at that point (a state pass does not advance it), `original()` the
+//!   backdrop. N consecutive state passes are N substeps (`fl.pass_index` = 0..N).
+//! * **Identity.** A layer whose chain has a state pass needs [`FilterLayer::id`]: the state is
+//!   kept per id and viewport. Without an id it is refused ([`FilterLayer::check_state`]:
+//!   [`StateError::MissingId`]; it draws nothing, logged once). Painting one id twice in a frame
+//!   steps it once (the second paint shows the state as it is).
+//! * **Size.** The state spans the whole capture (the padded rect, `uv` space) at
+//!   `ceil(capture * scale)` texels ([`StateOptions::with_scale`]); it lives in layer uv, so a
+//!   moved layer keeps it, and a resized layer reads the previous state stretched (no reset).
+//! * **Format.** [`StateFormat::Rgba16Float`] by default (signed, unbounded): it must be
+//!   renderable and filterable on the device, else stateful layers are refused and listed by
+//!   [`failed_states`] (WebGL2 / GLES without `EXT_color_buffer_float`); never silently downgraded.
+//!   [`StateFormat::Rgba8Unorm`] is an explicit opt-in for effects that pack their state in 8 bits.
+//! * **Lifetime.** A state starts at zero; [`reset_state`] zeroes it at the id's next paint; a state
+//!   not painted for 120 frames and 2 seconds is freed ([`state_count`] for debugging); a
+//!   re-install (or `destroy_glow`) drops all. It advances only on painted frames: the effect is
+//!   not animated by itself — repaint while it should move.
+//! * **Offline**, the renderer carries the state from one `process` call to the next
+//!   (`OfflineOptions::with_state`, `OfflineRenderer::reset_state`, a video processor's frames);
+//!   stateful chains are never tiled (`OfflineError::NotTileable`).
+//!
+//! ```
+//! use egui_filter_layers::{Effect, FilterChain, FilterLayer, Pass};
+//! # fn frame(ui: &mut egui::Ui, rect: egui::Rect) -> Result<(), egui_filter_layers::EffectError> {
+//! // Accumulates the backdrop's brightness over frames and shows it.
+//! let accumulate = Effect::new_state("glow", "
+//! fn effect(uv: vec2<f32>) -> vec4<f32> {
+//!     return state_px(vec2<i32>(0)) * 0.9 + src(uv) * 0.1;
+//! }")?;
+//! let show = Effect::new("show", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state(uv); }")?;
+//! let chain = FilterChain::new().then(Pass::new(&accumulate)).then(Pass::new(&show));
+//! FilterLayer::new(rect, chain).id(ui.id().with("glow")).paint(ui.painter());
+//! # Ok(()) }
+//! ```
+//!
 //! **Reduced-resolution passes.** [`Pass::with_scale`] runs a pass over `ceil(capture * scale)`
 //! pixels; the next pass (or the final composite, bilinearly) reads that smaller image. `uv`,
 //! `src()`, `original()`, `fl.texel` and `fl.size_px` keep their capture meaning, so an
@@ -258,6 +308,7 @@ mod layer;
 mod pass;
 mod plan;
 pub mod presets;
+mod state;
 
 #[cfg(feature = "glow")]
 mod glow_backend;
@@ -279,6 +330,7 @@ pub use effect::{Effect, EffectError, ParamError, ParamInfo, ParamType, ParamVal
 pub use impulses::{IMPULSE_COUNT_PARAM, IMPULSE_SLOTS, IMPULSES_PARAM, Impulse, ImpulsePack, Impulses};
 pub use layer::FilterLayer;
 pub use pass::{FilterChain, MIN_PASS_SCALE, PARAM_SLOTS, ParamIndexError, Params, Pass};
+pub use state::{StateError, StateFailure, StateFormat, StateOptions, failed_states, reset_state, state_count};
 
 #[cfg(feature = "glow")]
 pub use glow_backend::{destroy_glow, install_glow};

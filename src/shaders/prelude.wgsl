@@ -4,11 +4,17 @@
 //   fl.rect_uv, fl.texel, fl.size_px, fl.time, fl.pixels_per_point,
 //   fl.delta_time, fl.frame, fl.pointer, fl.pass_scale,
 //   src(), src_px(), src_texel(), out_texel(), original(), params(), to_linear(), to_gamma(),
-//   premultiply(), unpremultiply(), luma(), tex(), tex_size(), tex_load(), and `p` (the
+//   premultiply(), unpremultiply(), luma(), tex(), tex_size(), tex_load(), state(),
+//   state_load(), state_px(), state_size(), state_texel(), fl.pass_index, and `p` (the
 //   snippet's own `struct Params`, see below).
-// Every other `fl_*` / `internal_*` name, and every `fl` member not listed in the crate docs
-// (`pass_index` holds a neutral value until it is documented there), is private to the crate and
-// may change.
+// Every other `fl_*` / `internal_*` name, and every `fl` member not listed in the crate docs, is
+// private to the crate and may change.
+// Persistent state (F7, `Effect::new_state`): a layer with a state pass owns two state textures
+// (ping-pong) of `state_size()` pixels spanning the WHOLE capture (`uv` space). `state(uv)` samples
+// the latest state bilinearly (the one sampler of `fl_state_texture`, like `src`); `state_load(px)`
+// / `state_px(offset)` read exact texels (`textureLoad`) for simulations. A state pass's output
+// becomes the new state; display passes read the state as the last state pass before them left
+// it (or last frame's). Without a state pass the state is a 1x1 zero texture.
 // Scaled passes (`Pass::with_scale`): a pass may render a smaller image that spans the whole
 // capture (`fl.pass_scale` < 1). `uv`, `fl.texel`, `fl.size_px` stay the CAPTURE's; the pass's
 // input and output resolutions are `internal_src_texel` (`src_texel()`, `src_px()`, the `src()`
@@ -51,6 +57,8 @@ struct FlUniforms {
     pass_index: u32,
     internal_frag_texel: vec2<f32>,
     internal_src_texel: vec2<f32>,
+    internal_state_texel: vec2<f32>,
+    internal_state_size: vec2<f32>,
     params: array<vec4<f32>, 16>,
 }
 
@@ -162,6 +170,37 @@ fn tex_load(i: u32, px: vec2<i32>) -> vec4<f32> {
         default: {}
     }
     return color;
+}
+
+// The latest persistent state at `uv` (capture uv, like `src`), bilinear over the state texture
+// (clamped to its used region). Zero before any state pass wrote it.
+fn state(uv: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(fl_state_texture, fl_sampler, fl_storage_uv(uv, fl.internal_state_texel, fl.internal_state_scale, fl.internal_state_offset), 0.0);
+}
+
+// Size of the state in texels (`ceil(capture * StateOptions::scale)`; the stored content's size).
+fn state_size() -> vec2<f32> {
+    return fl.internal_state_size;
+}
+
+// One state texel in `uv` units.
+fn state_texel() -> vec2<f32> {
+    return fl.internal_state_texel;
+}
+
+// The exact state texel `px` (integer texel coordinates, (0, 0) top-left, y down), no
+// filtering; clamped to the state (edges repeat: a reflecting border for simulations).
+fn state_load(px: vec2<i32>) -> vec4<f32> {
+    let size = vec2<i32>(fl.internal_state_size);
+    let c = clamp(px, vec2<i32>(0), size - vec2<i32>(1));
+    let y = select(c.y, size.y - 1 - c.y, fl.internal_flip_y > 0.5);
+    return textureLoad(fl_state_texture, vec2<i32>(c.x, y), 0);
+}
+
+// The state texel under the current fragment, offset by `offset` texels (`state_load`).
+fn state_px(offset: vec2<i32>) -> vec4<f32> {
+    let here = vec2<i32>(floor(fl_frag_uv * fl.internal_state_size));
+    return state_load(here + offset);
 }
 
 fn to_linear(c: vec4<f32>) -> vec4<f32> {

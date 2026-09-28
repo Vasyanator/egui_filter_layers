@@ -10,6 +10,8 @@ pool of per-layer targets of the frame being prepared.
 Key structures:
 - `WgpuResources`: stored in egui-wgpu's `CallbackResources`; one per install generation.
 - `LayerTargets`: capture, chain targets and mesh buffers of ONE layer of the current frame.
+- `StateTargets`: the two state textures of one stateful layer (F7), kept across frames in
+  `WgpuResources::states` (NOT in the per-frame pool), so they die with the install's resources.
 
 Key functions:
 - `WgpuResources::create()`, `WgpuResources::next_targets()`.
@@ -26,6 +28,11 @@ immediately, so a rejected shader becomes a latched failure instead of wgpu's de
 use super::WgpuOptions;
 use super::chain::{ChainResources, ChainTargets, CompositeOver};
 use super::gpu::{GrowBuffer, Target, egui_texture_entries, shader, uniform_entry, with_error_scope};
+use crate::state::StateRegistry;
+
+/// The two state textures of one stateful layer (`Slot::StateA` / `StateB`), created and grown by
+/// the chain executor.
+pub(super) type StateTargets = [Option<Target>; 2];
 
 /// Format of the re-rendered backdrop: 8-bit gamma values, exactly what egui writes to a
 /// non-sRGB surface (and the bytes a `*Srgb` surface stores). Effects always sample this format.
@@ -95,6 +102,9 @@ pub(super) struct WgpuResources {
     pub pool: Vec<LayerTargets>,
     /// Next free `pool` entry in the frame being prepared.
     pub cursor: usize,
+    /// Persistent layer states (F7), by viewport and layer id; untouched by the per-frame pool
+    /// reset, dropped with these resources (a re-install builds new ones).
+    pub states: StateRegistry<StateTargets>,
 }
 
 /// egui-wgpu's premultiplied-alpha blend state (egui-wgpu 0.36 `renderer.rs`, `Renderer::new`).
@@ -180,7 +190,7 @@ impl WgpuResources {
             (mesh_locals_layout, mesh_pipeline)
         })?;
 
-        Ok(Self { generation, chain, composite, mesh_locals_layout, mesh_pipeline, srgb_capture, pool: Vec::new(), cursor: 0 })
+        Ok(Self { generation, chain, composite, mesh_locals_layout, mesh_pipeline, srgb_capture, pool: Vec::new(), cursor: 0, states: StateRegistry::default() })
     }
 
     /// The next free per-layer targets of this frame.

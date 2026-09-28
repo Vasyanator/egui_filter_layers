@@ -101,6 +101,10 @@ pub enum OfflineError {
     /// slot with no texture (see [`OfflineOptions::with_texture`](super::OfflineOptions::with_texture)).
     #[error("the chain's textures are unusable: {0}")]
     Texture(#[from] crate::TextureError),
+    /// The chain's persistent state cannot run on this device (its format is not renderable /
+    /// filterable, [`StateError::UnsupportedFormat`](crate::StateError::UnsupportedFormat)).
+    #[error("the chain's state is unusable: {0}")]
+    State(#[from] crate::StateError),
     /// A user texture is larger than the device can hold.
     #[error("the texture at slot {slot} is {width}x{height} pixels, but this device allows at most {max} per side")]
     TextureTooLarge {

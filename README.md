@@ -7,7 +7,10 @@ blur, colour adjustments, refraction, or your own WGSL shader.
 - Presets: Gaussian blur, brightness/contrast, saturation, grayscale, invert, tint, sharpen,
   pixelate, ripple (animated), lens, vignette, frosted glass, click ripples (rings from
   clicks, driven by the `Impulses` helper; repaints only while a ring is alive), a fast large
-  blur (`kawase_blur`, a dual-Kawase pyramid) and `bloom`.
+  blur (`kawase_blur`, a dual-Kawase pyramid) and `bloom`; persistent-state presets `trails`
+  and water (`wave_sim` + `wave_display`: a wave simulation with obstacles and click impulses).
+- Persistent per-layer state: state passes (`Effect::new_state`) keep an RGBA16F field between
+  frames for simulations and accumulation, on every backend and offline.
 - Reduced-resolution passes (`Pass::with_scale(0.5)`): cheap large kernels, upsampled back.
 - Custom effects: write one WGSL function; it is validated by [naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga)
   when you build it, with errors pointing at your snippet.
@@ -164,6 +167,9 @@ Prelude available to every effect:
 | `params(i)` | `vec4<f32>` anonymous parameter slot `i` (`0..16`) of the pass (untyped; prefer named) |
 | `tex(i, uv)` | user texture `i` (`0..3`, attached with `FilterLayer::texture`) at `uv` in its own 0..1 coordinates, through its own sampler (its egui `TextureOptions`) |
 | `tex_size(i)`, `tex_load(i, px)` | its size in texels; its exact texel `px` (`vec2<i32>`, clamped, no filtering) |
+| `state(uv)` | the layer's persistent state (below), bilinear; zero without a state pass |
+| `state_load(px)`, `state_px(offset)` | an exact state texel (`vec2<i32>`, clamped) / the one under the current pixel, offset |
+| `state_size()`, `state_texel()`, `fl.pass_index` | state size in texels; one state texel in `uv` units; this pass's index among the chain's passes of its kind (state substeps) |
 | `fl.texel`, `fl.size_px` | one capture pixel in `uv` units; capture size in pixels (also in scaled passes) |
 | `fl.pass_scale` | the pass's output resolution relative to the capture (`Pass::with_scale`, 1 = full) |
 | `fl.rect_uv` | the layer rect inside the capture (`xy` min, `zw` size) |
@@ -215,6 +221,33 @@ RGBA like `src()`. An effect that reads a slot with nothing attached is refused
 (`FilterLayer::check_textures`; the layer draws nothing and the error is logged once), and a
 texture id the renderer does not know (freed) skips its layer and is listed by
 `failed_textures(ctx)`. Offline, attach an `OfflineTexture` with `OfflineOptions::with_texture`.
+
+### Persistent state
+
+A **state pass** (`Effect::new_state`) writes the layer's state — two RGBA16F textures that
+survive from frame to frame — instead of the next image. Later passes (and the next frame) read
+it with `state(uv)`, or exactly with `state_load(px)` / `state_px(offset)`; inside a state pass
+`src()` is the display chain's input at that point. Consecutive state passes are substeps
+(`fl.pass_index`). The layer needs an identity:
+
+```rust
+use egui_filter_layers::{FilterChain, FilterLayer, Impulses, presets};
+
+// App state: impulses pushed where the user clicks (`impulses.push_point(pos, rect, 30.0, now)`).
+let sim = presets::wave_sim(&impulses, now, &[menu_obstacle]);
+let water = FilterChain::new().then(sim.clone()).then(sim).then(presets::wave_display(8.0, 0.6));
+FilterLayer::new(rect, water).id(ui.id().with("water")).paint(ui.painter());
+```
+
+A stateful layer without `FilterLayer::id` is refused (`StateError::MissingId`, logged once).
+The state spans the whole capture at `StateOptions::with_scale` resolution, lives in layer uv (a
+moved or resized layer keeps it, stretched), starts at zero, is zeroed by `reset_state(ctx, id)`
+and freed after 120 frames and 2 s unpainted; an id painted twice in one frame is stepped once.
+RGBA16F must be renderable and filterable on the device, else stateful layers are refused and
+listed by `failed_states(ctx)` (WebGL2 without `EXT_color_buffer_float`); `StateFormat::Rgba8Unorm`
+is an explicit opt-in. It advances only on painted frames (request repaints while it moves).
+Offline, the renderer carries the state from call to call (a video's frames); such chains are
+never tiled.
 
 ### Named parameters
 
@@ -370,8 +403,11 @@ UI shows untiled matches it bit for bit only with `with_max_tile_size(None)`. A 
 out of memory yields `OfflineError::OutOfMemory` (retry with smaller tiles), never a panic. Effects must not read further than their
 declared sample radius — the `lens` preset reads anywhere in the layer, so give a tiled lens
 `Pass::with_sample_radius`. Chains with a reduced-resolution pass (`with_scale`, `kawase_blur`,
-`bloom`) cannot be tiled exactly: a frame that would need tiles fails with
-`OfflineError::NotTileable`; process it whole with `with_max_tile_size(None)`. At the frame border sampling clamps to the edge, exactly as the UI
+`bloom`) or a state pass cannot be tiled exactly: a frame that would need tiles fails with
+`OfflineError::NotTileable`; process it whole with `with_max_tile_size(None)`. A state pass's
+state is carried by the renderer from one `process` call to the next (`OfflineOptions::with_state`,
+`OfflineRenderer::reset_state`; a `VideoProcessor` continues it frame to frame and every
+`process_video` stream starts from zero). At the frame border sampling clamps to the edge, exactly as the UI
 clamps at the screen edge.
 
 ### Video

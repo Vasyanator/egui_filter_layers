@@ -7,7 +7,8 @@ shows its effects.
 
 Key structures:
 - `OfflineOptions` (public): pixels per point, time, per-frame input (`delta_time`, `frame`,
-  pointer), background, corner radius, output alpha, tile size limit, user textures (F8).
+  pointer), background, corner radius, output alpha, tile size limit, user textures (F8),
+  persistent state options (F7).
 - `PointerState` (public): pointer position in frame uv + pressed.
 
 Key functions:
@@ -27,6 +28,7 @@ use crate::backend::TextureError;
 use crate::effect::TEXTURE_SLOTS;
 use crate::geometry::{LayerGeometry, pointer_uniform, px_f32};
 use crate::pass::InputUniforms;
+use crate::state::StateOptions;
 
 /// Settings of one offline run. Build with [`OfflineOptions::default`] and the `with_*` methods.
 #[derive(Clone, Debug, PartialEq)]
@@ -53,6 +55,8 @@ pub struct OfflineOptions {
     textures: [Option<OfflineTexture>; TEXTURE_SLOTS],
     /// The first out-of-range slot given to `with_texture`, reported by `validate`.
     invalid_texture_slot: Option<usize>,
+    /// How a stateful chain's state is stored (resolution, format).
+    pub(super) state: StateOptions,
 }
 
 /// The pointer an offline run shows its effects (`fl.pointer`), in the frame's uv: `0..1` across
@@ -80,6 +84,7 @@ impl Default for OfflineOptions {
             pointer: None,
             textures: [const { None }; TEXTURE_SLOTS],
             invalid_texture_slot: None,
+            state: StateOptions::default(),
         }
     }
 }
@@ -148,6 +153,22 @@ impl OfflineOptions {
             }
         }
         self
+    }
+
+    /// How the persistent state of a chain with a state pass is stored (default: full
+    /// resolution, RGBA16F) — the offline counterpart of
+    /// [`FilterLayer::state`](crate::FilterLayer::state). The renderer carries the state from
+    /// one run to the next; a changed format starts it over.
+    #[must_use]
+    pub fn with_state(mut self, state: StateOptions) -> Self {
+        self.state = state;
+        self
+    }
+
+    /// The state options.
+    #[must_use]
+    pub fn state(&self) -> StateOptions {
+        self.state
     }
 
     /// The texture attached at `slot`, if any.

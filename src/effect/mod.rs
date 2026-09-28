@@ -13,7 +13,7 @@ Key structures:
 - `CompiledModule` (crate-internal): the validated naga module every backend translates.
 
 Key functions:
-- `Effect::new()` / `compile()`: detect `struct Params`, assemble (prelude + snippet + the named
+- `Effect::new()` / `Effect::new_state()` (a state pass, F7) / `compile()`: detect `struct Params`, assemble (prelude + snippet + the named
   parameter tail), parse, lay out the named parameters, validate, check the resource interface.
 - `Effect::params()` / `Effect::param()`: reflection of the named parameters.
 - `Effect::reads_texture()`: which user texture slots the effect reads (IR scan, conservative).
@@ -227,6 +227,9 @@ pub struct Effect {
     /// Whether painting a layer with this effect requests a repaint every frame (detected from
     /// the snippet reading `fl.time`, overridable).
     animated: bool,
+    /// Whether this is a STATE pass (`Effect::new_state`): its output becomes the layer's
+    /// persistent state instead of the display chain's next input.
+    state: bool,
 }
 
 impl fmt::Debug for Effect {
@@ -236,6 +239,7 @@ impl fmt::Debug for Effect {
             .field("id", &self.module.id)
             .field("sample_radius_points", &self.sample_radius_points)
             .field("animated", &self.animated)
+            .field("state", &self.state)
             .finish()
     }
 }
@@ -255,7 +259,32 @@ impl Effect {
     pub fn new(label: &str, wgsl: &str) -> Result<Self, EffectError> {
         let module = compile(label, wgsl)?;
         let animated = reads_time(&module.module);
-        Ok(Self { module: Arc::new(module), sample_radius_points: 0.0, animated })
+        Ok(Self { module: Arc::new(module), sample_radius_points: 0.0, animated, state: false })
+    }
+
+    /// A STATE pass (F7): the same `fn effect(uv) -> vec4<f32>` contract and prelude as
+    /// [`Effect::new`], but its output is written to the layer's persistent state (the next
+    /// state, read by later passes and next frame through `state(uv)`, `state_load(px)`,
+    /// `state_px(offset)`), not to the display chain: the pass after it still reads, as `src()`,
+    /// what the pass before it read. Inside a state pass `src(uv)` is that display input,
+    /// `original(uv)` the backdrop, `fl.pass_index` its index among the chain's state passes
+    /// (N consecutive copies = N substeps per frame). It renders `state_size()` texels over the
+    /// whole capture (`uv` space, `FilterLayer::state` scale); `fl.pass_scale` is that scale.
+    ///
+    /// A layer whose chain has a state pass needs an identity (`FilterLayer::id`), otherwise it is
+    /// refused (`StateError::MissingId`). The state is RGBA16F unless opted into RGBA8
+    /// (`StateOptions::with_format`), starts at zero, and is kept per layer id between frames.
+    ///
+    /// # Errors
+    /// As [`Effect::new`].
+    pub fn new_state(label: &str, wgsl: &str) -> Result<Self, EffectError> {
+        Ok(Self { state: true, ..Self::new(label, wgsl)? })
+    }
+
+    /// Whether this is a state pass ([`Effect::new_state`]).
+    #[must_use]
+    pub fn is_state(&self) -> bool {
+        self.state
     }
 
     /// Declares how far, in layer points, the effect samples away from the pixel it writes (it
@@ -833,6 +862,23 @@ fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * p.a; }";
         // A snippet may not bind `p` itself either.
         let own = "@group(0) @binding(4) var<uniform> p: vec4<f32>;\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * p; }";
         assert!(matches!(Effect::new("own", own), Err(EffectError::Interface { .. })));
+    }
+
+    /// F7: a state effect is an ordinary module flagged as a state pass; every state helper of
+    /// the prelude is callable (sampled and exact reads in one module).
+    #[test]
+    fn state_effects_are_flagged_and_the_state_helpers_compile() {
+        let snippet = "fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let a = state(uv) + state_load(vec2<i32>(0, 1)) + state_px(vec2<i32>(-1, 0));
+    let b = vec4<f32>(state_size(), state_texel()) * f32(fl.pass_index);
+    return a + b + src(uv);
+}";
+        let Ok(state) = Effect::new_state("state", snippet) else { panic!("the state helpers must compile") };
+        assert!(state.is_state());
+        let Ok(display) = Effect::new("display", snippet) else { panic!("a display pass may read the state too") };
+        assert!(!display.is_state());
+        assert!(state.clone().with_sample_radius(2.0).animated().is_state(), "builders keep the kind");
+        assert!(Effect::new_state("broken", "fn effect(uv: vec2<f32>) -> vec4<f32> { return ; }").is_err());
     }
 
     #[test]

@@ -9,7 +9,8 @@ an `Effect` (an `Arc` bump) in `HotEffect::poll`.
 
 Key structures:
 - `HotEffect` (public): the GUI-side handle — the last good effect, the current error, `poll`.
-- `HotOptions` (public): poll interval, the `egui::Context` to repaint, an effect set-up closure.
+- `HotOptions` (public): poll interval, the `egui::Context` to repaint, an effect set-up closure,
+  whether the file is a state pass (`with_state`, compiled with `Effect::new_state`, F7).
 - `HotReloadEvent`, `HotReloadError` (public): what one `poll` observed; why the file is broken.
 - `Rebound` + `rebind()` (public): rebuild a `Pass` on a reloaded effect, keeping the named and
   anonymous parameter values that still fit.
@@ -55,18 +56,20 @@ pub struct HotOptions {
     repaint: Option<egui::Context>,
     /// Applied to each compiled effect before it is published.
     setup: Option<Setup>,
+    /// Compile the file as a state pass (`Effect::new_state`).
+    state: bool,
 }
 
 impl Default for HotOptions {
     /// Poll every [`DEFAULT_POLL_INTERVAL`], no repaint, effects published as compiled.
     fn default() -> Self {
-        Self { interval: DEFAULT_POLL_INTERVAL, repaint: None, setup: None }
+        Self { interval: DEFAULT_POLL_INTERVAL, repaint: None, setup: None, state: false }
     }
 }
 
 impl fmt::Debug for HotOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HotOptions").field("interval", &self.interval).field("repaint", &self.repaint.is_some()).field("setup", &self.setup.is_some()).finish()
+        f.debug_struct("HotOptions").field("interval", &self.interval).field("repaint", &self.repaint.is_some()).field("setup", &self.setup.is_some()).field("state", &self.state).finish()
     }
 }
 
@@ -92,6 +95,13 @@ impl HotOptions {
     #[must_use]
     pub fn with_setup(mut self, setup: impl Fn(Effect) -> Effect + Send + 'static) -> Self {
         self.setup = Some(Box::new(setup));
+        self
+    }
+
+    /// Compiles the file as a STATE pass ([`Effect::new_state`], F7) instead of a display pass.
+    #[must_use]
+    pub fn with_state(mut self, state: bool) -> Self {
+        self.state = state;
         self
     }
 
@@ -461,7 +471,7 @@ impl Watcher {
         if self.last_error.is_none() && self.last_source.as_deref() == Some(source.as_str()) {
             return true;
         }
-        let result = Effect::new(&self.label, &source);
+        let result = if self.options.state { Effect::new_state(&self.label, &source) } else { Effect::new(&self.label, &source) };
         self.last_source = Some(source);
         match result {
             Ok(effect) => {

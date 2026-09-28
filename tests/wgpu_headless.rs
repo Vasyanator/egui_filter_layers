@@ -16,7 +16,10 @@
 //! bright spot only. User textures (F8): a 2x2 checker read exactly, through a nearest and a
 //! linear sampler, updated in full and in part between frames; three slots at once; unknown and
 //! freed ids reported (`failed_textures`) and a missing attachment refused, each skipping only its
-//! layer.
+//! layer. Persistent state (F7): a `state + 0.25` state pass accumulates over frames (RGBA16F and
+//! opt-in RGBA8), survives the per-frame target pool, is reset by `reset_state`, stepped once per
+//! frame when the id is painted twice, stretched (not reset) when the layer grows past its
+//! allocation, dropped by a re-install; a stateful layer without an id is refused.
 //!
 //! Needs a GPU adapter (Vulkan, Metal, DX12 or GL), so it is ignored by default:
 //! `cargo test --all-features -- --ignored`.
@@ -27,7 +30,7 @@ use std::sync::Arc;
 
 use egui::{Align2, Color32, ColorImage, FontId, Pos2, Rect, TextureOptions, pos2, vec2};
 use egui::emath::TSTransform;
-use egui_filter_layers::{BackendStatus, Effect, FilterChain, FilterLayer, Pass, WgpuOptions, install_wgpu, presets};
+use egui_filter_layers::{BackendStatus, Effect, FilterChain, FilterLayer, Pass, StateFormat, StateOptions, WgpuOptions, install_wgpu, presets};
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 128;
@@ -978,4 +981,114 @@ fn unknown_freed_and_missing_textures_skip_their_layer_only() {
     let mut expected = vec![unknown, freed];
     expected.sort_by_key(|id| format!("{id:?}"));
     assert_eq!(failed, expected);
+}
+
+/// F7: a state pass adding 0.25 to every state channel per frame (exact texel reads), and a display
+/// pass showing the state (sampled at texel centres: exact).
+fn accumulator() -> FilterChain {
+    let step = match Effect::new_state("accumulate", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state_px(vec2<i32>(0)) + vec4<f32>(0.25); }") {
+        Ok(effect) => Pass::new(&effect),
+        Err(error) => panic!("{error}"),
+    };
+    FilterChain::new().then(step).then(pass_of("show", "fn effect(uv: vec2<f32>) -> vec4<f32> { return min(state(uv), vec4<f32>(1.0)); }"))
+}
+
+/// The value (0..=255) a layer of [`accumulator`] shows after `frames` steps.
+fn accumulated(frames: u32) -> u8 {
+    [0, 64, 128, 191, 255].get(usize::try_from(frames).unwrap_or(usize::MAX)).copied().unwrap_or(255)
+}
+
+/// Checks the grey of pixel `(x, y)` within one step of `expected`.
+fn assert_grey(pixels: &[u8], x: u32, y: u32, expected: u8, what: &str) {
+    let actual = rgb(pixels, x, y);
+    assert!(actual.iter().all(|value| value.abs_diff(expected) <= 1), "{what}: pixel ({x}, {y}) is {actual:?}, expected grey {expected}");
+}
+
+/// F7: over four frames the state accumulates 0.25 per frame (surviving the per-frame target pool
+/// reset), then `reset_state` starts it over; the same id painted twice in a frame is stepped once
+/// (both paints show the same value); a layer without an id is refused (backdrop kept).
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn state_accumulates_resets_and_steps_once_per_frame() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let chain = accumulator();
+    let id = egui::Id::new("accumulator");
+    let left = Rect::from_min_max(pos2(8.0, 8.0), pos2(120.0, 120.0));
+    let right = Rect::from_min_max(pos2(136.0, 8.0), pos2(248.0, 60.0));
+    let unnamed = Rect::from_min_max(pos2(136.0, 70.0), pos2(248.0, 120.0));
+    let mut paint = |ui: &mut egui::Ui| {
+        let painter = ui.painter();
+        halves(painter);
+        FilterLayer::new(left, chain.clone()).id(id).paint(painter);
+        // The same id again in the same frame: shows the state, does not step it.
+        FilterLayer::new(right, chain.clone()).id(id).paint(painter);
+        FilterLayer::new(unnamed, chain.clone()).paint(painter);
+    };
+    for frame in 1..=4 {
+        let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+        assert_grey(&pixels, 60, 60, accumulated(frame), &format!("frame {frame}, first paint"));
+        assert_grey(&pixels, 190, 30, accumulated(frame), &format!("frame {frame}, second paint of the id"));
+        assert_near(&pixels, 190, 100, [0, 0, 255], &format!("frame {frame}: no id, refused"));
+    }
+    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert_eq!(egui_filter_layers::state_count(&ctx), 1);
+    egui_filter_layers::reset_state(&ctx, id);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+    assert_grey(&pixels, 60, 60, accumulated(1), "after reset_state");
+    assert!(egui_filter_layers::failed_states(&ctx).is_empty() && egui_filter_layers::failed_effects(&ctx).is_empty());
+}
+
+/// F7: an explicit RGBA8 state accumulates the same way (0.25 steps are exact enough in 8 bits).
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn an_rgba8_state_accumulates_too() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let chain = accumulator();
+    let mut paint = |ui: &mut egui::Ui| {
+        halves(ui.painter());
+        FilterLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(120.0, 120.0)), chain.clone()).id(egui::Id::new("rgba8")).state(StateOptions::default().with_format(StateFormat::Rgba8Unorm)).paint(ui.painter());
+    };
+    for frame in 1..=4 {
+        let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+        assert_grey(&pixels, 60, 60, accumulated(frame), &format!("frame {frame}"));
+    }
+}
+
+/// F7: a layer that grows past its state allocation continues its state (the previous state is
+/// read stretched, the textures grow keeping their content), at a reduced state scale too; a
+/// re-install drops every state.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn a_growing_layer_keeps_its_state_and_a_reinstall_drops_it() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let chain = accumulator();
+    for options in [StateOptions::default(), StateOptions::default().with_scale(0.5)] {
+        let id = egui::Id::new(("growing", options.scale().to_bits()));
+        let mut rect = Rect::from_min_max(pos2(8.0, 8.0), pos2(40.0, 24.0));
+        let paint = |ui: &mut egui::Ui, rect: Rect| {
+            halves(ui.painter());
+            FilterLayer::new(rect, chain.clone()).id(id).state(options).paint(ui.painter());
+        };
+        for frame in 1..=3 {
+            if frame == 3 {
+                // Far beyond the first allocation.
+                rect = Rect::from_min_max(pos2(4.0, 4.0), pos2(250.0, 124.0));
+            }
+            let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| paint(ui, rect));
+            assert_grey(&pixels, 20, 15, accumulated(frame), &format!("scale {}, frame {frame}", options.scale()));
+            if frame == 3 {
+                assert_grey(&pixels, 200, 100, accumulated(frame), "the grown part reads the stretched previous state");
+            }
+        }
+    }
+    assert_eq!(egui_filter_layers::state_count(&ctx), 2);
+    let installed = install_wgpu(&ctx, &state, WgpuOptions::from(&egui_wgpu::RendererOptions { dithering: false, ..Default::default() }).with_clear_color([0.0, 0.0, 0.0, 1.0]));
+    assert!(installed.is_ok(), "{installed:?}");
+    let id = egui::Id::new(("growing", 1.0_f32.to_bits()));
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| {
+        halves(ui.painter());
+        FilterLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(40.0, 24.0)), chain.clone()).id(id).paint(ui.painter());
+    });
+    assert_grey(&pixels, 20, 15, accumulated(1), "a re-install starts every state over");
+    assert_eq!(egui_filter_layers::state_count(&ctx), 1);
 }

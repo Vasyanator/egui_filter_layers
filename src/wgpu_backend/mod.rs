@@ -43,7 +43,7 @@ mod textures;
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use egui::epaint::ClippedPrimitive;
@@ -51,6 +51,7 @@ use egui::{Rect, TextureId};
 
 use crate::backend::{Backend, BackendKind, BackendStatus, EffectFailure, InstallError, LayerJob, TextureFailure, register};
 use crate::effect::{CompiledModule, TEXTURE_SLOTS};
+use crate::state::{StateError, StateFailure, StateFormat};
 use crate::geometry::PxRect;
 use plugin::FilterLayersPlugin;
 use render::FilterCallback;
@@ -327,6 +328,8 @@ struct Health {
     failed_effects: HashMap<u64, FailedEffect>,
     /// Attached user textures that could not be resolved, by id (egui never reuses an id).
     failed_textures: HashMap<TextureId, TextureFailure>,
+    /// State formats the device cannot render / filter (F7), latched per format.
+    failed_states: HashMap<StateFormat, StateFailure>,
 }
 
 /// Per-install "logged once" latches for debug messages that would otherwise repeat every frame.
@@ -368,6 +371,9 @@ pub(crate) struct Shared {
     texture_copies: Mutex<TextureCopies>,
     /// Log-once latches of this install.
     logged: LoggedOnce,
+    /// Number of layer states the resources hold (mirrored after every prepare for
+    /// `state_count()`, which runs on the GUI thread).
+    state_count: AtomicUsize,
 }
 
 impl Shared {
@@ -439,6 +445,18 @@ impl Shared {
         health.failed_textures.insert(id, TextureFailure { id, error });
     }
 
+    /// Records that stateful layers asking for `format` are refused (the device cannot render or
+    /// filter it) and logs it once per format.
+    fn fail_state(&self, format: StateFormat, reason: String) {
+        let mut health = self.health();
+        if health.failed_states.contains_key(&format) {
+            return;
+        }
+        let error = StateError::UnsupportedFormat { format, reason };
+        log::error!("egui_filter_layers (wgpu): stateful filter layers are skipped (they draw nothing extra).\nError: {error}");
+        health.failed_states.insert(format, StateFailure { format, error });
+    }
+
     /// Whether `module` is known to fail on this device.
     fn effect_failed(&self, module: &CompiledModule) -> bool {
         self.health().failed_effects.contains_key(&module.id)
@@ -475,6 +493,14 @@ impl Backend for WgpuBackend {
 
     fn failed_textures(&self) -> Vec<TextureFailure> {
         self.shared.health().failed_textures.values().cloned().collect()
+    }
+
+    fn failed_states(&self) -> Vec<StateFailure> {
+        self.shared.health().failed_states.values().cloned().collect()
+    }
+
+    fn state_count(&self) -> usize {
+        self.shared.state_count.load(Ordering::Relaxed)
     }
 
     fn paint_layer(&self, painter: &egui::Painter, job: LayerJob) {
@@ -553,6 +579,7 @@ pub fn install_wgpu(ctx: &egui::Context, render_state: &egui_wgpu::RenderState, 
         health: Mutex::new(Health { failure: problem.clone(), ..Health::default() }),
         texture_copies: Mutex::new(TextureCopies::default()),
         logged: LoggedOnce::default(),
+        state_count: AtomicUsize::new(0),
     });
     if let Some(handle) = ctx.plugin_opt::<FilterLayersPlugin>() {
         handle.lock().replace_shared(Arc::clone(&shared));

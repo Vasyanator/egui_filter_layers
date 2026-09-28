@@ -31,6 +31,10 @@ mapped. User textures are checked against the chain (`plan::check_textures`, the
 before any GPU work, uploaded once per attached `OfflineTexture` (kept per slot while the same
 texture stays attached) into `Rgba8Unorm` textures bound through egui-wgpu's sampler mapping, and
 are independent of tiles (their uv is their own).
+Persistent state (F7): a chain with a state pass keeps its state in the renderer (`OfflineState`,
+two state textures) from one run to the next (a video processor's frames), configured by
+`OfflineOptions::with_state`, zeroed by `reset_state`; such a chain is never tiled
+(`OfflineError::NotTileable`), and a failed run forgets the state.
 */
 
 //! Offline processing: apply a [`FilterChain`] to an ordinary image or video frame on wgpu and
@@ -80,6 +84,12 @@ are independent of tiles (their uv is their own).
 //!
 //! The pipeline is 8-bit like the UI's capture: 16-bit input is converted to 8 bits first.
 //!
+//! **Persistent state** (a chain with a state pass, `Effect::new_state`): the renderer keeps the
+//! state from one `process` call to the next — frame `n` continues frame `n - 1`, like a layer in
+//! the UI — sized from the frame (`OfflineOptions::with_state` for the resolution and format);
+//! [`OfflineRenderer::reset_state`] starts over from zero. A new frame size stretches the previous
+//! state like a resized layer. Stateful chains cannot be tiled ([`OfflineError::NotTileable`]).
+//!
 //! User textures ([`OfflineOptions::with_texture`] with an [`OfflineTexture`]) are what
 //! `FilterLayer::texture` attaches in the UI; [`OfflineTexture::from_color_image`] holds exactly
 //! the bytes egui uploads for that image, so an effect reading them agrees with the UI.
@@ -108,9 +118,10 @@ pub use texture::OfflineTexture;
 use crate::effect::{TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING};
 use crate::geometry::{LayerGeometry, PxRect, layer_geometry, padding_px};
 use crate::pass::{FilterChain, InputUniforms};
-use crate::plan::check_textures;
-use crate::wgpu_backend::chain::{ChainJob, ChainRecording, ChainResources, ChainSource, ChainTargets, ChainWindow, draw_composite};
-use crate::wgpu_backend::gpu::{ErrorScopes, begin_pass, egui_sampler_descriptor};
+use crate::plan::{StatePlan, StatePlanInput, check_textures};
+use crate::state::{StateError, StateFormat};
+use crate::wgpu_backend::chain::{ChainJob, ChainRecording, ChainResources, ChainSource, ChainState, ChainTargets, ChainWindow, draw_composite};
+use crate::wgpu_backend::gpu::{ErrorScopes, Target, begin_pass, egui_sampler_descriptor};
 use frame::{MAX_SIDE, convert_output, frame_bytes};
 use readback::{RowLayout, map_read};
 use tiles::{Tile, TilePlan};
@@ -160,6 +171,21 @@ pub struct OfflineRenderer {
     user_textures: [Option<UploadedTexture>; TEXTURE_SLOTS],
     /// Samplers by egui texture options (egui-wgpu's mapping), created on first use.
     samplers: std::collections::HashMap<egui::TextureOptions, wgpu::Sampler>,
+    /// The persistent state of stateful chains (F7), carried from run to run.
+    state: Option<OfflineState>,
+}
+
+/// The persistent state of an offline renderer: two state textures and where the latest state is.
+#[derive(Debug)]
+struct OfflineState {
+    /// `Slot::StateA` / `Slot::StateB` (grown by the chain executor, keeping content).
+    targets: [Option<Target>; 2],
+    /// Which target holds the latest state.
+    current: u8,
+    /// Its content's size; `None` = no content yet (cleared by the next run).
+    used: Option<[u32; 2]>,
+    /// The format the targets hold.
+    format: StateFormat,
 }
 
 /// The GPU copy of an attached [`OfflineTexture`].
@@ -217,7 +243,16 @@ impl OfflineRenderer {
             scratch: Vec::new(),
             user_textures: [const { None }; TEXTURE_SLOTS],
             samplers: std::collections::HashMap::new(),
+            state: None,
         })
+    }
+
+    /// Starts the persistent state (F7) over: the next run of a stateful chain begins from zero.
+    /// The state textures are kept (reused by the next run).
+    pub fn reset_state(&mut self) {
+        if let Some(state) = self.state.as_mut() {
+            state.used = None;
+        }
     }
 
     /// A renderer on egui-wgpu's device: the same adapter, device and shader compiler as the
@@ -322,12 +357,13 @@ impl OfflineRenderer {
         output.resize(frame_bytes(size[0], size[1])?, 0);
 
         let geometry = frame_geometry(size, chain.padding_points(), options)?;
+        let stateful = chain.passes().iter().any(|pass| pass.effect().is_state());
+        let state_format = options.state.format();
+        if stateful && let Some(reason) = self.chain.state_format_problem(state_format) {
+            return Err(OfflineError::State(StateError::UnsupportedFormat { format: state_format, reason }));
+        }
         self.chain.evict_dropped();
-        let pipelines = chain
-            .passes()
-            .iter()
-            .map(|pass| self.chain.effect_pipeline(&self.device, pass.effect().module()).map_err(|message| OfflineError::Effect { label: pass.effect().label().to_owned(), message }))
-            .collect::<Result<Vec<_>, _>>()?;
+        let pipelines = self.chain.pass_pipelines(&self.device, chain.passes(), state_format).map_err(|(module, message)| OfflineError::Effect { label: module.label.to_string(), message })?;
         let overlap = u32::try_from(padding_px(chain.padding_points(), geometry.pixels_per_layer_point)).unwrap_or(0).saturating_add(TILE_OVERLAP_MARGIN_PX);
         let device_limit = self.max_texture_side.min(self.max_readback_side);
         let limit = options.max_tile_size.map_or(device_limit, |cap| cap.min(device_limit));
@@ -340,6 +376,17 @@ impl OfflineRenderer {
             // (= UI) result. Refuse instead of approximating.
             return Err(OfflineError::NotTileable { reason: format!("pass {index} runs at scale {} (a reduced-resolution pass needs the whole frame; the frame is {}x{} and tiles are at most {limit} pixels)", pass.scale(), size[0], size[1]) });
         }
+        if plan.tiles.len() > 1
+            && let Some(index) = chain.passes().iter().position(|pass| pass.effect().is_state())
+        {
+            // The state spans the whole frame and continues across runs; a tile would step it
+            // once per tile over a partial window.
+            return Err(OfflineError::NotTileable { reason: format!("pass {index} is a state pass (persistent state needs the whole frame; the frame is {}x{} and tiles are at most {limit} pixels)", size[0], size[1]) });
+        }
+        if stateful && self.state.as_ref().is_none_or(|state| state.format != state_format) {
+            self.state = Some(OfflineState { targets: [None, None], current: 0, used: None, format: state_format });
+        }
+        let state_input = self.state.as_ref().filter(|_| stateful).map(|state| StatePlanInput { scale: options.state.scale(), current: state.current, previous_px: state.used, step: true });
         if plan.tiles.len() > 1 {
             log::debug!("egui_filter_layers (offline): {}x{} processed in {} tiles of {:?}", size[0], size[1], plan.tiles.len(), plan.alloc);
         }
@@ -347,12 +394,18 @@ impl OfflineRenderer {
         self.ensure_user_textures(options).await?;
 
         for tile in &plan.tiles {
-            let run = TileRun { tile: *tile, geometry, image_width: size[0], time: options.time, input: options.input_uniforms(&geometry) };
-            let (layout, errors) = self.record_tile(&run, pixels, chain, &pipelines)?;
+            let run = TileRun { tile: *tile, geometry, image_width: size[0], time: options.time, input: options.input_uniforms(&geometry), state: state_input };
+            let (layout, errors, state_plan) = self.record_tile(&run, pixels, chain, &pipelines)?;
             if let Some(error) = errors.await {
                 // Textures or the readback buffer may now be invalid objects: recreate them next run.
                 self.drop_allocations();
+                self.state = None;
                 return Err(offline_gpu_error(&error));
+            }
+            // The state step ran: the next run continues from its result.
+            if let (Some(state), Some(state_plan)) = (self.state.as_mut(), state_plan) {
+                state.current = state_plan.final_index;
+                state.used = Some(state_plan.final_px);
             }
             // Taken out while mapped: an error below, or dropping this future (cancelling
             // `process_async`), drops the buffer instead of leaving it mapped for the next run.
@@ -506,8 +559,9 @@ impl OfflineRenderer {
     /// Uploads one tile's window, records the chain (`chain.rs`, which may grow its
     /// intermediates) and the composite into the output texture, copies the output rect into the
     /// readback buffer and submits — all inside [`ErrorScopes`]. Returns the readback layout of
-    /// the tile and the future of the first GPU error of that work (await it before mapping).
-    fn record_tile(&mut self, run: &TileRun, pixels: &[u8], chain: &FilterChain, pipelines: &[wgpu::RenderPipeline]) -> Result<(RowLayout, impl Future<Output = Option<wgpu::Error>> + use<>), OfflineError> {
+    /// the tile, the future of the first GPU error of that work (await it before mapping) and, for
+    /// a stateful run, where the latest state is afterwards.
+    fn record_tile(&mut self, run: &TileRun, pixels: &[u8], chain: &FilterChain, pipelines: &[wgpu::RenderPipeline]) -> Result<(RowLayout, impl Future<Output = Option<wgpu::Error>> + use<>, Option<StatePlan>), OfflineError> {
         let (window, out) = (run.tile.window, run.tile.output);
         let [out_w, out_h] = [px_u32(out.w)?, px_u32(out.h)?];
         let layout = RowLayout::new(out_w, out_h)?;
@@ -517,6 +571,8 @@ impl OfflineRenderer {
         };
         let (device, queue, resources, composite) = (&self.device, &self.queue, &self.chain, &self.composite);
         let user_textures = self.user_textures.each_ref().map(|uploaded| uploaded.as_ref().map(|uploaded| &uploaded.bind_group));
+        let mut state = self.state.as_mut().filter(|_| run.state.is_some()).map(|state| ChainState { targets: &mut state.targets, format: state.format });
+        let mut state_plan = None;
 
         let scopes = ErrorScopes::push(device);
         let recorded = 'record: {
@@ -537,11 +593,13 @@ impl OfflineRenderer {
                 passes: chain.passes(),
                 pipelines,
                 user_textures,
+                state: run.state,
             };
-            let bind_group = resources.record(&mut ChainRecording { device, queue, encoder: &mut encoder }, &mut targets.chain, &job);
-            let Some(bind_group) = bind_group else {
+            let recorded = resources.record(&mut ChainRecording { device, queue, encoder: &mut encoder }, &mut targets.chain, &job, state.as_mut());
+            let Some((bind_group, planned_state)) = recorded else {
                 break 'record false;
             };
+            state_plan = planned_state;
             {
                 let mut pass = begin_pass(&mut encoder, &targets.output_view, "egui_filter_layers offline composite", wgpu::Color::TRANSPARENT);
                 draw_composite(&mut pass, composite, &bind_group, PxRect { x: 0, y: 0, w: out.w, h: out.h });
@@ -555,7 +613,7 @@ impl OfflineRenderer {
             true
         };
         let errors = scopes.pop();
-        if recorded { Ok((layout, errors)) } else { Err(OfflineError::Gpu("the chain executor rejected the tile (crate bug)".to_owned())) }
+        if recorded { Ok((layout, errors, state_plan)) } else { Err(OfflineError::Gpu("the chain executor rejected the tile (crate bug)".to_owned())) }
     }
 }
 
@@ -571,6 +629,8 @@ struct TileRun {
     time: f32,
     /// `fl.delta_time`, `fl.frame`, `fl.pointer` (the whole frame's; every tile uses the same).
     input: InputUniforms,
+    /// The renderer's state before this run (stateful chains, never tiled).
+    state: Option<StatePlanInput>,
 }
 
 /// The layer geometry of a whole `size` frame: the layer rect covers the frame (in points at

@@ -3,7 +3,8 @@
 //! * In memory: `process_video` over an in-memory source and sink must write every frame, in
 //!   order, byte-identical to `OfflineRenderer::process` of the same frame at the same time; the
 //!   source's times must reach the shader as `fl.time`; cancelling from the progress callback must
-//!   abort the sink.
+//!   abort the sink; a stateful chain (F7) carries its state from frame to frame, and every
+//!   `process_video` stream starts from a zero state.
 //! * ffmpeg end to end: a synthetic clip (lavfi `testsrc` + `sine`) is inverted into a lossless
 //!   FFV1 file with the audio copied; the output must have every frame, the size, an audio stream,
 //!   and frames equal to the offline path's result for the decoded input frames. A translucent
@@ -175,6 +176,30 @@ fn frame_times_reach_the_shader_and_cancelling_aborts() {
     assert!(matches!(result, Err(VideoError::Cancelled { frames: 3 })), "{result:?}");
     assert!(sink.aborted && !sink.finished);
     assert_eq!(sink.frames.len(), 3);
+}
+
+/// F7: the processor carries a state pass's state from frame to frame (`state + 0.25` reaches 1.0
+/// on the 4th frame); `process_video` starts every stream from zero; `reset_state` starts over.
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn a_stateful_chain_carries_its_state_from_frame_to_frame() {
+    let step = Effect::new_state("accumulate", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state_px(vec2<i32>(0)) + vec4<f32>(0.25); }").unwrap_or_else(|error| panic!("{error}"));
+    let show = Effect::new("show", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(min(state(uv).rgb, vec3<f32>(1.0)), 1.0); }").unwrap_or_else(|error| panic!("{error}"));
+    let chain = FilterChain::new().then(Pass::new(&step)).then(Pass::new(&show));
+    let mut processor = VideoProcessor::new(renderer(), chain, OfflineOptions::default());
+    let expected = [64_u8, 128, 191, 255];
+    let grey_of = |pixels: &[u8]| pixels.chunks_exact(4).map(|px| px[0]).max().unwrap_or(0);
+    for _stream in 0..2 {
+        let mut source = MemorySource::new(4, 255);
+        let mut sink = MemorySink::default();
+        process_video(&mut processor, &mut source, &mut sink, |_| ControlFlow::Continue(())).unwrap_or_else(|error| panic!("{error}"));
+        let greys: Vec<u8> = sink.frames.iter().map(|(pixels, _)| grey_of(pixels)).collect();
+        assert!(greys.iter().zip(expected).all(|(grey, want)| grey.abs_diff(want) <= 1), "{greys:?}: every stream starts from zero");
+    }
+    processor.reset_state();
+    let frame = MemorySource::frame(0, 255);
+    let greys: Vec<u8> = (0..4).map(|index| processor.process_frame(&FrameRef::new(&frame, WIDTH, HEIGHT, AlphaMode::Straight), f64::from(index) / 30.0).map(|out| grey_of(out.pixels())).unwrap_or_else(|error| panic!("{error}"))).collect();
+    assert!(greys.iter().zip(expected).all(|(grey, want)| grey.abs_diff(want) <= 1), "{greys:?}: process_frame continues the state");
 }
 
 // ---- ffmpeg end to end ----

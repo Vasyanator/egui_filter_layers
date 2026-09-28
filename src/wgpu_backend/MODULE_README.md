@@ -22,7 +22,10 @@ One frame, per filter layer:
    `*Srgb` targets through an `Rgba8UnormSrgb` view of it with the linear-output entry, so
    meshes blend in linear like egui's), then hands the capture's unorm view to the chain executor
    (`ChainResources::record`, `chain.rs`): it runs the draws of `plan::plan` — effect passes
-   ping-pong (RGBA16F when the adapter can) — and returns the composite bind group.
+   ping-pong (RGBA16F when the adapter can) — and returns the composite bind group. A stateful
+   layer (F7) first looks up its entry in `WgpuResources::states` (viewport + id; eviction of
+   unpainted entries runs at every prepare) and hands its two state textures to the executor
+   (`ChainState`), then records where the latest state is.
 4. `FilterCallback::paint` draws the BLENDED composite (`chain::draw_composite_over`: an erase
    draw then an add draw, together `mix(dst, filtered, coverage)`, uncovered pixels discarded)
    into egui's pass. Outside the rounded mask the screen keeps what egui drew, including paint
@@ -67,7 +70,7 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   synchronous `with_error_scope` on top of it, format capability check).
 - `resources.rs`: the UI's objects: `ChainResources` + egui-pass blended composite pipelines +
   mesh pipeline (and whether the capture renders through its sRGB view), per-layer target pool
-  (`LayerTargets`).
+  (`LayerTargets`), persistent layer states (`states`: `StateRegistry<StateTargets>`).
 - `render.rs`: the `CallbackTrait` implementation (backdrop re-render, then the chain executor).
 - `mesh.wgsl`: mesh re-render shader (egui-wgpu maths + dithering; `fs_main` = gamma framebuffer
   path, `fs_main_linear` = linear framebuffer path).
@@ -87,6 +90,14 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   textures (kept copy of a full upload not yet applied, else egui-wgpu's bind group; partial
   updates land in that texture before the frame's command buffer); the plan holds its bind group
   until the frame is rendered, so a texture egui frees after the frame is still valid there.
+- State (F7): state textures are `Rgba16Float` (refused with `Shared::fail_state` unless the
+  adapter renders AND filters it — the same check as float intermediates) or opt-in `Rgba8Unorm`;
+  they live in `WgpuResources::states`, NEVER in the per-frame `LayerTargets` pool, and die with the
+  install's resources (a re-install drops them). `record` grows them with `Target::ensure_kept`
+  (a `copy_texture_to_texture` recorded before the passes, so the latest content survives) and
+  clears the one the plan names; effect pipelines are cached per module AND output format (state
+  passes render into the state format). `Shared::state_count` mirrors the registry size for the
+  GUI thread.
 - Both ping-pong targets are grown to at least the plan's `target_px` (every scaled step's
   image sits at the target origin; viewports and mappings come from the plan).
 - Every layer of a frame gets its own `LayerTargets` (pool index = prepare order, reset in

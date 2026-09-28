@@ -345,7 +345,7 @@ impl Extend<Pass> for FilterChain {
 }
 
 /// Size in bytes of the `FlUniforms` block (see `shaders/prelude.wgsl`).
-pub(crate) const UNIFORM_BLOCK_SIZE: usize = 432;
+pub(crate) const UNIFORM_BLOCK_SIZE: usize = 448;
 
 /// Byte offsets of the `FlUniforms` members; pinned against naga's computed layout by a test.
 pub(crate) mod offsets {
@@ -395,8 +395,12 @@ pub(crate) mod offsets {
     pub const FRAG_TEXEL: usize = 152;
     /// `internal_src_texel: vec2<f32>`.
     pub const SRC_TEXEL: usize = 160;
+    /// `internal_state_texel: vec2<f32>`.
+    pub const STATE_TEXEL: usize = 168;
+    /// `internal_state_size: vec2<f32>`.
+    pub const STATE_SIZE: usize = 176;
     /// `params: array<vec4<f32>, 16>`.
-    pub const PARAMS: usize = 176;
+    pub const PARAMS: usize = 192;
 }
 
 /// The non-parameter uniforms of one pass.
@@ -435,14 +439,21 @@ pub(crate) struct FrameUniforms {
     /// Pointer in capture uv, `z` pressed, `w` present (`fl.pointer`); `w = 0`: no pointer
     /// (the value until `with_input`).
     pub pointer: [f32; 4],
-    /// Capture uv -> storage uv of the state texture (`internal_state_*`); identity while no
-    /// chain has state.
+    /// Capture uv -> storage uv of the state texture (`internal_state_scale` / `_offset`);
+    /// identity for a draw that binds no state (`plan.rs` sets it for the others).
     pub state: [[f32; 2]; 2],
+    /// One texel of the state content the draw reads, in capture uv (`internal_state_texel`,
+    /// `state_texel()`, the `state()` edge clamp); `[1, 1]` without state (the 1x1 dummy).
+    pub state_texel: [f32; 2],
+    /// The state content's size in texels (`internal_state_size`, `state_size()`, the
+    /// `state_load` clamp); `[1, 1]` without state (the 1x1 dummy).
+    pub state_size: [f32; 2],
     /// Same for the coverage texture (`internal_cover_*`); identity while no mask needs one.
     pub cover: [[f32; 2]; 2],
     /// Output resolution of the draw relative to the capture (`fl.pass_scale`); `1` = full.
     pub pass_scale: f32,
-    /// Index of the draw among the frame's draws of its kind (`fl.pass_index`).
+    /// Index of the draw among the chain's passes of its kind, display or state (`fl.pass_index`;
+    /// consecutive state passes are the substeps of one frame). Set per draw by `plan.rs`.
     pub pass_index: u32,
     /// One pixel of the draw's OUTPUT in capture uv (`internal_frag_texel`: fragment-mode-1 uv,
     /// `out_texel()`); `texel` at full resolution.
@@ -484,6 +495,8 @@ impl FrameUniforms {
             frame: 0,
             pointer: [0.0; 4],
             state: [[1.0, 1.0], [0.0, 0.0]],
+            state_texel: [1.0, 1.0],
+            state_size: [1.0, 1.0],
             cover: [[1.0, 1.0], [0.0, 0.0]],
             pass_scale: 1.0,
             pass_index: 0,
@@ -562,6 +575,8 @@ pub(crate) fn pack_uniforms(frame: &FrameUniforms, params: &Params) -> [u8; UNIF
     put_u32(&mut bytes, offsets::PASS_INDEX, frame.pass_index);
     put_f32s(&mut bytes, offsets::FRAG_TEXEL, &frame.frag_texel);
     put_f32s(&mut bytes, offsets::SRC_TEXEL, &frame.src_texel);
+    put_f32s(&mut bytes, offsets::STATE_TEXEL, &frame.state_texel);
+    put_f32s(&mut bytes, offsets::STATE_SIZE, &frame.state_size);
     for (i, slot) in params.iter().enumerate() {
         put_f32s(&mut bytes, offsets::PARAMS + i * 16, slot);
     }
@@ -615,8 +630,10 @@ mod tests {
         assert_eq!(offset_of("pass_index"), offsets::PASS_INDEX);
         assert_eq!(offset_of("internal_frag_texel"), offsets::FRAG_TEXEL);
         assert_eq!(offset_of("internal_src_texel"), offsets::SRC_TEXEL);
+        assert_eq!(offset_of("internal_state_texel"), offsets::STATE_TEXEL);
+        assert_eq!(offset_of("internal_state_size"), offsets::STATE_SIZE);
         assert_eq!(offset_of("params"), offsets::PARAMS);
-        assert_eq!(members.len(), 24, "every member is pinned above");
+        assert_eq!(members.len(), 26, "every member is pinned above");
         assert_eq!(usize::try_from(*span).unwrap_or(0), UNIFORM_BLOCK_SIZE);
     }
 
@@ -639,6 +656,8 @@ mod tests {
             frame: 77,
             pointer: [0.5, 0.25, 1.0, 1.0],
             state: [[0.5, 0.75], [0.125, 0.25]],
+            state_texel: [0.25, 0.375],
+            state_size: [4.0, 8.0],
             cover: [[0.375, 1.0], [0.0, 0.5]],
             pass_scale: 0.5,
             pass_index: 3,
@@ -675,6 +694,7 @@ mod tests {
         assert_eq!(read_u32(offsets::PASS_INDEX), 3);
         assert!((read_f32(&bytes, offsets::FRAG_TEXEL) - 1.0).abs() < f32::EPSILON && (read_f32(&bytes, offsets::FRAG_TEXEL + 4) - 0.5).abs() < f32::EPSILON);
         assert!((read_f32(&bytes, offsets::SRC_TEXEL) - 0.0625).abs() < f32::EPSILON && (read_f32(&bytes, offsets::SRC_TEXEL + 4) - 0.125).abs() < f32::EPSILON);
+        assert!((read_f32(&bytes, offsets::STATE_TEXEL + 4) - 0.375).abs() < f32::EPSILON && (read_f32(&bytes, offsets::STATE_SIZE) - 4.0).abs() < f32::EPSILON);
     }
 
     #[test]

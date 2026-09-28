@@ -12,6 +12,7 @@ Key structures:
 Key functions:
 - `FilterLayer::paint()`.
 - `FilterLayer::texture()` / `check_textures()`: user textures (F8) and the check `paint` runs.
+- `FilterLayer::id()` / `state()` / `check_state()`: persistent state (F7) and its check.
 - `frame_input()`: the per-frame input (`fl.delta_time`, `fl.frame`, `fl.pointer`) read from the
   context on the GUI thread.
 
@@ -21,7 +22,9 @@ Never panics and never draws a fake: with no backend installed it logs one warni
 paints nothing, leaving the backdrop unfiltered. A failed backend is skipped the same way, and
 neither case requests repaints for animated chains. A layer whose user textures cannot serve its
 effects (`TextureError`: an invalid slot, or a slot an effect reads with nothing attached) is
-skipped too, its error logged once per context and message (`log_texture_error_once`).
+skipped too, its error logged once per context and message (`log_texture_error_once`), and so
+is a layer with a state pass but no id (`StateError::MissingId`, same latch). A pending
+`reset_state` request for the layer's id is consumed at its paint (`state::take_reset`).
 */
 
 use egui::{Context, CornerRadius, Id, Painter, Rect, TextureId};
@@ -30,6 +33,7 @@ use crate::backend::{FrameInput, LayerJob, PointerInput, TextureError, installed
 use crate::effect::TEXTURE_SLOTS;
 use crate::pass::FilterChain;
 use crate::plan::check_textures;
+use crate::state::{StateError, StateOptions, take_reset};
 
 /// Sets `ctx`'s "no backend installed" latch; returns whether it was unset (i.e. whether to warn).
 fn first_not_installed_warning(ctx: &Context) -> bool {
@@ -53,18 +57,36 @@ fn warn_not_installed_once(ctx: &Context) {
     }
 }
 
+/// Sets `ctx`'s latch for `message`; returns whether it was unset (i.e. whether to log).
+fn first_layer_error(ctx: &Context, message: &str) -> bool {
+    ctx.data_mut(|data| !std::mem::replace(data.get_temp_mut_or_default::<bool>(Id::new(("egui_filter_layers::layer_error", message))), true))
+}
+
 /// Logs `error` (a layer skipped for its textures) the first time this message is seen on `ctx`.
 /// The latch is per message in `ctx`'s temporary memory, like `warn_not_installed_once`: the same
 /// misuse repeats every frame, a different one (another effect or slot) is logged once more.
 fn log_texture_error_once(ctx: &Context, error: &TextureError) {
     let message = error.to_string();
-    let first = ctx.data_mut(|data| !std::mem::replace(data.get_temp_mut_or_default::<bool>(Id::new(("egui_filter_layers::texture_error", &message))), true));
-    if first {
+    if first_layer_error(ctx, &message) {
         log::error!(
             "egui_filter_layers: a FilterLayer was skipped (it draws nothing extra) because its textures cannot serve its effects.\n\
              Error: {message}\n\
              Fix: attach a texture to every slot the chain's effects read (`FilterLayer::texture(slot, id)`, slots 0..{TEXTURE_SLOTS}); \
              `FilterLayer::check_textures` reports this without painting. Logged once per message."
+        );
+    }
+}
+
+/// Logs `error` (a stateful layer skipped) once per context and message, like
+/// `log_texture_error_once`.
+fn log_state_error_once(ctx: &Context, error: &StateError) {
+    let message = error.to_string();
+    if first_layer_error(ctx, &message) {
+        log::error!(
+            "egui_filter_layers: a FilterLayer was skipped (it draws nothing extra).\n\
+             Error: {message}\n\
+             Fix: give every layer whose chain has a state pass a stable identity with `FilterLayer::id(egui::Id)`; \
+             `FilterLayer::check_state` reports this without painting. Logged once per message."
         );
     }
 }
@@ -112,13 +134,60 @@ pub struct FilterLayer {
     /// The first out-of-range slot given to [`FilterLayer::texture`], reported by
     /// [`FilterLayer::check_textures`] (the builder cannot return an error).
     invalid_slot: Option<usize>,
+    /// The layer's identity (required by stateful chains, F7).
+    id: Option<Id>,
+    /// How the persistent state is stored (stateful chains only).
+    state: StateOptions,
 }
 
 impl FilterLayer {
     /// A layer filtering `rect` (points) through `chain` (a `Pass`, `Vec<Pass>` or `FilterChain`).
     #[must_use]
     pub fn new(rect: Rect, chain: impl Into<FilterChain>) -> Self {
-        Self { rect, chain: chain.into(), corner_radius: CornerRadius::ZERO, textures: [None; TEXTURE_SLOTS], invalid_slot: None }
+        Self { rect, chain: chain.into(), corner_radius: CornerRadius::ZERO, textures: [None; TEXTURE_SLOTS], invalid_slot: None, id: None, state: StateOptions::default() }
+    }
+
+    /// Gives the layer a stable identity (e.g. `ui.id().with("water")`), REQUIRED when its
+    /// chain has a state pass ([`crate::Effect::new_state`]): the layer's persistent state is
+    /// found again by this id (and the painting viewport) every frame. Paint one id once per
+    /// frame: a second paint in the same frame shows the state without stepping it. A state not
+    /// painted for 120 frames and 2 seconds is freed; [`crate::reset_state`] zeroes it.
+    #[must_use]
+    pub fn id(mut self, id: Id) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    /// The layer's identity, if any.
+    #[must_use]
+    pub fn layer_id(&self) -> Option<Id> {
+        self.id
+    }
+
+    /// How the layer's persistent state is stored (resolution, format); ignored by chains
+    /// without a state pass. Default: full resolution, RGBA16F.
+    #[must_use]
+    pub fn state(mut self, options: StateOptions) -> Self {
+        self.state = options;
+        self
+    }
+
+    /// The state options.
+    #[must_use]
+    pub fn state_options(&self) -> StateOptions {
+        self.state
+    }
+
+    /// Whether the layer can keep its state: a chain with a state pass needs an id.
+    /// [`FilterLayer::paint`] runs this and skips the layer on an error (logged once per context).
+    ///
+    /// # Errors
+    /// [`StateError::MissingId`] naming the first state pass.
+    pub fn check_state(&self) -> Result<(), StateError> {
+        match self.chain.passes().iter().position(|pass| pass.effect().is_state()) {
+            Some(pass) if self.id.is_none() => Err(StateError::MissingId { effect: self.chain.passes()[pass].effect().label().to_owned(), pass }),
+            Some(_) | None => Ok(()),
+        }
     }
 
     /// Attaches the egui texture `id` at user texture `slot` (`0..TEXTURE_SLOTS`), which effects
@@ -207,6 +276,10 @@ impl FilterLayer {
             log_texture_error_once(ctx, &error);
             return;
         }
+        if let Err(error) = self.check_state() {
+            log_state_error_once(ctx, &error);
+            return;
+        }
         // An effect reading `fl.time` must keep moving in an otherwise idle app.
         if self.chain.is_animated() {
             ctx.request_repaint();
@@ -217,7 +290,11 @@ impl FilterLayer {
         let time = ctx.input(|input| input.time) as f32;
         let frame_input = frame_input(ctx);
         let padding_points = self.chain.padding_points();
-        let job = LayerJob { rect: self.rect, corner_radius: self.corner_radius, passes: self.chain.into_passes(), padding_points, time, frame_input, textures: self.textures };
+        let stateful = self.chain.passes().iter().any(|pass| pass.effect().is_state());
+        // Consumed only by a stateful layer's paint, so a request waits for the layer it targets.
+        let reset_state = stateful && self.id.is_some_and(|id| take_reset(ctx, id));
+        let viewport = ctx.viewport_id();
+        let job = LayerJob { rect: self.rect, corner_radius: self.corner_radius, passes: self.chain.into_passes(), padding_points, time, frame_input, textures: self.textures, id: self.id, viewport, state: self.state, reset_state };
         backend.paint_layer(painter, job);
     }
 }
@@ -252,6 +329,12 @@ mod tests {
         }
         fn failed_textures(&self) -> Vec<TextureFailure> {
             Vec::new()
+        }
+        fn failed_states(&self) -> Vec<crate::state::StateFailure> {
+            Vec::new()
+        }
+        fn state_count(&self) -> usize {
+            0
         }
         fn paint_layer(&self, _painter: &Painter, _job: LayerJob) {
             self.painted.fetch_add(1, Ordering::Relaxed);
@@ -310,6 +393,12 @@ mod tests {
         }
         fn failed_textures(&self) -> Vec<TextureFailure> {
             Vec::new()
+        }
+        fn failed_states(&self) -> Vec<crate::state::StateFailure> {
+            Vec::new()
+        }
+        fn state_count(&self) -> usize {
+            0
         }
         fn paint_layer(&self, _painter: &Painter, job: LayerJob) {
             self.inputs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(job.frame_input);
@@ -378,6 +467,73 @@ mod tests {
             output.textures_delta.clear();
             assert_eq!(backend.painted.swap(0, Ordering::Relaxed) > 0, attach, "attached: {attach}");
         }
+    }
+
+    /// A backend that keeps `(id, reset_state, stateful)` of every job.
+    struct Jobs {
+        jobs: std::sync::Mutex<Vec<(Option<Id>, bool, bool)>>,
+    }
+
+    impl Backend for Jobs {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Glow
+        }
+        fn status(&self) -> BackendStatus {
+            BackendStatus::Installed { backend: BackendKind::Glow }
+        }
+        fn failed_effects(&self) -> Vec<EffectFailure> {
+            Vec::new()
+        }
+        fn failed_textures(&self) -> Vec<TextureFailure> {
+            Vec::new()
+        }
+        fn failed_states(&self) -> Vec<crate::state::StateFailure> {
+            Vec::new()
+        }
+        fn state_count(&self) -> usize {
+            0
+        }
+        fn paint_layer(&self, _painter: &Painter, job: LayerJob) {
+            let stateful = job.state_key().is_some();
+            self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((job.id, job.reset_state, stateful));
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// F7: a stateful chain without an id never reaches the backend (`MissingId`); with one it
+    /// does, and a `reset_state` request is consumed by the next paint of that id only.
+    #[test]
+    fn stateful_layers_need_an_id_and_consume_resets() {
+        let Ok(state) = crate::Effect::new_state("sim", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state(uv); }") else { panic!("must compile") };
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0));
+        let (id, other) = (Id::new("water"), Id::new("other"));
+        assert_eq!(FilterLayer::new(rect, crate::Pass::new(&state)).check_state(), Err(StateError::MissingId { effect: "sim".to_owned(), pass: 0 }));
+        assert_eq!(FilterLayer::new(rect, crate::Pass::new(&state)).id(id).check_state(), Ok(()));
+        assert_eq!(FilterLayer::new(rect, presets::invert(1.0)).check_state(), Ok(()), "no state pass, no id needed");
+
+        let ctx = Context::default();
+        let backend = Arc::new(Jobs { jobs: std::sync::Mutex::new(Vec::new()) });
+        register(&ctx, Arc::clone(&backend) as Arc<dyn Backend>);
+        let frame = |paint: &dyn Fn(&Painter)| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| paint(&Painter::new(ui.ctx().clone(), LayerId::background(), Rect::EVERYTHING)));
+            output.textures_delta.clear();
+            std::mem::take(&mut *backend.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+        };
+        assert!(frame(&|painter| FilterLayer::new(rect, crate::Pass::new(&state)).paint(painter)).is_empty(), "refused before the backend");
+        crate::reset_state(&ctx, id);
+        // A stateless layer with the id and a stateful one with another id leave the request.
+        let jobs = frame(&|painter| {
+            FilterLayer::new(rect, presets::invert(1.0)).id(id).paint(painter);
+            FilterLayer::new(rect, crate::Pass::new(&state)).id(other).paint(painter);
+        });
+        assert_eq!(jobs, [(Some(id), false, false), (Some(other), false, true)]);
+        let jobs = frame(&|painter| {
+            FilterLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter);
+            FilterLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter);
+        });
+        assert_eq!(jobs, [(Some(id), true, true), (Some(id), false, true)], "consumed by the first paint of the id");
     }
 
     /// The "no backend installed" latch is per `Context`: set once per context, independent between contexts.

@@ -37,6 +37,9 @@ Four usage levels, lowest first: `VideoProcessor::process_frame*` (own decode lo
   minus the previous processed frame's, 0 first, never negative), advanced only after a
   successful frame and reset by `drive` per stream (`reset_frame_clock` for custom loops); values
   set explicitly in `OfflineOptions` win.
+- A stateful chain's state (F7) is the renderer's, so it continues from frame to frame; `drive`
+  resets it together with the frame clock per stream (`VideoProcessor::reset_state` for custom
+  loops).
 - The driver calls `begin` once, then `write_frame` per frame, then exactly one of `finish`
   (success) or `abort` (a frame-loop error or cancellation, after a successful `begin`); a
   failing `begin` or `finish` is not followed by `abort`. Cancellation is `ControlFlow::Break` from the

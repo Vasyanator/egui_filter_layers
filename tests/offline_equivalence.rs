@@ -21,6 +21,10 @@
 //!   attached as egui textures in the UI and as `OfflineTexture::from_color_image` offline is bit
 //!   for bit the same, tiled or whole; textures are uploaded once per `OfflineTexture`; missing and
 //!   invalid slots are typed errors.
+//! * Persistent state (F7): a state pass accumulates across `process` calls of one renderer,
+//!   `reset_state` starts over, a new frame size continues the state, a stateful chain refuses
+//!   tiling (`NotTileable`); the `wave_sim` preset spreads a centred impulse symmetrically and its
+//!   energy stays bounded over many frames.
 //! * The GPU tests of this file run one at a time (`GPU_TESTS`, see there).
 //!
 //! Needs a GPU adapter, so the tests are ignored by default:
@@ -31,7 +35,7 @@
 use std::sync::Arc;
 
 use egui::{Color32, ColorImage, Pos2, Rect, TextureOptions, ViewportId, ViewportInfo, pos2, vec2};
-use egui_filter_layers::{AlphaMode, BackendStatus, Effect, FilterChain, FilterLayer, FrameRef, OfflineOptions, OfflineRenderer, OfflineTexture, Pass, TEXTURE_SLOTS, WgpuOptions, install_wgpu, presets};
+use egui_filter_layers::{AlphaMode, BackendStatus, Effect, FilterChain, FilterLayer, FrameRef, Impulses, OfflineOptions, OfflineRenderer, OfflineTexture, Pass, StateOptions, TEXTURE_SLOTS, WgpuOptions, install_wgpu, presets};
 
 const WIDTH: u32 = 192;
 const HEIGHT: u32 = 128;
@@ -764,5 +768,140 @@ fn missing_and_invalid_textures_are_typed_errors() {
     match offline.process(&frame, &chain, &two.with_texture(2, too_large)) {
         Err(egui_filter_layers::OfflineError::TextureTooLarge { slot: 2, width, .. }) => assert_eq!(width, side),
         other => panic!("a texture beyond the device limit: {:?}", other.map(|frame| frame.width())),
+    }
+}
+
+// ---- F7: persistent state ----
+
+/// A state pass adding 0.25 per run (exact texel reads) and a display pass showing the state.
+fn accumulator() -> FilterChain {
+    let step = Effect::new_state("accumulate", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state_px(vec2<i32>(0)) + vec4<f32>(0.25); }").unwrap_or_else(|error| panic!("{error}"));
+    let show = Effect::new("show", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(min(state(uv).rgb, vec3<f32>(1.0)), 1.0); }").unwrap_or_else(|error| panic!("{error}"));
+    FilterChain::new().then(Pass::new(&step)).then(Pass::new(&show))
+}
+
+/// The grey an [`accumulator`] run shows after `runs` steps.
+fn accumulated(runs: usize) -> u8 {
+    [0, 64, 128, 191, 255].get(runs).copied().unwrap_or(255)
+}
+
+/// F7 offline: the renderer carries the state across `process` calls (4 calls reach 1.0),
+/// `reset_state` starts over, a larger frame continues the state (stretched), and a frame that
+/// would need tiles is refused.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn offline_state_accumulates_across_runs_and_refuses_tiling() {
+    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
+    let chain = accumulator();
+    let small = test_image(40, 30, |_, _| 255);
+    let large = test_image(120, 90, |_, _| 255);
+    let run = |offline: &mut OfflineRenderer, pixels: &[u8], width: u32, height: u32, options: &OfflineOptions| offline.process(&FrameRef::new(pixels, width, height, AlphaMode::Straight), &chain, options).unwrap_or_else(|error| panic!("{error}"));
+    for options in [OfflineOptions::default(), OfflineOptions::default().with_state(StateOptions::default().with_scale(0.5))] {
+        offline.reset_state();
+        for runs in 1..=4 {
+            let out = run(&mut offline, &small, 40, 30, &options);
+            assert!(out.pixels().chunks_exact(4).all(|px| px[..3].iter().all(|v| v.abs_diff(accumulated(runs)) <= 1)), "{options:?}: run {runs}");
+        }
+        offline.reset_state();
+        let out = run(&mut offline, &small, 40, 30, &options);
+        assert!(out.pixels()[..3].iter().all(|v| v.abs_diff(accumulated(1)) <= 1), "{options:?}: after reset_state");
+        let out = run(&mut offline, &large, 120, 90, &options);
+        assert!(out.pixels().chunks_exact(4).all(|px| px[..3].iter().all(|v| v.abs_diff(accumulated(2)) <= 1)), "{options:?}: a larger frame continues the state");
+    }
+    let tiled = offline.process(&FrameRef::new(&large, 120, 90, AlphaMode::Straight), &chain, &OfflineOptions::default().with_max_tile_size(Some(64)));
+    assert!(matches!(tiled, Err(egui_filter_layers::OfflineError::NotTileable { .. })), "{:?}", tiled.map(|frame| frame.width()));
+}
+
+/// F7: the water preset. One impulse at the centre of an odd-sized frame spreads as a ring that
+/// is symmetric under the square's reflections (texel for texel within one 8-bit step of the
+/// displayed height), reaches well away from the centre, and stays bounded: after the impulse
+/// stopped pushing, the discrete wave energy (`sum v^2 + speed * |grad h|^2 + restore * h^2`,
+/// estimated from the displayed height and velocity) never exceeds its peak by more than the
+/// 8-bit quantization and has decayed after 120 frames, and nothing saturates.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn wave_sim_spreads_an_impulse_symmetrically_and_stays_bounded() {
+    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
+    const SIDE: u32 = 65;
+    const GAIN: f64 = 0.25 * 255.0;
+    let centre = SIDE / 2;
+    let image = test_image(SIDE, SIDE, |_, _| 255);
+    let frame = FrameRef::new(&image, SIDE, SIDE, AlphaMode::Straight);
+    // Height (red) and velocity (green) shown around mid-grey: 0.5 + 0.25 * value, exact reads.
+    let show = Effect::new("height", "fn effect(uv: vec2<f32>) -> vec4<f32> { let s = state_px(vec2<i32>(0)); return vec4<f32>(clamp(vec2<f32>(0.5) + 0.25 * s.rg, vec2<f32>(0.0), vec2<f32>(1.0)), 0.5, 1.0); }").unwrap_or_else(|error| panic!("{error}"));
+    let mut impulses = Impulses::new(0.1);
+    assert!(impulses.push([0.5, 0.5], 20.0, 0.0));
+    let dt = 1.0 / 60.0;
+    let (mut energies, mut extremes) = (Vec::new(), Vec::new());
+    let mut reached = false;
+    for index in 0..120_u32 {
+        let now = f64::from(index) * f64::from(dt);
+        let sim = presets::wave_sim(&impulses, now, &[]).with("impulse_radius", 2.0).unwrap_or_else(|error| panic!("{error}"));
+        let chain = FilterChain::new().then(sim).then(Pass::new(&show));
+        let out = offline.process(&frame, &chain, &OfflineOptions::default().with_delta_time(dt)).unwrap_or_else(|error| panic!("{error}"));
+        let channel = |x: u32, y: u32, c: u32| out.pixels()[usize::try_from((y * SIDE + x) * 4 + c).unwrap_or(0)];
+        let grey = |x: u32, y: u32| channel(x, y, 0);
+        for d in 1..centre {
+            let axis = [grey(centre + d, centre), grey(centre - d, centre), grey(centre, centre + d), grey(centre, centre - d)];
+            let diagonal = [grey(centre + d, centre + d), grey(centre - d, centre - d), grey(centre + d, centre - d), grey(centre - d, centre + d)];
+            let knight = [grey(centre + d, centre + d / 2), grey(centre + d / 2, centre + d), grey(centre - d, centre - d / 2), grey(centre - d / 2, centre - d)];
+            for group in [axis, diagonal, knight] {
+                let (lo, hi) = (group.iter().min().copied().unwrap_or(0), group.iter().max().copied().unwrap_or(0));
+                assert!(hi - lo <= 1, "frame {index}, distance {d}: {group:?} is not symmetric");
+            }
+        }
+        let value = |x: u32, y: u32, c: u32| (f64::from(channel(x, y, c)) - 127.5) / GAIN;
+        reached |= (value(centre + 16, centre, 0)).abs() >= 0.05;
+        let mut energy = 0.0;
+        let mut extreme = 0_u8;
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let (h, v) = (value(x, y, 0), value(x, y, 1));
+                let dx = if x + 1 < SIDE { value(x + 1, y, 0) - h } else { 0.0 };
+                let dy = if y + 1 < SIDE { value(x, y + 1, 0) - h } else { 0.0 };
+                energy += v * v + 0.35 * (dx * dx + dy * dy) + 0.002 * h * h;
+                extreme = extreme.max(channel(x, y, 0).abs_diff(128)).max(channel(x, y, 1).abs_diff(128));
+            }
+        }
+        energies.push(energy);
+        extremes.push(extreme);
+    }
+    assert!(reached, "the ring must travel 16 texels away: energies {energies:?}");
+    assert!(extremes.iter().all(|&extreme| extreme < 120), "a value saturated (unstable): {extremes:?}");
+    // The impulse pushes during its 0.1 s life (6 frames); afterwards the damped energy may not
+    // grow (one quantization step of slack per texel: 1 / GAIN^2 each).
+    let slack = f64::from(SIDE * SIDE) * 2.0 / (GAIN * GAIN);
+    let peak = energies[7..].iter().copied().fold(0.0, f64::max);
+    assert!(peak > slack, "the impulse must have made waves: {energies:?}");
+    for (index, window) in energies[7..].windows(2).enumerate() {
+        assert!(window[1] <= window[0] * 1.02 + slack, "frame {}: energy grew {} -> {}: {energies:?}", index + 8, window[0], window[1]);
+    }
+    assert!(energies[119] < 0.8 * peak, "damping must drain energy: {energies:?}");
+}
+
+/// F7: `trails`: a white square moving over black leaves a trace that halves every second
+/// (`decay = 0.5`, one frame per second), while the square itself stays white.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn trails_fade_by_their_decay_per_second() {
+    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
+    const SIDE: u32 = 48;
+    let square_at = |left: u32| (0..SIDE).flat_map(|y| (0..SIDE).map(move |x| (x, y))).flat_map(|(x, y)| if (left..left + 8).contains(&x) && (20..28).contains(&y) { [255_u8; 4] } else { [0, 0, 0, 255] }).collect::<Vec<u8>>();
+    let chain = presets::trails(0.5);
+    let options = OfflineOptions::default().with_delta_time(1.0);
+    let mut red_at = Vec::new();
+    for left in [4, 16, 28] {
+        let pixels = square_at(left);
+        let out = offline.process(&FrameRef::new(&pixels, SIDE, SIDE, AlphaMode::Straight), &chain, &options).unwrap_or_else(|error| panic!("{error}"));
+        let red = |x: u32| out.pixels()[usize::try_from((24 * SIDE + x) * 4).unwrap_or(0)];
+        red_at.push([red(6), red(18), red(30)]);
+    }
+    // Rows: frames; columns: where the square was on frames 1, 2, 3.
+    let expected = [[255, 0, 0], [128, 255, 0], [64, 128, 255]];
+    for (row, want) in red_at.iter().zip(expected) {
+        assert!(row.iter().zip(want).all(|(value, want)| value.abs_diff(want) <= 1), "{red_at:?}");
     }
 }

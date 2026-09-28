@@ -40,6 +40,12 @@ Notes (GL state contract, checked against egui_glow 0.36.2 `painter.rs`):
   the SAME internal format with identical source/destination rects — both required by GLES 3 /
   WebGL2 for multisample blits — then blitted (single-sample, format-converting) into the
   capture. A buffer with no matching format skips only the layers painted into it.
+- Persistent state (F7): a stateful layer's two state targets live in `GlowState::states` (keyed by
+  viewport and id); they are grown keeping their content (`RenderTarget::ensure_kept`, a blit)
+  and the plan's empty one cleared before the passes, and the entry records where the latest state
+  is after a clean run (any other outcome forgets the content: the next run starts from zero).
+  RGBA16F state needs the float intermediates probe to have passed (renderable; half-float
+  filtering is core in GL 3.3 / GLES 3.0), else the layer is refused (`GlowState::fail_state`).
 - GL errors after the passes are attributed to the effects: with one distinct effect in the
   chain it is disabled directly; otherwise the chain's effects become "suspects" and later runs
   check after every pass until the culprit is found. Errors in capture / composite (the crate's
@@ -50,14 +56,15 @@ use std::collections::HashSet;
 
 use glow::HasContext as _;
 
-use super::GlowState;
+use super::{GlowState, StateTargets};
 use super::glsl::{GROUP0_TEXTURE_BINDINGS, GlslTarget, USER_UNIT_BASE};
-use super::resources::{GlError, PARAMS_BINDING_POINT, ParamsBuffer, ReadFormat, ReadFormatError, RenderTarget, ResolveTarget, Resources, UNIFORM_BINDING_POINT};
+use super::resources::{GlError, PARAMS_BINDING_POINT, ParamsBuffer, ReadFormat, ReadFormatError, RenderTarget, ResolveTarget, Resources, TargetFormat, UNIFORM_BINDING_POINT};
 use crate::backend::LayerJob;
-use crate::effect::{BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_SOURCE_TEXTURE, TEXTURE_SLOTS};
+use crate::effect::{BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, TEXTURE_SLOTS};
 use crate::geometry::{LayerGeometry, PxRect, layer_geometry, transform_scale};
 use crate::pass::{FrameUniforms, InputUniforms, UNIFORM_BLOCK_SIZE};
-use crate::plan::{Allocations, Bindings, ChainPlan, Slot, composite_params_block, composite_uniforms, params_block, plan, step_uniforms};
+use crate::plan::{Allocations, Bindings, ChainPlan, Slot, StatePlan, StatePlanInput, composite_params_block, composite_uniforms, params_block, plan, step_uniforms};
+use crate::state::StateFormat;
 
 /// Stand-in key for rejections that have no known format (no colour buffer, or a driver that
 /// cannot report it), so they are still logged only once.
@@ -124,8 +131,8 @@ struct LayerRun<'a> {
 /// How one layer run ended; applied to `GlowState` by [`paint_layer`].
 #[derive(Debug)]
 enum LayerOutcome {
-    /// Composited successfully.
-    Done,
+    /// Composited successfully; a stateful run says where the latest state now is.
+    Done(Option<StatePlan>),
     /// A crate-owned step failed: latch the whole backend.
     Latch {
         /// The step, for the log.
@@ -229,6 +236,13 @@ unsafe fn paint_saved(gl: &glow::Context, state: &mut GlowState, target: GlslTar
             }
         }
         let diagnose = job.passes.iter().any(|pass| state.suspects.contains(&pass.effect().module().id));
+        let state_key = job.state_key();
+        let state_format = job.state.format();
+        let float_targets = state.resources.as_ref().is_some_and(Resources::float_intermediates);
+        if state_key.is_some() && state_format == StateFormat::Rgba16Float && !float_targets {
+            state.fail_state(state_format, "RGBA16F is not renderable on this context (GLES / WebGL2 without EXT_color_buffer_float)".to_owned());
+            return;
+        }
         let Some(mut resources) = state.resources.take() else {
             return;
         };
@@ -236,8 +250,30 @@ unsafe fn paint_saved(gl: &glow::Context, state: &mut GlowState, target: GlslTar
         let input = job.frame_input.resolve(info.pixels_per_point, geometry.capture);
         let run = LayerRun { geometry, job, input, screen, caller, embedded: target != GlslTarget::Desktop330, user_textures };
 
+        // Unpainted states are freed at every paint (GL is current here), then this layer's
+        // entry is looked up (a format change replaces its targets, freed too).
+        let (frame, time) = (job.frame_input.frame, f64::from(job.time));
+        GlowState::free_state_targets(gl, state.states.evict(job.viewport, frame, time));
+        let mut entry = state_key.map(|key| state.states.begin(key, state_format, frame, time, job.reset_state, || [None, None]));
+        if let Some((_, _, replaced)) = entry.as_mut() {
+            GlowState::free_state_targets(gl, replaced.take());
+        }
         drain_errors(gl);
-        let outcome = run_layer(gl, &mut resources, &run, &programs, diagnose);
+        let outcome = {
+            let mut layer_state = entry.as_mut().map(|(entry, run, _)| LayerState {
+                targets: &mut entry.targets,
+                format: if state_format == StateFormat::Rgba16Float { TargetFormat::Rgba16F } else { TargetFormat::Rgba8 },
+                input: StatePlanInput { scale: job.state.scale(), current: run.current, previous_px: run.previous, step: run.step },
+            });
+            run_layer(gl, &mut resources, &run, &programs, diagnose, layer_state.as_mut())
+        };
+        if let Some((entry, run, _)) = entry {
+            match &outcome {
+                LayerOutcome::Done(Some(state_plan)) => entry.finish(run, frame, state_plan.final_index, state_plan.final_px),
+                // Not run (or not cleanly): the content is unknown, start over from zero.
+                _ => entry.invalidate(),
+            }
+        }
         cleanup(gl);
         apply_outcome(gl, state, &mut resources, job, outcome);
         state.resources = Some(resources);
@@ -251,7 +287,7 @@ unsafe fn paint_saved(gl: &glow::Context, state: &mut GlowState, target: GlslTar
 unsafe fn apply_outcome(gl: &glow::Context, state: &mut GlowState, resources: &mut Resources, job: &LayerJob, outcome: LayerOutcome) {
     let modules = || job.passes.iter().map(|pass| pass.effect().module());
     match outcome {
-        LayerOutcome::Done => {
+        LayerOutcome::Done(_) => {
             // A clean run of the whole chain clears its suspects.
             for module in modules() {
                 state.suspects.remove(&module.id);
@@ -287,11 +323,23 @@ unsafe fn apply_outcome(gl: &glow::Context, state: &mut GlowState, resources: &m
     }
 }
 
+/// A stateful layer's state for one run: its two targets (kept in `GlowState::states`), their
+/// format and what the registry knows of them.
+struct LayerState<'a> {
+    /// `Slot::StateA` / `Slot::StateB`.
+    targets: &'a mut StateTargets,
+    /// Storage format.
+    format: TargetFormat,
+    /// The plan's input.
+    input: StatePlanInput,
+}
+
 /// Capture, passes and composite of one layer. Leaves bindings for `paint_layer` to restore.
+/// A stateful job needs `layer_state`; its targets are grown (keeping content) and cleared here.
 ///
 /// # Safety
 /// `gl` must be current on this thread; `programs` matches `run.job.passes`.
-unsafe fn run_layer(gl: &glow::Context, resources: &mut Resources, run: &LayerRun<'_>, programs: &[glow::Program], diagnose: bool) -> LayerOutcome {
+unsafe fn run_layer(gl: &glow::Context, resources: &mut Resources, run: &LayerRun<'_>, programs: &[glow::Program], diagnose: bool, layer_state: Option<&mut LayerState<'_>>) -> LayerOutcome {
     // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); `resources` and `programs` were created on this context and are alive, and `programs` matches `run.job.passes` (caller contract).
     unsafe {
         gl.disable(glow::SCISSOR_TEST);
@@ -314,8 +362,9 @@ unsafe fn run_layer(gl: &glow::Context, resources: &mut Resources, run: &LayerRu
         // glow always computes the whole capture (fragment mode 0 interpolates over the viewport);
         // the composite's origin is the capture's screen position, as on the wgpu UI.
         let attached = run.user_textures.map(|texture| texture.is_some());
-        let Some(plan) = plan(&run.job.passes, capture.size(), PxRect { x: 0, y: 0, w: capture.w, h: capture.h }, [capture.x, capture.y], attached) else {
-            return LayerOutcome::Done;
+        let state_input = layer_state.as_ref().map(|state| state.input);
+        let Some(plan) = plan(&run.job.passes, capture.size(), PxRect { x: 0, y: 0, w: capture.w, h: capture.h }, [capture.x, capture.y], attached, state_input) else {
+            return LayerOutcome::Done(None);
         };
         // Both ping-pong targets hold every step's viewport (the plan's pool size).
         let needed = plan.target_px.map(|side| i32::try_from(side).unwrap_or(i32::MAX));
@@ -325,9 +374,26 @@ unsafe fn run_layer(gl: &glow::Context, resources: &mut Resources, run: &LayerRu
                 return LayerOutcome::Latch { what: "allocating an intermediate target", error: error.to_string() };
             }
         }
-        let allocations = allocations(resources);
-
-        match run_passes(gl, resources, run, &plan, &allocations, programs, diagnose) {
+        // State targets: grown keeping the latest content, the empty one cleared.
+        let states: Option<&StateTargets> = match (plan.state, layer_state) {
+            (Some(state_plan), Some(layer_state)) => {
+                let needed = state_plan.target_px.map(|side| i32::try_from(side).unwrap_or(i32::MAX));
+                for slot in layer_state.targets.iter_mut() {
+                    if let Err(error) = RenderTarget::ensure_kept(slot, gl, layer_state.format, needed, max) {
+                        return LayerOutcome::Latch { what: "allocating a state target", error: error.to_string() };
+                    }
+                }
+                if let Some(clear) = state_plan.clear
+                    && let Some(target) = layer_state.targets.get(usize::from(clear == Slot::StateB)).and_then(Option::as_ref)
+                {
+                    target.clear(gl);
+                }
+                Some(&*layer_state.targets)
+            }
+            (Some(_), None) => return LayerOutcome::Done(None),
+            (None, _) => None,
+        };
+        match run_passes(gl, resources, states, run, &plan, programs, diagnose) {
             Ok(Some((index, error))) => return LayerOutcome::PassFailed { index, error },
             Ok(None) => {}
             Err(error) => return LayerOutcome::Latch { what: "uploading a named-parameter block", error: error.to_string() },
@@ -339,15 +405,15 @@ unsafe fn run_layer(gl: &glow::Context, resources: &mut Resources, run: &LayerRu
             return LayerOutcome::PassesFailed { error: pass_error };
         }
 
-        if let Err(error) = composite(gl, resources, run, &plan, &allocations) {
+        if let Err(error) = composite(gl, resources, states, run, &plan) {
             return LayerOutcome::Latch { what: "uploading the composite's parameter block", error: error.to_string() };
         }
         let error = gl.get_error();
         if error != glow::NO_ERROR {
             return LayerOutcome::Latch { what: "compositing the filtered region", error: format!("GL error 0x{error:04x}") };
         }
+        LayerOutcome::Done(plan.state)
     }
-    LayerOutcome::Done
 }
 
 /// Why [`capture`] did not copy the backdrop.
@@ -506,19 +572,23 @@ fn frame_uniforms(geometry: &LayerGeometry, time: f32) -> FrameUniforms {
     FrameUniforms::for_layer(geometry, time, true)
 }
 
-/// The GL target a plan slot names.
-fn target_of(resources: &Resources, slot: Slot) -> &RenderTarget {
+/// The GL target a plan slot names, or `None` for a state slot without state targets (no plan
+/// binds one: a state slot exists only with `plan.state`, whose targets `run_layer` created).
+fn target_of<'a>(resources: &'a Resources, states: Option<&'a StateTargets>, slot: Slot) -> Option<&'a RenderTarget> {
     match slot {
-        Slot::Source => &resources.capture,
-        Slot::Ping => &resources.ping_pong[0],
-        Slot::Pong => &resources.ping_pong[1],
+        Slot::Source => Some(&resources.capture),
+        Slot::Ping => Some(&resources.ping_pong[0]),
+        Slot::Pong => Some(&resources.ping_pong[1]),
+        Slot::StateA => states.and_then(|states| states[0].as_ref()),
+        Slot::StateB => states.and_then(|states| states[1].as_ref()),
     }
 }
 
-/// The allocated sizes of the capture and the ping-pong targets (the plan maps each step's
-/// content, held at its target's `(0, 0)` corner, through them).
-fn allocations(resources: &Resources) -> Allocations {
-    Allocations { source: resources.capture.allocated_px(), ping_pong: [resources.ping_pong[0].allocated_px(), resources.ping_pong[1].allocated_px()] }
+/// The allocated sizes of the capture, the ping-pong and the state targets (the plan maps each
+/// step's content, held at its target's `(0, 0)` corner, through them).
+fn allocations(resources: &Resources, states: Option<&StateTargets>) -> Allocations {
+    let state = |index: usize| states.and_then(|states| states[index].as_ref()).map_or([0, 0], RenderTarget::allocated_px);
+    Allocations { source: resources.capture.allocated_px(), ping_pong: [resources.ping_pong[0].allocated_px(), resources.ping_pong[1].allocated_px()], state: [state(0), state(1)] }
 }
 
 /// Binds every texture of one draw on its texture units (`glsl.rs`): the `@group(0)` textures on
@@ -528,7 +598,7 @@ fn allocations(resources: &Resources) -> Allocations {
 ///
 /// # Safety
 /// `gl` must be current on this thread; `resources` and `user_textures` alive on it.
-unsafe fn bind_textures(gl: &glow::Context, resources: &Resources, bindings: Bindings, user_textures: &[Option<glow::Texture>; TEXTURE_SLOTS]) {
+unsafe fn bind_textures(gl: &glow::Context, resources: &Resources, states: Option<&StateTargets>, bindings: Bindings, user_textures: &[Option<glow::Texture>; TEXTURE_SLOTS]) {
     // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); every texture belongs to `resources` or is one of egui_glow's live user textures (caller contract).
     unsafe {
         for ((unit, bind), texture) in (USER_UNIT_BASE..).zip(bindings.user).zip(user_textures) {
@@ -538,13 +608,16 @@ unsafe fn bind_textures(gl: &glow::Context, resources: &Resources, bindings: Bin
             gl.active_texture(glow::TEXTURE0 + unit);
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
         }
+        // A slot the plan binds always has a target (see `target_of`); the dummies stand only for
+        // bindings the plan leaves empty.
+        let texture_of = |slot: Option<Slot>| slot.and_then(|slot| target_of(resources, states, slot)).map_or(resources.transparent, |target| target.texture);
         for (unit, binding) in (0_u32..).zip(GROUP0_TEXTURE_BINDINGS) {
             let texture = match binding {
-                BINDING_SOURCE_TEXTURE => target_of(resources, bindings.src).texture,
-                BINDING_ORIGINAL_TEXTURE => bindings.original.map_or(resources.transparent, |slot| target_of(resources, slot).texture),
+                BINDING_SOURCE_TEXTURE => texture_of(Some(bindings.src)),
+                BINDING_ORIGINAL_TEXTURE => texture_of(bindings.original),
+                BINDING_STATE_TEXTURE => texture_of(bindings.state),
                 BINDING_COVERAGE_TEXTURE => resources.white,
-                // `BINDING_STATE_TEXTURE` (no chain has state); `GROUP0_TEXTURE_BINDINGS` holds
-                // nothing else.
+                // `GROUP0_TEXTURE_BINDINGS` holds nothing else.
                 _ => resources.transparent,
             };
             gl.active_texture(glow::TEXTURE0 + unit);
@@ -554,7 +627,7 @@ unsafe fn bind_textures(gl: &glow::Context, resources: &Resources, bindings: Bin
     }
 }
 
-/// Runs every pass step of `plan` into its ping-pong target.
+/// Runs every pass step of `plan` into its ping-pong or state target (`target_of`).
 ///
 /// With `diagnose`, checks `glGetError` after every pass and stops at the first failing one,
 /// returning `(pass index, error)`; otherwise the caller checks once after all passes.
@@ -562,21 +635,22 @@ unsafe fn bind_textures(gl: &glow::Context, resources: &Resources, bindings: Bin
 /// # Safety
 /// `gl` must be current on this thread; targets must be at least `plan.target_px`; `programs`
 /// matches `run.job.passes`; no GL error may be pending on entry.
-unsafe fn run_passes(gl: &glow::Context, resources: &mut Resources, run: &LayerRun<'_>, plan: &ChainPlan, allocations: &Allocations, programs: &[glow::Program], diagnose: bool) -> Result<Option<(usize, u32)>, GlError> {
+unsafe fn run_passes(gl: &glow::Context, resources: &mut Resources, states: Option<&StateTargets>, run: &LayerRun<'_>, plan: &ChainPlan, programs: &[glow::Program], diagnose: bool) -> Result<Option<(usize, u32)>, GlError> {
+    let allocations = allocations(resources, states);
     let frame = frame_uniforms(&run.geometry, run.job.time).with_input(&run.input);
     // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); targets are at least the plan's pool size and `programs` matches `run.job.passes` (caller contract); all objects are alive on this context.
     unsafe {
         gl.bind_vertex_array(Some(resources.vertex_array));
         for step in &plan.steps {
             // `plan` was built from `run.job.passes`, which `programs` matches one to one.
-            let (Some(pass), Some(program)) = (run.job.passes.get(step.pass), programs.get(step.pass)) else {
+            let (Some(pass), Some(program), Some(output)) = (run.job.passes.get(step.pass), programs.get(step.pass), target_of(resources, states, step.output)) else {
                 continue;
             };
-            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(target_of(resources, step.output).framebuffer));
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(output.framebuffer));
             gl.viewport(0, 0, step.used_px[0], step.used_px[1]);
             gl.use_program(Some(*program));
-            bind_textures(gl, resources, step.bindings, &run.user_textures);
-            upload_uniforms(gl, resources.uniform_buffer, &step_uniforms(&frame, plan, step, allocations, pass));
+            bind_textures(gl, resources, states, step.bindings, &run.user_textures);
+            upload_uniforms(gl, resources.uniform_buffer, &step_uniforms(&frame, plan, step, &allocations, pass));
             upload_params(gl, &mut resources.params, params_block(pass))?;
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             if diagnose {
@@ -598,9 +672,9 @@ unsafe fn run_passes(gl: &glow::Context, resources: &mut Resources, run: &LayerR
 ///
 /// # Safety
 /// `gl` must be current on this thread; the passes of `plan` have run.
-unsafe fn composite(gl: &glow::Context, resources: &mut Resources, run: &LayerRun<'_>, plan: &ChainPlan, allocations: &Allocations) -> Result<(), GlError> {
+unsafe fn composite(gl: &glow::Context, resources: &mut Resources, states: Option<&StateTargets>, run: &LayerRun<'_>, plan: &ChainPlan) -> Result<(), GlError> {
     let geometry = &run.geometry;
-    let bytes = composite_uniforms(&frame_uniforms(geometry, run.job.time).with_input(&run.input), plan, allocations, geometry);
+    let bytes = composite_uniforms(&frame_uniforms(geometry, run.job.time).with_input(&run.input), plan, &allocations(resources, states), geometry);
     let region = gl_rect(geometry.region, run.screen[1]);
     // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); the passes ran (caller contract), so the plan's composite source holds their output; all objects are alive on this context.
     unsafe {
@@ -608,7 +682,7 @@ unsafe fn composite(gl: &glow::Context, resources: &mut Resources, run: &LayerRu
         gl.viewport(region[0], region[1], geometry.region.w, geometry.region.h);
         gl.enable(glow::SCISSOR_TEST);
         gl.use_program(Some(resources.composite));
-        bind_textures(gl, resources, plan.composite.bindings, &run.user_textures);
+        bind_textures(gl, resources, states, plan.composite.bindings, &run.user_textures);
         upload_uniforms(gl, resources.uniform_buffer, &bytes);
         upload_params(gl, &mut resources.params, composite_params_block())?;
         gl.draw_arrays(glow::TRIANGLES, 0, 3);
@@ -664,13 +738,13 @@ mod tests {
         let rect = Rect::from_min_size(pos2(40.0, 30.0), vec2(120.0, 80.0));
         let Some(geometry) = layer_geometry(rect, Rect::EVERYTHING, 1.5, [800, 600], 6.0, CornerRadius::same(8), 1.0) else { panic!("visible") };
         let capture = geometry.capture;
-        let Some(glow_plan) = plan(&passes, capture.size(), PxRect { x: 0, y: 0, w: capture.w, h: capture.h }, [capture.x, capture.y], [false, true, false]) else { panic!("planned") };
+        let Some(glow_plan) = plan(&passes, capture.size(), PxRect { x: 0, y: 0, w: capture.w, h: capture.h }, [capture.x, capture.y], [false, true, false], None) else { panic!("planned") };
         let window = ChainWindow::whole(&geometry, [capture.x, capture.y]);
-        let Some(wgpu_plan) = plan(&passes, capture.size(), window.rect, window.composite_origin, [false, true, false]) else { panic!("planned") };
+        let Some(wgpu_plan) = plan(&passes, capture.size(), window.rect, window.composite_origin, [false, true, false], None) else { panic!("planned") };
         assert_eq!(glow_plan, wgpu_plan);
 
         let used = capture.size().map(|side| u32::try_from(side).unwrap_or(0));
-        let allocations = Allocations { source: [256, 256], ping_pong: [[320, 192], used] };
+        let allocations = Allocations { source: [256, 256], ping_pong: [[320, 192], used], state: [[0, 0]; 2] };
         let time = 1.25;
         let wgpu_uniforms = chain_uniforms(&wgpu_frame_uniforms(&geometry, time), &wgpu_plan, &passes, &geometry, &allocations, 256);
         let glow_frame = frame_uniforms(&geometry, time);

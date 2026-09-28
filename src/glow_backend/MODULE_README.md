@@ -15,7 +15,10 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
    the layer for non-normalized formats; multisampled -> resolve with identical rects into a
    renderbuffer of the SAME internal format, then blit the padded capture rect into the RGBA8
    capture texture;
-5. plan the run (`plan::plan`, whole capture), grow the ping-pong targets to the plan's
+5. plan the run (`plan::plan`, whole capture; a stateful layer's `GlowState::states` entry, looked
+   up after evicting unpainted ones, feeds its state input), grow its state targets keeping their
+   content (`RenderTarget::ensure_kept`: new texture + blit) and clear the one the plan names,
+   grow the ping-pong targets to the plan's
    `target_px`, and run its pass steps into them at `(0, 0, used_px)` (smaller for scaled
    passes; mode-0 uv interpolation over that viewport needs nothing else), binding every texture
    unit per draw (the plan's `@group(0)` slots and attached user textures, dummies elsewhere) and
@@ -32,7 +35,8 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
 - `glsl.rs`: pure WGSL->GLSL translation (naga `glsl-out`, empty writer flags), dialect choice,
   the reflected `fl` and named-parameter block names (by `@binding` 0 / 4), and the texture-unit table of the prelude's layout (`GROUP0_TEXTURE_BINDINGS`,
   `USER_UNIT_BASE`).
-- `resources.rs`: `GlError`, `RenderTarget`, `ParamsBuffer` (grow-only params UBO), `Resources`
+- `resources.rs`: `GlError`, `RenderTarget` (incl. `ensure_kept` / `clear` for state targets),
+  `ParamsBuffer` (grow-only params UBO), `Resources`
   (incl. dummy textures), `build_program` (all GL object code).
 - `render.rs`: the per-layer GL sequence and state restoration.
 
@@ -50,6 +54,12 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   before painting and frees after it, so an id resolved in the callback is current and alive.
 - Every wiring decision (which slot a draw binds and writes, mappings, uniform bytes) comes from
   `src/plan.rs`; this module maps `plan::Slot` to `RenderTarget`s only.
+- State (F7): per `(viewport, id)` two `RenderTarget`s in `GlowState::states` (RGBA16F only when the
+  float-intermediate probe passed — half-float filtering is core in GL 3.3 / GLES 3.0 — else the
+  layer is refused, `GlowState::fail_state`; RGBA8 opt-in), sampled on unit 2 (`state()`,
+  `texelFetch` for `state_load`); an entry is updated only by a clean run (`LayerOutcome::Done`),
+  any other outcome forgets its content. Evicted / replaced targets are freed in the paint
+  callback; `destroy_glow` frees all.
 - Backend-wide failures (resource creation, unexplained capture / composite GL error) latch
   `GlowState::failure`; per-effect failures (translation, compile/link, a GL error of that
   effect's draw — attributed directly for single-effect chains, else by per-pass checks on later

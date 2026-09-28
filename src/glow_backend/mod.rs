@@ -9,7 +9,8 @@ Key structures:
 - `GlowBackend`: the registered backend (`Arc<Mutex<GlowState>>` + chosen GLSL dialect).
 - `GlowState`: lazily created `Resources`, per-effect program cache, failure latches, effects
   under per-pass GL error diagnosis (`suspects`), attached user textures that could not be
-  resolved (`failed_textures`).
+  resolved (`failed_textures`), persistent layer states (`states`, F7) and refused state formats
+  (`failed_states`).
 
 Key functions:
 - `install_glow()`, `destroy_glow()` (public).
@@ -41,8 +42,13 @@ use glow::HasContext as _;
 
 use crate::backend::{Backend, BackendKind, BackendStatus, EffectFailure, InstallError, LayerJob, TextureFailure, installed, register, uninstall};
 use crate::effect::{CompiledModule, TEXTURE_SLOTS};
+use crate::state::{StateError, StateFailure, StateFormat, StateRegistry};
 use glsl::{GlslTarget, glsl_target, translate};
-use resources::{GlError, Resources, build_program};
+use resources::{GlError, RenderTarget, Resources, build_program};
+
+/// The two state textures of one stateful layer (`Slot::StateA` / `StateB`), created and grown
+/// by `render.rs`.
+type StateTargets = [Option<RenderTarget>; 2];
 
 /// A compiled effect program and the module it was built from (to evict it once dropped).
 #[derive(Debug)]
@@ -79,6 +85,10 @@ pub(crate) struct GlowState {
     /// Attached user textures `egui_glow::Painter::texture` could not resolve, by id (egui never
     /// reuses an id, so an entry is permanent).
     failed_textures: HashMap<egui::TextureId, TextureFailure>,
+    /// Persistent layer states (F7), by viewport and layer id; freed by eviction and `destroy`.
+    states: StateRegistry<StateTargets>,
+    /// State formats this context cannot render / filter, latched per format.
+    failed_states: HashMap<StateFormat, StateFailure>,
     /// Set by `destroy_glow`; a late callback must not recreate resources.
     destroyed: bool,
 }
@@ -152,6 +162,27 @@ impl GlowState {
         self.failed_textures.insert(id, TextureFailure { id, error });
     }
 
+    /// Records that stateful layers asking for `format` are refused and logs it once per format.
+    fn fail_state(&mut self, format: StateFormat, reason: String) {
+        if self.failed_states.contains_key(&format) {
+            return;
+        }
+        let error = StateError::UnsupportedFormat { format, reason };
+        log::error!("egui_filter_layers (glow): stateful filter layers are skipped (they draw nothing extra).\nError: {error}");
+        self.failed_states.insert(format, StateFailure { format, error });
+    }
+
+    /// Frees the GL objects of `targets` (evicted or replaced state targets).
+    ///
+    /// # Safety
+    /// `gl` must be current on this thread and own the targets.
+    unsafe fn free_state_targets(gl: &glow::Context, targets: impl IntoIterator<Item = StateTargets>) {
+        for target in targets.into_iter().flatten().flatten() {
+            // SAFETY: forwarded contract.
+            unsafe { target.destroy(gl) };
+        }
+    }
+
     /// The program for `module`, building and caching it on first use.
     ///
     /// Returns `None` when this effect failed (now or earlier); the failure is logged once.
@@ -196,7 +227,9 @@ impl GlowState {
             for (_, entry) in self.programs.drain() {
                 gl.delete_program(entry.program);
             }
+            Self::free_state_targets(gl, self.states.drain());
         }
+        self.failed_states.clear();
         self.failed_effects.clear();
         self.failed_textures.clear();
         self.suspects.clear();
@@ -258,6 +291,14 @@ impl Backend for GlowBackend {
 
     fn failed_textures(&self) -> Vec<TextureFailure> {
         self.lock().failed_textures.values().cloned().collect()
+    }
+
+    fn failed_states(&self) -> Vec<StateFailure> {
+        self.lock().failed_states.values().cloned().collect()
+    }
+
+    fn state_count(&self) -> usize {
+        self.lock().states.len()
     }
 
     fn paint_layer(&self, painter: &egui::Painter, job: LayerJob) {

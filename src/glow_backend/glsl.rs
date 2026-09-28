@@ -202,8 +202,11 @@ mod tests {
             let Ok(effect) = Effect::new(label, source) else { panic!("{label} must validate") };
             for target in TARGETS {
                 match translate(effect.module(), target) {
-                    // Unit 0 = the pass input; built-ins reading `original()` (bloom) also unit 1.
-                    Ok(program) => check_program(label, &program, target, if source.contains("original(") { &[0, 1] } else { &[0] }),
+                    // Unit 0 = the pass input, 1 = `original()` (bloom), 2 = the state (F7).
+                    Ok(program) => {
+                        let units: Vec<u32> = [("src", 0), ("original(", 1), ("state", 2)].iter().filter(|(name, _)| source.contains(name)).map(|&(_, unit)| unit).collect();
+                        check_program(label, &program, target, &units);
+                    }
                     Err(error) => panic!("{label} {target:?}: {error}"),
                 }
             }
@@ -289,6 +292,31 @@ mod tests {
                     assert!(program.fragment.contains("texelFetch") && program.fragment.contains("textureLod") && program.fragment.contains("textureSize"), "{target:?}\n{}", program.fragment);
                 }
                 Err(error) => panic!("textures {target:?}: {error}"),
+            }
+        }
+    }
+
+    /// F7: sampled (`state`) and exact (`state_load` / `state_px`, `texelFetch`) reads of the
+    /// state share ONE combined sampler on unit 2, beside the pass input and a user texture read
+    /// both ways — no texture is read through two samplers, so every dialect translates it.
+    #[test]
+    fn state_helpers_translate_with_src_and_a_user_texture() {
+        let snippet = "fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let exact = state_load(vec2<i32>(2, 3)) + state_px(vec2<i32>(-1, 0)) * state_size().x * state_texel().y;
+    return state(uv) + exact + src(uv) + tex(0u, uv) + tex_load(0u, vec2<i32>(0));
+}";
+        for build in [Effect::new_state, Effect::new] {
+            let effect = build("state", snippet);
+            let Ok(effect) = effect else { panic!("{effect:?}") };
+            for target in TARGETS {
+                match translate(effect.module(), target) {
+                    Ok(program) => {
+                        // `tex(0u, ..)` switches over every slot, so all three user units are referenced.
+                        check_program("state", &program, target, &[0, 2, USER_UNIT_BASE, USER_UNIT_BASE + 1, USER_UNIT_BASE + 2]);
+                        assert!(program.fragment.contains("texelFetch") && program.fragment.contains("textureLod"), "{target:?}\n{}", program.fragment);
+                    }
+                    Err(error) => panic!("state {target:?}: {error}"),
+                }
             }
         }
     }

@@ -22,7 +22,8 @@ Detection runs BEFORE the parse because a snippet reading `p.x` does not parse w
 appended `var<uniform> p: Params;`; naga's IR then confirms it (the struct is found by name).
 
 ## Files and submodules
-- `mod.rs`: `Effect` (incl. `reads_texture`), `EffectError`, `CompiledModule`, binding constants
+- `mod.rs`: `Effect` (incl. `reads_texture`; `new_state` / `is_state`: a state pass, F7 — the
+  same module, flagged on the `Effect`), `EffectError`, `CompiledModule`, binding constants
   (`@group(0)` bindings, user texture groups, public `TEXTURE_SLOTS`), `compile()`, the internal
   composite modules.
 - `diagnostics.rs`: `SnippetLocation`, `Assembled` (where prelude / snippet / tail lie; naga

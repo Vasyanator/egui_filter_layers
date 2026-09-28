@@ -16,6 +16,7 @@ Key structures:
 
 Key functions:
 - `register()` / `installed()` / `uninstall()` (crate-internal): the per-context registry.
+- `LayerJob::is_stateful()`: whether a job carries persistent state (a state pass, F7).
 - `status()`, `failed_effects()`, `failed_textures()` (public, re-exported at the crate root).
 
 Notes:
@@ -29,11 +30,12 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use egui::{Context, CornerRadius, Painter, Pos2, Rect, TextureId};
+use egui::{Context, CornerRadius, Id, Painter, Pos2, Rect, TextureId, ViewportId};
 
 use crate::effect::TEXTURE_SLOTS;
 use crate::geometry::{PxRect, pointer_uniform};
 use crate::pass::{InputUniforms, Pass};
+use crate::state::{StateFailure, StateOptions};
 
 /// Which GPU backend a status refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -184,6 +186,23 @@ pub(crate) struct LayerJob {
     /// The user texture attached at each slot (`FilterLayer::texture`); every slot an effect of
     /// `passes` reads is `Some` (checked by `plan::check_textures` before the job is built).
     pub textures: [Option<TextureId>; TEXTURE_SLOTS],
+    /// `FilterLayer::id`; `Some` whenever a pass is a state pass (checked before the job is built).
+    pub id: Option<Id>,
+    /// The viewport whose pass painted the layer (states are kept per viewport and id).
+    pub viewport: ViewportId,
+    /// `FilterLayer::state`.
+    pub state: StateOptions,
+    /// A `reset_state` request for `id` was consumed by this paint: start from zero.
+    pub reset_state: bool,
+}
+
+impl LayerJob {
+    /// The layer's state key when the job is stateful (a state pass and an id), else `None`.
+    #[must_use]
+    pub(crate) fn state_key(&self) -> Option<crate::state::StateKey> {
+        let id = self.id?;
+        self.passes.iter().any(|pass| pass.effect().is_state()).then_some(crate::state::StateKey { viewport: self.viewport, id })
+    }
 }
 
 /// The pointer as the GUI thread saw it when the layer was painted.
@@ -237,6 +256,10 @@ pub(crate) trait Backend: Send + Sync + 'static {
     fn failed_effects(&self) -> Vec<EffectFailure>;
     /// Attached user textures this backend could not resolve.
     fn failed_textures(&self) -> Vec<TextureFailure>;
+    /// State formats this backend refused (F7).
+    fn failed_states(&self) -> Vec<StateFailure>;
+    /// How many layer states the backend holds (F7, a debug accessor).
+    fn state_count(&self) -> usize;
     /// Paints one filter layer. Must never panic; failures are latched and logged.
     fn paint_layer(&self, painter: &Painter, job: LayerJob);
     /// Downcasting hook for backend-specific teardown (e.g. `destroy_glow`).
@@ -336,6 +359,12 @@ mod tests {
         }
         fn failed_textures(&self) -> Vec<TextureFailure> {
             Vec::new()
+        }
+        fn failed_states(&self) -> Vec<StateFailure> {
+            Vec::new()
+        }
+        fn state_count(&self) -> usize {
+            0
         }
         fn paint_layer(&self, _painter: &Painter, _job: LayerJob) {}
         fn as_any(&self) -> &dyn Any {

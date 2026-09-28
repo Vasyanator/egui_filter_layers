@@ -15,7 +15,9 @@
 //! passes (F6): the same scaled-identity, kawase and bloom scenes as `wgpu_headless.rs`, and like
 //! it: `original()` in later passes (F1), `fl.pointer` / `fl.delta_time` / `fl.frame` (F2), and
 //! user textures (F8: exact / nearest / linear reads, full and partial updates, three slots,
-//! unknown / freed / missing textures).
+//! unknown / freed / missing textures), and persistent state (F7: accumulation over frames in
+//! RGBA16F and RGBA8, reset, one step per frame for an id painted twice, growth keeping the state,
+//! a missing id refused).
 //!
 //! Linux only (EGL device platform, Mesa or a vendor EGL). Needs a GPU or Mesa's software
 //! device, so it is ignored by default: `cargo test --all-features --test glow_headless -- --ignored`.
@@ -27,7 +29,7 @@ use std::sync::Arc;
 
 use egui::emath::TSTransform;
 use egui::{Color32, ColorImage, Pos2, Rect, TextureOptions, pos2, vec2};
-use egui_filter_layers::{BackendKind, BackendStatus, Effect, FilterChain, FilterLayer, Pass, destroy_glow, install_glow, presets};
+use egui_filter_layers::{BackendKind, BackendStatus, Effect, FilterChain, FilterLayer, Pass, StateFormat, StateOptions, destroy_glow, install_glow, presets};
 use glow::HasContext as _;
 use glutin::api::egl::context::PossiblyCurrentContext;
 use glutin::api::egl::device::Device;
@@ -959,4 +961,78 @@ fn unknown_freed_and_missing_textures_skip_their_layer_only() {
     let mut expected = vec![unknown, freed];
     expected.sort_by_key(|id| format!("{id:?}"));
     assert_eq!(failed, expected);
+}
+
+/// F7: a state pass adding 0.25 per frame (exact texel reads) and a display pass showing it.
+fn accumulator() -> FilterChain {
+    let step = match Effect::new_state("accumulate", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state_px(vec2<i32>(0)) + vec4<f32>(0.25); }") {
+        Ok(effect) => Pass::new(&effect),
+        Err(error) => panic!("{error}"),
+    };
+    FilterChain::new().then(step).then(pass("show", "fn effect(uv: vec2<f32>) -> vec4<f32> { return min(state(uv), vec4<f32>(1.0)); }"))
+}
+
+/// The value (0..=255) an [`accumulator`] layer shows after `frames` steps.
+fn accumulated(frames: u32) -> u8 {
+    [0, 64, 128, 191, 255].get(usize::try_from(frames).unwrap_or(usize::MAX)).copied().unwrap_or(255)
+}
+
+/// Checks the grey of pixel `(x, y)` within one step of `expected`.
+fn assert_grey(pixels: &[u8], x: u32, y: u32, expected: u8, what: &str) {
+    let actual = rgb(pixels, x, y);
+    assert!(actual.iter().all(|value| value.abs_diff(expected) <= 1), "{what}: pixel ({x}, {y}) is {actual:?}, expected grey {expected}");
+}
+
+/// F7 on glow: accumulation over frames (RGBA16F), `reset_state`, one step per frame for an id
+/// painted twice, a missing id refused, an explicit RGBA8 state, and a layer growing past its
+/// allocation keeping its state (the blit of `ensure_kept`, rows bottom-up).
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn state_accumulates_resets_grows_and_steps_once_per_frame() {
+    let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let chain = accumulator();
+    let id = egui::Id::new("accumulator");
+    let left = Rect::from_min_max(pos2(8.0, 8.0), pos2(120.0, 120.0));
+    let right = Rect::from_min_max(pos2(136.0, 8.0), pos2(248.0, 60.0));
+    let unnamed = Rect::from_min_max(pos2(136.0, 70.0), pos2(248.0, 120.0));
+    let mut paint = |ui: &mut egui::Ui| {
+        let painter = ui.painter();
+        halves(painter);
+        FilterLayer::new(left, chain.clone()).id(id).paint(painter);
+        FilterLayer::new(right, chain.clone()).id(id).paint(painter);
+        FilterLayer::new(unnamed, chain.clone()).paint(painter);
+    };
+    for frame in 1..=4 {
+        let pixels = harness.frame(&mut paint);
+        assert_grey(&pixels, 60, 60, accumulated(frame), &format!("frame {frame}, first paint"));
+        assert_grey(&pixels, 190, 30, accumulated(frame), &format!("frame {frame}, second paint of the id"));
+        assert_near(&pixels, 190, 100, [0, 0, 255], &format!("frame {frame}: no id, refused"));
+    }
+    assert_active(&harness.ctx);
+    assert_eq!(egui_filter_layers::state_count(&harness.ctx), 1);
+    egui_filter_layers::reset_state(&harness.ctx, id);
+    let pixels = harness.frame(&mut paint);
+    assert_grey(&pixels, 60, 60, accumulated(1), "after reset_state");
+
+    for options in [StateOptions::default().with_format(StateFormat::Rgba8Unorm), StateOptions::default().with_scale(0.5)] {
+        let id = egui::Id::new(("growing", options.scale().to_bits(), options.format() == StateFormat::Rgba8Unorm));
+        let mut rect = Rect::from_min_max(pos2(8.0, 8.0), pos2(40.0, 24.0));
+        for frame in 1..=3 {
+            if frame == 3 {
+                // Far beyond the first allocation (64-px growth steps).
+                rect = Rect::from_min_max(pos2(4.0, 4.0), pos2(250.0, 124.0));
+            }
+            let pixels = harness.frame(&mut |ui| {
+                halves(ui.painter());
+                FilterLayer::new(rect, chain.clone()).id(id).state(options).paint(ui.painter());
+            });
+            let what = format!("{options:?}, frame {frame}");
+            assert_grey(&pixels, 20, 15, accumulated(frame), &what);
+            if frame == 3 {
+                assert_grey(&pixels, 200, 100, accumulated(frame), &format!("{what}: the grown part reads the stretched previous state"));
+            }
+        }
+    }
+    assert!(egui_filter_layers::failed_states(&harness.ctx).is_empty(), "{:?}", egui_filter_layers::failed_states(&harness.ctx));
+    assert!(egui_filter_layers::failed_effects(&harness.ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&harness.ctx));
 }

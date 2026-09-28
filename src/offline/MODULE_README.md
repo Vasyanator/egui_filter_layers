@@ -32,7 +32,7 @@ frame stream needs (`video/` builds on exactly that).
   `run`, per-tile recording), `frame_geometry`, upload / readback copies.
 - `texture.rs`: `OfflineTexture` (owned premultiplied RGBA8 + egui `TextureOptions`, shared by
   clones; `from_color_image` = egui's upload bytes; identity decides re-uploads).
-- `options.rs`: `OfflineOptions` (user textures per slot, `with_texture`; validated before GPU work; `delta_time` / `frame` remember
+- `options.rs`: `OfflineOptions` (persistent state options, `with_state`; user textures per slot, `with_texture`; validated before GPU work; `delta_time` / `frame` remember
   whether they were set, so a video processor fills only unset ones), `PointerState` (frame uv),
   `input_uniforms` (the run's `fl.delta_time` / `fl.frame` / `fl.pointer`, the pointer through
   the UI's `geometry::pointer_uniform`).
@@ -66,6 +66,12 @@ frame stream needs (`video/` builds on exactly that).
   options, `ChainResources::user_layout`) is kept while the same `OfflineTexture` stays attached
   and dropped when the slot empties; uploads run in awaited `ErrorScopes`. They are sampled in
   their own uv, so tiles need nothing for them (tiled == whole, tested).
+- Persistent state (F7): a chain with a state pass runs over the renderer's one `OfflineState`
+  (two state textures, the latest's index and size), created on first use or when the format
+  changes, carried across runs (a `VideoProcessor` continues it frame to frame; `process_video`
+  and `reset_state` start it over), dropped after a GPU error. Such a chain is never tiled
+  (`NotTileable`); an RGBA16F state on a device that cannot render / filter it is
+  `OfflineError::State`.
 - Tiles overlap by the chain padding + 1 px; effects must read no further than their sample radius
   (the `lens` preset needs an explicit radius when tiled).
 - Every size is checked (`MAX_SIDE` = 2^24 - 1 per side, `usize` / `u32` / `u64` arithmetic);

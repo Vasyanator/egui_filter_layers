@@ -11,6 +11,9 @@ Key functions:
 - refraction: `ripple` (animated), `lens`
 - impulse-driven: `click_ripples` (driven by an `Impulses`, not animated by itself)
 - reduced resolution (F6, `Pass::with_scale`): `kawase_blur` (dual-Kawase pyramid), `bloom`
+- persistent state (F7, state passes; the layer needs `FilterLayer::id`): `trails`, and the
+  water pair `wave_sim` (height-field wave equation with obstacles and impulses) + `wave_display`
+  (refraction and a highlight from the heights); `WaveObstacle`
 - combos: `frosted_glass`
 
 Notes:
@@ -25,9 +28,9 @@ point, Scene zoom included) in the shaders, so they scale with the layer like th
 
 use std::sync::OnceLock;
 
-use egui::Color32;
+use egui::{Color32, Rect};
 
-use crate::effect::{Effect, ParamError};
+use crate::effect::{Effect, EffectError, ParamError};
 use crate::impulses::Impulses;
 use crate::pass::{FilterChain, PARAM_SLOTS, Params, Pass};
 
@@ -260,6 +263,112 @@ fn effect(uv: vec2<f32>) -> vec4<f32> {
 
 // ---- end kawase_blur / bloom ----
 
+// ---- trails / water (F7, persistent state) ----
+
+/// Trails, state pass: the state keeps the brightest of its decayed self and the current input,
+/// per premultiplied channel (`max` of two valid premultiplied colours is valid). `decay` = the
+/// fraction kept after one second (`pow(decay, delta_time)` per frame: frame-rate independent).
+const TRAILS_STATE: &str = "struct Params { decay: f32 }
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let keep = pow(clamp(p.decay, 0.0, 1.0), fl.delta_time);
+    return max(state_px(vec2<i32>(0)) * keep, src(uv));
+}
+";
+
+/// Trails, display pass: the input with the trail behind it.
+const TRAILS_DISPLAY: &str = "fn effect(uv: vec2<f32>) -> vec4<f32> {
+    return max(src(uv), state(uv));
+}
+";
+
+/// Water, state pass: one explicit step of the 2D wave equation on a height field
+/// (`r` = height, `g` = vertical velocity, per state texel; symplectic Euler, stable for
+/// `speed + restore / 8 <= 0.5`): `v' = (v + speed * laplacian(h) - restore * h) * damping`,
+/// `h' = h + v'`. `restore` pulls the mean level back to 0 (impulses push the surface down, which
+/// would otherwise make the whole surface drift without bound). The borders
+/// reflect (`state_px` clamps). On the first substep of a frame (`fl.pass_index == 0`) every live
+/// impulse pushes the surface down with a Gaussian of `impulse_radius` points, faded over its life,
+/// and a pressed pointer does so continuously with `pointer_strength` (per second, times
+/// `fl.delta_time`). Inside an obstacle (rounded rects in layer-rect uv, radii in points) the
+/// surface is held flat and still.
+const WAVE_SIM: &str = "struct Params {
+    impulses: array<vec4<f32>, 16>,
+    impulse_count: u32,
+    life: f32,
+    speed: f32,
+    damping: f32,
+    restore: f32,
+    impulse_radius: f32,
+    pointer_strength: f32,
+    obstacle_count: u32,
+    obstacles: array<vec4<f32>, 8>,
+    obstacle_radii: array<vec4<f32>, 2>,
+}
+fn wave_rounded_rect_distance(q: vec2<f32>, lo: vec2<f32>, hi: vec2<f32>, radius: f32) -> f32 {
+    let half_size = 0.5 * (hi - lo);
+    let r = clamp(radius, 0.0, min(half_size.x, half_size.y));
+    let d = abs(q - 0.5 * (lo + hi)) - half_size + vec2<f32>(r);
+    return length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0) - r;
+}
+fn wave_splash(uv: vec2<f32>, center: vec2<f32>, radius_px: f32) -> f32 {
+    let d = (uv - center) * fl.size_px / radius_px;
+    return exp(-dot(d, d));
+}
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let here = state_px(vec2<i32>(0));
+    let around = state_px(vec2<i32>(1, 0)).r + state_px(vec2<i32>(-1, 0)).r + state_px(vec2<i32>(0, 1)).r + state_px(vec2<i32>(0, -1)).r;
+    let restore = clamp(p.restore, 0.0, 0.1);
+    var v = (here.g + clamp(p.speed, 0.0, 0.5 - restore / 8.0) * (around - 4.0 * here.r) - restore * here.r) * clamp(p.damping, 0.0, 1.0);
+    if fl.pass_index == 0u {
+        let radius_px = max(p.impulse_radius * fl.pixels_per_point, 1.0);
+        let count = min(p.impulse_count, 16u);
+        for (var i = 0u; i < count; i = i + 1u) {
+            let impulse = p.impulses[i];
+            let fade = 1.0 - clamp(impulse.z / max(p.life, 0.000001), 0.0, 1.0);
+            v = v - impulse.w * fade * fl.delta_time * wave_splash(uv, fl.rect_uv.xy + impulse.xy * fl.rect_uv.zw, radius_px);
+        }
+        if fl.pointer.w > 0.5 && fl.pointer.z > 0.5 {
+            v = v - p.pointer_strength * fl.delta_time * wave_splash(uv, fl.pointer.xy, radius_px);
+        }
+    }
+    let local = (uv - fl.rect_uv.xy) / fl.rect_uv.zw;
+    let layer_px = fl.rect_uv.zw * fl.size_px;
+    let obstacles = min(p.obstacle_count, 8u);
+    for (var i = 0u; i < obstacles; i = i + 1u) {
+        let o = p.obstacles[i];
+        let radius = p.obstacle_radii[i / 4u][i % 4u] * fl.pixels_per_point;
+        if wave_rounded_rect_distance(local * layer_px, o.xy * layer_px, o.zw * layer_px, radius) <= 0.0 {
+            return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        }
+    }
+    return vec4<f32>(here.r + v, v, 0.0, 1.0);
+}
+";
+
+/// Water, display pass: refracts the input by the height gradient (`refraction` points of
+/// displacement per unit of slope, capped at `|refraction|`) and adds a white highlight on slopes
+/// facing the light (`specular`, zero on a flat surface: a calm surface is the input unchanged).
+const WAVE_DISPLAY: &str = "struct Params { refraction: f32, specular: f32 }
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let t = state_texel();
+    let slope = 0.5 * vec2<f32>(state(uv + vec2<f32>(t.x, 0.0)).r - state(uv - vec2<f32>(t.x, 0.0)).r, state(uv + vec2<f32>(0.0, t.y)).r - state(uv - vec2<f32>(0.0, t.y)).r);
+    let reach = abs(p.refraction) * fl.pixels_per_point;
+    var offset = slope * p.refraction * fl.pixels_per_point;
+    let len = length(offset);
+    if len > reach {
+        offset = offset * (reach / len);
+    }
+    let c = src(uv + offset * fl.texel);
+    let n = normalize(vec3<f32>(-slope, 1.0));
+    let h = normalize(vec3<f32>(-0.4, -0.6, 1.0) + vec3<f32>(0.0, 0.0, 1.0));
+    let highlight = max(pow(max(dot(n, h), 0.0), 64.0) - pow(h.z, 64.0), 0.0) * max(p.specular, 0.0);
+    let rgb = min(c.rgb + vec3<f32>(highlight), vec3<f32>(1.0));
+    return vec4<f32>(rgb, max(c.a, max(rgb.r, max(rgb.g, rgb.b))));
+}
+";
+
+// ---- end trails / water ----
+
 /// Every built-in effect: `(label, WGSL snippet)`. Tests validate and translate all of them.
 #[cfg(test)]
 pub(crate) const BUILTIN_EFFECTS: &[(&str, &str)] = &[
@@ -279,6 +388,10 @@ pub(crate) const BUILTIN_EFFECTS: &[(&str, &str)] = &[
     ("kawase_up", KAWASE_UP),
     ("bloom_bright", BLOOM_BRIGHT),
     ("bloom_combine", BLOOM_COMBINE),
+    ("trails_state", TRAILS_STATE),
+    ("trails_display", TRAILS_DISPLAY),
+    ("wave_sim", WAVE_SIM),
+    ("wave_display", WAVE_DISPLAY),
 ];
 
 /// Returns the shared built-in effect, compiling it on first use.
@@ -290,6 +403,15 @@ fn builtin(cell: &'static OnceLock<Effect>, label: &str, source: &str, configure
     cell.get_or_init(|| match Effect::new(label, source) {
         Ok(effect) => configure(effect),
         Err(error) => panic!("egui_filter_layers: built-in effect `{label}` is invalid (crate bug): {error}"),
+    })
+    .clone()
+}
+
+/// [`builtin`] for a STATE pass effect ([`Effect::new_state`]); the same crate-bug panic contract.
+fn builtin_state(cell: &'static OnceLock<Effect>, label: &str, source: &str) -> Effect {
+    cell.get_or_init(|| match Effect::new_state(label, source) {
+        Ok(effect) => effect,
+        Err(error) => panic!("egui_filter_layers: built-in state effect `{label}` is invalid (crate bug): {}", EffectError::to_string(&error)),
     })
     .clone()
 }
@@ -559,6 +681,123 @@ pub fn bloom(threshold: f32, intensity: f32, radius: f32) -> FilterChain {
 
 // ---- end kawase_blur / bloom ----
 
+// ---- trails / water (F7) ----
+
+/// Trails: everything that passes under the layer leaves a fading trace. A state pass keeps, per
+/// premultiplied channel, the brightest of the input and the decayed state, and a display pass
+/// shows the brightest of the input and that state. `decay` is the fraction of a trace left after
+/// one second (`0..=1`, clamped; e.g. `0.1`), applied per frame through `fl.delta_time`, so the
+/// fade does not depend on the frame rate (offline: set `OfflineOptions::with_delta_time`, or run
+/// a video, whose frame clock sets it).
+///
+/// A state chain: the layer needs [`FilterLayer::id`](crate::FilterLayer::id). The trace fades only
+/// on frames egui paints (repaint while it should move). Keep the default RGBA16F state: 8-bit
+/// state rounds small decays away, so faint traces would never vanish.
+#[must_use]
+pub fn trails(decay: f32) -> FilterChain {
+    static STATE: OnceLock<Effect> = OnceLock::new();
+    static DISPLAY: OnceLock<Effect> = OnceLock::new();
+    let decay = if decay.is_finite() { decay.clamp(0.0, 1.0) } else { 0.0 };
+    let state = builtin_param("trails_state", Pass::new(&builtin_state(&STATE, "trails_state", TRAILS_STATE)).with("decay", decay));
+    FilterChain::new().then(state).then(Pass::new(&builtin(&DISPLAY, "trails_display", TRAILS_DISPLAY, |e| e)))
+}
+
+/// How many obstacles [`wave_sim`] takes (more are ignored).
+pub const WAVE_OBSTACLES: usize = 8;
+
+/// A rounded rect the water of [`wave_sim`] flows around (the surface is held still inside it),
+/// in the layer rect's uv (`(0, 0)` = its top-left corner, `(1, 1)` = its bottom-right), like
+/// [`Impulses`]; its corner radius in points.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WaveObstacle {
+    /// Top-left corner in layer-rect uv.
+    pub min: [f32; 2],
+    /// Bottom-right corner in layer-rect uv.
+    pub max: [f32; 2],
+    /// Corner radius in points.
+    pub corner_radius: f32,
+}
+
+impl WaveObstacle {
+    /// The obstacle covering `obstacle` (points, the space `layer_rect` is in) of a layer painted
+    /// over `layer_rect`; `None` for a layer rect without area or non-finite input.
+    #[must_use]
+    pub fn from_rect(obstacle: Rect, layer_rect: Rect, corner_radius: f32) -> Option<Self> {
+        if !layer_rect.is_positive() || !layer_rect.is_finite() || !obstacle.is_finite() || !corner_radius.is_finite() {
+            return None;
+        }
+        let min = (obstacle.min - layer_rect.min) / layer_rect.size();
+        let max = (obstacle.max - layer_rect.min) / layer_rect.size();
+        Some(Self { min: [min.x, min.y], max: [max.x, max.y], corner_radius: corner_radius.max(0.0) })
+    }
+}
+
+/// Water, the simulation half: a STATE pass running one step of a height-field wave equation
+/// (state `r` = height, `g` = velocity) per paint. Pair it with [`wave_display`], which draws it;
+/// chain several copies for substeps (`fl.pass_index` tells them apart, impulses are injected
+/// on the first):
+///
+/// ```
+/// use egui_filter_layers::{FilterChain, Impulses, presets};
+/// let impulses = Impulses::new(0.15);
+/// let sim = presets::wave_sim(&impulses, 0.0, &[]);
+/// let water = FilterChain::new().then(sim.clone()).then(sim).then(presets::wave_display(8.0, 0.6));
+/// assert_eq!(water.len(), 3);
+/// ```
+///
+/// Every live impulse of `impulses` at `now` (push them where the user clicks, see [`Impulses`])
+/// pushes the surface down; `obstacles` (at most [`WAVE_OBSTACLES`], the rest ignored) are held
+/// still, so waves reflect off them. Named parameters, set on the returned pass with
+/// [`Pass::set`]: `speed` (`0..=0.5`, the squared Courant number: how far a wave travels per
+/// step; default `0.35`), `damping` (velocity kept per step, default `0.995`), `restore` (pull
+/// of the mean level back to 0 per step, `0..=0.1`, default `0.002`), `impulse_radius`
+/// (points, default `6`), `pointer_strength` (a pressed pointer's continuous push per second,
+/// default `0`: off). Steps are per paint, not per second: at a fixed frame rate the speed is
+/// constant, and a slower frame rate slows the water (substeps compensate).
+///
+/// The layer needs [`FilterLayer::id`](crate::FilterLayer::id). The surface moves only on frames
+/// egui paints: repaint while it is not calm (e.g. `ctx.request_repaint()` for a few seconds after
+/// the last impulse). The heights need the default RGBA16F state (signed values).
+#[must_use]
+pub fn wave_sim(impulses: &Impulses, now: f64, obstacles: &[WaveObstacle]) -> Pass {
+    static EFFECT: OnceLock<Effect> = OnceLock::new();
+    const LABEL: &str = "wave_sim";
+    let mut pass = Pass::new(&builtin_state(&EFFECT, LABEL, WAVE_SIM));
+    builtin_param(LABEL, impulses.apply(&mut pass, now));
+    let used = &obstacles[..obstacles.len().min(WAVE_OBSTACLES)];
+    let rects: Vec<[f32; 4]> = used.iter().map(|obstacle| [obstacle.min[0], obstacle.min[1], obstacle.max[0], obstacle.max[1]]).collect();
+    let mut radii = [[0.0_f32; 4]; 2];
+    for (index, obstacle) in used.iter().enumerate() {
+        radii[index / 4][index % 4] = obstacle.corner_radius;
+    }
+    builtin_param(LABEL, pass.set_slice("obstacles", &rects));
+    builtin_param(LABEL, pass.set_slice("obstacle_radii", &radii));
+    // `used.len() <= WAVE_OBSTACLES` (8), so the conversion cannot fail.
+    builtin_param(LABEL, pass.set("obstacle_count", u32::try_from(used.len()).unwrap_or(0)));
+    let values = [("life", impulses.life()), ("speed", 0.35), ("damping", 0.995), ("restore", 0.002), ("impulse_radius", 6.0), ("pointer_strength", 0.0)];
+    for (name, value) in values {
+        builtin_param(LABEL, pass.set(name, value));
+    }
+    pass
+}
+
+/// Water, the drawing half (a display pass after [`wave_sim`]): refracts the layer's input by the
+/// water's slope — `refraction` points of displacement per unit of slope, capped at
+/// `|refraction|` (its declared sample radius) — and adds a white highlight of strength
+/// `specular` on slopes facing the light. A calm surface shows the input unchanged.
+/// Non-finite arguments count as 0.
+#[must_use]
+pub fn wave_display(refraction: f32, specular: f32) -> Pass {
+    static EFFECT: OnceLock<Effect> = OnceLock::new();
+    const LABEL: &str = "wave_display";
+    let finite = |value: f32| if value.is_finite() { value } else { 0.0 };
+    let (refraction, specular) = (finite(refraction), finite(specular));
+    let pass = Pass::new(&builtin(&EFFECT, LABEL, WAVE_DISPLAY, |e| e)).with_sample_radius(refraction.abs());
+    builtin_param(LABEL, pass.with("refraction", refraction).and_then(|pass| pass.with("specular", specular)))
+}
+
+// ---- end trails / water ----
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,8 +825,9 @@ mod tests {
             vignette(0.6, 0.4, 0.5),
             click_ripples(&Impulses::new(1.0), 0.0, 4.0, 20.0, 60.0),
         ];
-        // Chains: gaussian_blur (1 effect), kawase_blur / bloom (4 effects between them).
-        assert_eq!(passes.len() + 1 + 4, BUILTIN_EFFECTS.len(), "one constructor per built-in pass effect");
+        // Chains: gaussian_blur (1 effect), kawase_blur / bloom (4 effects between them), trails (2),
+        // wave_sim + wave_display (2).
+        assert_eq!(passes.len() + 1 + 4 + 2 + 2, BUILTIN_EFFECTS.len(), "one constructor per built-in pass effect");
         // Detected from the WGSL reading `fl.time`, not configured by hand.
         assert!(ripple(1.0, 1.0, 1.0).effect().is_animated());
         assert!(!brightness_contrast(0.1, 1.2).effect().is_animated());
@@ -633,6 +873,35 @@ mod tests {
         assert_eq!(glow.passes()[0].get("threshold"), Some(ParamValue::F32(0.7)));
         assert_eq!(glow.passes().last().and_then(|pass| pass.get("intensity")), Some(ParamValue::F32(1.5)));
         assert_eq!(bloom(f32::NAN, f32::INFINITY, f32::NAN).passes()[0].get("threshold"), Some(ParamValue::F32(0.0)));
+    }
+
+    /// F7: the state presets are state passes with their named parameters set.
+    #[test]
+    fn state_presets_are_configured() {
+        use crate::ParamValue;
+        let chain = trails(0.25);
+        assert_eq!(chain.len(), 2);
+        assert!(chain.passes()[0].effect().is_state() && !chain.passes()[1].effect().is_state());
+        assert_eq!(chain.passes()[0].get("decay"), Some(ParamValue::F32(0.25)));
+        assert_eq!(trails(f32::NAN).passes()[0].get("decay"), Some(ParamValue::F32(0.0)));
+        let mut impulses = Impulses::new(0.5);
+        assert!(impulses.push([0.25, 0.75], 3.0, 1.0));
+        let layer = Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(200.0, 100.0));
+        let menu = Rect::from_min_size(egui::pos2(150.0, 75.0), egui::vec2(100.0, 50.0));
+        let Some(obstacle) = WaveObstacle::from_rect(menu, layer, 12.0) else { panic!("valid rects") };
+        assert_eq!(obstacle, WaveObstacle { min: [0.25, 0.25], max: [0.75, 0.75], corner_radius: 12.0 });
+        assert_eq!(WaveObstacle::from_rect(menu, Rect::NOTHING, 1.0), None);
+        let sim = wave_sim(&impulses, 1.25, &[obstacle; 10]);
+        assert!(sim.effect().is_state() && !sim.effect().is_animated());
+        assert_eq!(sim.get("impulse_count"), Some(ParamValue::U32(1)));
+        assert_eq!(sim.get("obstacle_count"), Some(ParamValue::U32(8)), "at most WAVE_OBSTACLES");
+        assert_eq!(sim.get_slice("obstacle_radii").map(|radii| radii[1]), Some(ParamValue::Vec4([12.0; 4])));
+        assert_eq!(sim.get_slice("obstacles").map(|rects| rects[7]), Some(ParamValue::Vec4([0.25, 0.25, 0.75, 0.75])));
+        assert_eq!(sim.get("life"), Some(ParamValue::F32(0.5)));
+        let display = wave_display(-8.0, f32::NAN);
+        assert!(!display.effect().is_state());
+        assert!((display.sample_radius() - 8.0).abs() < f32::EPSILON);
+        assert_eq!(display.get("specular"), Some(ParamValue::F32(0.0)));
     }
 
     #[test]

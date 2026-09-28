@@ -11,7 +11,8 @@ Shared by the chain executor (`chain.rs`), the UI callback's own objects (`resou
 
 Key structures:
 - `Target`: grow-only 2D render target that is sampled afterwards (optionally with a second,
-  sRGB-reinterpreting view to render through).
+  sRGB-reinterpreting view to render through); `Target::ensure_kept` grows one KEEPING its
+  content (a GPU copy; the persistent state textures, F7).
 - `GrowBuffer`: grow-only buffer written with `Queue::write_buffer`.
 
 Key functions:
@@ -92,8 +93,8 @@ pub(crate) fn with_error_scope<T>(device: &wgpu::Device, create: impl FnOnce() -
 /// A grow-only 2D texture used as a render target and sampled afterwards.
 #[derive(Debug)]
 pub(crate) struct Target {
-    /// The texture (kept for its lifetime; views hold it too).
-    _texture: wgpu::Texture,
+    /// The texture (kept for its lifetime; views hold it too; the source of `ensure_kept`'s copy).
+    texture: wgpu::Texture,
     /// Default view of the whole texture (the texture's own format); what passes sample.
     pub view: wgpu::TextureView,
     /// A view in another format of the same texture (e.g. `Rgba8UnormSrgb` of an `Rgba8Unorm`
@@ -121,21 +122,49 @@ impl Target {
         }
         slot.get_or_insert_with(|| {
             let size = [needed[0].max(previous[0]).max(1), needed[1].max(previous[1]).max(1)];
-            let view_formats = render_view_format.as_slice();
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats,
-            });
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let render_view = render_view_format.map(|view_format| texture.create_view(&wgpu::TextureViewDescriptor { format: Some(view_format), ..wgpu::TextureViewDescriptor::default() }));
-            Target { _texture: texture, view, render_view, render_view_format, size }
+            Self::create(device, format, render_view_format, wgpu::TextureUsages::empty(), label, size)
         })
+    }
+
+    /// A new target of `size` pixels (at least 1), usable as a render attachment and a sampled
+    /// texture plus `extra_usage`.
+    fn create(device: &wgpu::Device, format: wgpu::TextureFormat, render_view_format: Option<wgpu::TextureFormat>, extra_usage: wgpu::TextureUsages, label: &str, size: [u32; 2]) -> Self {
+        let size = size.map(|side| side.max(1));
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | extra_usage,
+            view_formats: render_view_format.as_slice(),
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let render_view = render_view_format.map(|view_format| texture.create_view(&wgpu::TextureViewDescriptor { format: Some(view_format), ..wgpu::TextureViewDescriptor::default() }));
+        Target { texture, view, render_view, render_view_format, size }
+    }
+
+    /// Makes `slot` hold a target of `format` at least `needed` pixels large, KEEPING its content:
+    /// a grown target is a new texture into which `encoder` copies the whole old one (at the
+    /// origin, before any later command of `encoder`). A target of another format is replaced
+    /// without a copy (its content is meaningless in the new format). Targets made here also
+    /// allow copies (`COPY_SRC | COPY_DST`).
+    pub(crate) fn ensure_kept<'a>(slot: &'a mut Option<Target>, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, format: wgpu::TextureFormat, label: &str, needed: [u32; 2]) -> &'a Target {
+        let copyable = wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST;
+        let old = slot.take_if(|target| target.texture.format() != format || !target.texture.usage().contains(copyable));
+        drop(old);
+        let fits = slot.as_ref().is_some_and(|target| target.size[0] >= needed[0] && target.size[1] >= needed[1]);
+        if !fits {
+            let previous = slot.take();
+            let base = previous.as_ref().map_or([0, 0], |target| target.size);
+            let grown = Self::create(device, format, None, copyable, label, [needed[0].max(base[0]), needed[1].max(base[1])]);
+            if let Some(previous) = previous {
+                encoder.copy_texture_to_texture(previous.texture.as_image_copy(), grown.texture.as_image_copy(), wgpu::Extent3d { width: base[0], height: base[1], depth_or_array_layers: 1 });
+            }
+            *slot = Some(grown);
+        }
+        slot.get_or_insert_with(|| Self::create(device, format, None, copyable, label, needed))
     }
 
     /// The view to render into: the `render_view_format` view when one was requested, else the

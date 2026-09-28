@@ -9,7 +9,8 @@ WGSL sources compiled into the crate with `include_str!` (by `effect.rs`).
   `effect/` appends AFTER a snippet declaring `struct Params`), the user texture groups 1..=3
   (`fl_userN` at 0, `fl_userN_sampler` at 1: egui-wgpu's texture layout), the public helpers
   (`src`, `src_px`, `src_texel`, `out_texel`, `original`, `params`, `tex`, `tex_size`,
-  `tex_load`, colour helpers), and both entry points
+  `tex_load`, `state`, `state_load`, `state_px`, `state_size`, `state_texel`, colour helpers),
+  and both entry points
   (`fl_vertex`: attribute-less full-viewport triangle; `fl_fragment`: computes the fragment's
   capture uv with `fl_capture_uv` and calls the user's `effect`).
   It must stay BEFORE user code so snippet line numbers are a plain offset.
@@ -38,6 +39,10 @@ WGSL sources compiled into the crate with `include_str!` (by `effect.rs`).
   `clamp(uv) * internal_*_scale - internal_*_offset`; offsets are 0 for a whole-capture window, so
   glow and the UI see exactly the pre-window arithmetic. The edge clamp uses the SAMPLED image's
   pixel: `internal_src_texel` for `src` (a scaled input), `fl.texel` for `original`.
+- The state (binding 5, F7) is read like every texture through ONE sampler (`fl_sampler`,
+  `state()`: `fl_storage_uv` with `internal_state_*` and the state content's texel) and exactly
+  with `textureLoad` (`state_load`: clamped to `internal_state_size`, row flipped by
+  `internal_flip_y`, since state contents sit at the texture origin with no window offset).
 - Only `textureSampleLevel` (valid in non-uniform control flow, translates to `textureLod`) and
   `textureLoad` (`texelFetch`) read textures. The slot helpers `tex` / `tex_size` / `tex_load` take
   the slot as their FIRST argument and `switch` on it (a slot `>= 3` yields zero); `effect/`'s

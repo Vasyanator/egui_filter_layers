@@ -8,7 +8,8 @@ them. No per-frame policy lives here — see `render.rs`.
 Key structures:
 - `GlError`: typed failure of any GL object operation.
 - `TargetFormat`, `RenderTarget`: a texture + framebuffer pair, grown on demand (never shrunk,
-  rounded up to `GROW_STEP` so a growing layer does not reallocate every frame).
+  rounded up to `GROW_STEP` so a growing layer does not reallocate every frame);
+  `RenderTarget::ensure_kept` grows one KEEPING its content (the persistent state targets, F7).
 - `ReadFormat`: the colour format of the framebuffer being captured, and the renderbuffer format
   a multisample resolve must use to match it (GLES 3 / WebGL2 require identical formats).
 - `ResolveTarget`: renderbuffer + framebuffer for that resolve, reallocated on format change.
@@ -221,6 +222,61 @@ impl RenderTarget {
         }
         self.allocated = size;
         Ok(())
+    }
+
+    /// Makes `slot` hold a target of `format` at least `needed` pixels large KEEPING its content
+    /// (F7 state textures): a target that must grow is replaced by a new one into which the old
+    /// one's whole allocation is blitted (at the origin, `NEAREST`, same format), then freed; a
+    /// target of another format is freed without a copy. Leaves the READ / DRAW framebuffer
+    /// bindings changed (the caller restores them).
+    ///
+    /// # Errors
+    /// As [`RenderTarget::create`] / [`RenderTarget::ensure_size`]; the slot is then empty.
+    ///
+    /// # Safety
+    /// `gl` must be current on this thread; `slot`'s target was created on it.
+    pub unsafe fn ensure_kept(slot: &mut Option<Self>, gl: &glow::Context, format: TargetFormat, needed: [i32; 2], max: i32) -> Result<(), GlError> {
+        // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); every target is created on it here or was (caller contract), and each freed one is taken out of `slot` first.
+        unsafe {
+            if let Some(old) = slot.take_if(|target| target.format != format) {
+                old.destroy(gl);
+            }
+            if slot.as_ref().is_some_and(|target| target.allocated[0] >= needed[0] && target.allocated[1] >= needed[1]) {
+                return Ok(());
+            }
+            let mut grown = Self::create(gl, format)?;
+            let previous = slot.take();
+            let base = previous.as_ref().map_or([0, 0], |target| target.allocated);
+            if let Err(error) = grown.ensure_size(gl, grown_size(base, needed, max), max) {
+                grown.destroy(gl);
+                if let Some(previous) = previous {
+                    previous.destroy(gl);
+                }
+                return Err(error);
+            }
+            if let Some(previous) = previous {
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(previous.framebuffer));
+                gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(grown.framebuffer));
+                gl.blit_framebuffer(0, 0, base[0], base[1], 0, 0, base[0], base[1], glow::COLOR_BUFFER_BIT, glow::NEAREST);
+                previous.destroy(gl);
+            }
+            *slot = Some(grown);
+        }
+        Ok(())
+    }
+
+    /// Clears the whole target to transparent zero. Leaves `GL_DRAW_FRAMEBUFFER` bound to it and
+    /// the clear colour changed (`egui_glow` sets its own before clearing).
+    ///
+    /// # Safety
+    /// `gl` must be current on this thread with scissoring disabled; the target was created on it.
+    pub unsafe fn clear(&self, gl: &glow::Context) {
+        // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); the framebuffer is this target's own.
+        unsafe {
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.framebuffer));
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+        }
     }
 
     /// The allocated size as the unsigned pixel counts `plan::TextureMapping::of` takes

@@ -20,7 +20,9 @@ Notes:
 Every frame goes through `OfflineRenderer::run` (and so through `wgpu_backend/chain.rs`); this
 module adds no GPU work. `fl.time` of a frame is the source's time for it (seconds from the first
 frame), converted to `f32`; `fl.delta_time` / `fl.frame` come from the processor's `FrameClock`
-(time since the previous frame, frame index) unless the options set them explicitly.
+(time since the previous frame, frame index) unless the options set them explicitly. A stateful
+chain's state (F7) lives in the renderer, so it continues from frame to frame; `drive` resets it
+with the frame clock at the start of every stream.
 */
 
 //! Video: filter frame streams with the same chains as the UI.
@@ -71,6 +73,10 @@ frame), converted to `f32`; `fl.delta_time` / `fl.frame` come from the processor
 //! dropped by ffmpeg, as `-fps_mode cfr` does) and a video stream that starts after the file's
 //! first audio is padded with its first frame, which keeps the passed-through audio in sync.
 //! Frame `i` then has `fl.time = i / frame_rate`.
+//!
+//! **Persistent state.** A chain with a state pass (`Effect::new_state`) continues its state from
+//! frame to frame: the processor's renderer keeps it ([`VideoProcessor::reset_state`] starts over;
+//! [`process_video`] does at the start of every stream). Such chains are never tiled.
 //!
 //! **Frame counters.** [`VideoProcessor`] also sets `fl.frame` to the index of the frame it
 //! processes (0 for the first; [`process_video`] restarts at 0 per stream, a custom loop calls
@@ -190,6 +196,13 @@ impl VideoProcessor {
     /// (a new stream or a seek in a custom decode loop; [`process_video`] does it itself).
     pub fn reset_frame_clock(&mut self) {
         self.clock = FrameClock::default();
+    }
+
+    /// Starts the persistent state of a stateful chain (a state pass, F7) over from zero; the
+    /// processor otherwise carries it from frame to frame ([`OfflineRenderer::reset_state`]).
+    /// [`process_video`] does it at the start of every stream.
+    pub fn reset_state(&mut self) {
+        self.renderer.reset_state();
     }
 
     /// Filters `frame`, shown at `time` seconds (`fl.time`), and returns a view of the result,
@@ -329,8 +342,9 @@ where
     let info = source.info().clone();
     log::info!("egui_filter_layers (video): processing {}x{} at {} fps ({} frames expected)", info.width(), info.height(), info.frame_rate(), info.frame_count().map_or_else(|| "unknown".to_owned(), |count| count.to_string()));
     sink.begin(&info)?;
-    // A stream starts at `fl.frame = 0`, whatever the processor ran before.
+    // A stream starts at `fl.frame = 0` and a zero state, whatever the processor ran before.
     processor.reset_frame_clock();
+    processor.reset_state();
     match frame_loop(processor, source, sink, &info, progress, block).await {
         Ok(frames) => {
             sink.finish()?;

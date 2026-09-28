@@ -490,6 +490,7 @@ Each phase is marked done here in the same commit that lands it.
 - Phase 3a (F3 `Impulses` in `src/impulses.rs` + `presets::click_ripples`: layer-rect uv, oldest-first drop at 16 / `with_capacity`, `pack` / `apply` into named params `impulses` / `impulse_count`, `request_repaint_if_alive` the only `Context` use; compact-support wave packet clamped to `|amplitude|` = sample radius; GPU tests wgpu + glow): done.
 - Phase 6 (F5 hot reload, feature `hot-reload`, `src/hot.rs`: `HotEffect::watch` / `watch_with` + `HotOptions` (interval, repaint `Context`, set-up closure), `poll` -> `HotReloadEvent`, `current` / `error` / `status_text`, `HotReloadError` (missing / io / compile with diagnostic / spawn / stopped), free fn `rebind(&Pass, &Effect) -> Rebound`; not compiled on wasm32): done.
 - Phase 3c (F8 user textures: `FilterLayer::texture(slot, TextureId)` / `texture_at` / `check_textures`, `TEXTURE_SLOTS` = 3; prelude `tex(i, uv)` (the texture's own sampler = its egui `TextureOptions`), `tex_size(i)`, `tex_load(i, px)` (`textureLoad`); `fl_user0..2` + samplers at `@group(1..=3)` = egui-wgpu's texture layout; binding 7 (`fl_nearest_sampler`) removed; `Effect::reads_texture` from an IR scan (constant slot = that slot, computed = all); `plan::check_textures` refuses a layer / offline run reading an unattached slot (`TextureError`, logged once per context in the UI); `plan::Bindings::user`; wgpu binds egui's own bind group per slot (kept copies for full uploads not yet applied), dummy groups elsewhere, composites group 0 only; glow units 4..6 from `Painter::texture`; unresolvable ids skip the layer and are reported by `failed_textures()` (`TextureFailure`, latched per id); offline `OfflineTexture` (`new` / `from_color_image`) + `OfflineOptions::with_texture`, uploaded once per texture identity, `OfflineError::Texture` / `TextureTooLarge`; glow params UBO grow-only + `glBufferSubData`; GPU tests wgpu + glow + offline (UI == offline bit for bit, tiled == whole), glow scenes for `original()` in later passes and `fl.pointer` / `delta_time` / `frame`): done.
+- Phase 4 (F7 persistent state: `Effect::new_state` / `is_state`; `FilterLayer::id` (required, `StateError::MissingId` via `check_state`) / `state(StateOptions)`; `StateFormat` RGBA16F (renderable + filterable or refused: `failed_states` / `StateFailure`, offline `OfflineError::State`) / opt-in RGBA8; `reset_state(ctx, id)`, `state_count(ctx)`; `src/state.rs` (`StateRegistry`: per `(ViewportId, Id)`, one step per frame, eviction after > 120 frames AND > 2 s); `plan.rs` state steps (`StepKind`, `Slot::StateA/B`, `StatePlanInput` / `StatePlan`: clear, sizes, final slot); prelude `state` / `state_load` / `state_px` / `state_size` / `state_texel`, `fl.pass_index` documented; `FlUniforms` 448 B; wgpu `WgpuResources::states` + `Target::ensure_kept` + pipelines keyed by format; glow `GlowState::states` + `RenderTarget::ensure_kept`; offline state carried across runs, `reset_state`, `with_state`, `NotTileable`; `VideoProcessor::reset_state`, per-stream reset; `HotOptions::with_state`; presets `trails`, `wave_sim` + `wave_display` + `WaveObstacle`; GPU tests wgpu (Vulkan + GL) / glow / offline / video): done.
 
 ## 18. Findings during execution
 - Phase 1: naga's GLSL writer rejects one texture read through two samplers in one module
@@ -597,3 +598,51 @@ Each phase is marked done here in the same commit that lands it.
   crate's layout because every such layout is created from one descriptor
   (`gpu::egui_texture_entries`); egui-wgpu textures are `Rgba8Unorm`, so `tex()` returns the same
   gamma bytes as `src()` on every backend (egui_glow uploads RGBA8 too, `srgb_textures = false`).
+- Phase 4 (F7): §8's `state(uv)` "nearest by default" + `state_linear(uv)` is infeasible (binding 7
+  is gone and naga's GLSL writer rejects one texture through two samplers). `state(uv)` samples
+  through the one linear `fl_sampler` (smooth display reads; exact at texel centres), and the
+  simulation reads exact texels with `state_load(px)` / `state_px(offset)` (`textureLoad`, clamped
+  = reflecting border, row flipped on GL). State + src + a user texture in one module translates
+  for every GLSL dialect (`state_helpers_translate_with_src_and_a_user_texture`). `FlUniforms` grew
+  by `internal_state_texel` (168) and `internal_state_size` (176): `params` moved 176 -> 192, the
+  block is 448 bytes. `fl.pass_index` is now set (index among the chain's passes of its kind) and
+  documented. A display pass reading the state in a chain with no state pass sees the 1x1 zero
+  dummy — identical to a state never written, so no id is required there.
+- Phase 4: eviction is "not painted for > 120 frames AND > 2 s", not "whichever first": time alone
+  would evict every state of an app that idled > 2 s on its first frame back, frames alone every
+  state of a fast app within 0.5 s at 240 fps. Checked at every paint (both UI backends).
+- Phase 4: states are keyed by `(ViewportId, Id)`: egui 0.36 counts `cumulative_frame_nr` per
+  viewport, and eframe renders every viewport through one renderer (shared `CallbackResources` on
+  wgpu), so "same frame" is only meaningful per viewport. One id in two viewports = two states
+  (documented). The same id painted twice in one frame of a viewport: the first paint steps it,
+  later ones skip the state steps and show the state as it is (debug-logged once per key) — §15
+  risk 2's plan.
+- Phase 4: grow-only state textures must KEEP the latest content when they grow (the read mapping
+  uses the previous size). Growing the write target lazily per step would change allocations
+  after the uniform buffer is built, so both backends grow the two state textures up front with a
+  copy (wgpu `Target::ensure_kept`: new texture, `copy_texture_to_texture` of the old one, state
+  textures carry `COPY_SRC | COPY_DST`; glow `RenderTarget::ensure_kept`: new texture + `NEAREST`
+  blit) — tested by layers growing far past their allocation at scale 1 and 0.5 on wgpu (Vulkan,
+  GL) and glow.
+- Phase 4: reset is backend-neutral: `reset_state` stores the id in the context's temp data and
+  the next stateful paint of that id consumes it into `LayerJob::reset_state`; a new or reset
+  state is cleared by the plan (`StatePlan::clear`), so no draw ever reads a dummy as "zero
+  state" with the wrong size. wgpu effect pipelines are cached per `(module, output format)`:
+  an RGBA8 state pass on a float-intermediate device renders into another format.
+- Phase 4: the RGBA16F policy is the float-intermediates check on both backends (wgpu
+  `renderable_and_filterable`; glow: the renderability probe — half-float linear filtering is core
+  in GL 3.3 / GLES 3.0). Refusals are latched per format in `failed_states()` (`StateFailure`), a
+  new accessor beside `failed_effects()` (a format is not an effect). Not runnable here: no device
+  at hand lacks RGBA16F (see Not verified in the phase report).
+- Phase 4 (offline): `OfflineOptions::with_state` only CONFIGURES the state (scale, format); a
+  chain with a state pass always carries it (the renderer is the identity). `process_video`
+  resets the state with the frame clock at the start of every stream; a failed run drops it.
+- Phase 4 (`wave_sim`): the velocity-driven impulses inject momentum and the discrete wave
+  equation conserves `sum(v)` (reflecting borders), so the whole surface drifted without bound
+  (measured: displayed energy grew linearly for 120 frames; f16 would overflow under a held
+  pointer). A restoring term `restore` (default 0.002 per step, stability `speed + restore / 8 <=
+  0.5`) pulls the mean back to 0. Obstacles are rounded rects in layer-rect uv (`WaveObstacle`, at
+  most 8); their radii are packed into `array<vec4<f32>, 2>` (F4 rejects `array<f32, N>`). Steps are
+  per paint; `trails(decay)` takes the fraction kept per SECOND (`pow(decay, fl.delta_time)`), so
+  it is frame-rate independent. Neither preset is animated by itself (documented: repaint while
+  moving). `HotEffect::watch_state` became `HotOptions::with_state(true)`.

@@ -11,11 +11,16 @@ bind the texture a `Slot` names, upload the bytes produced here and draw; they m
 decision of their own.
 
 Key structures:
-- `Slot`: a texture of one run (the capture or a ping-pong intermediate).
+- `Slot`: a texture of one run (the capture, a ping-pong intermediate or a state texture).
+- `StepKind`: display step (writes the display chain) or state step (writes the state, F7).
+- `StatePlanInput` / `StatePlan`: what the caller knows of a layer's state (which texture holds
+  the latest, its size, whether to step it this run) and what the run leaves (clear, sizes,
+  where the latest state is afterwards).
 - `Content`: what a slot holds at one point of the run (the whole capture at some resolution, or
   a window of it at the texture origin).
-- `Bindings`: the slots one draw binds at `fl_src_texture` / `fl_original_texture` (`None` = the
-  backend's neutral dummy), and which user texture slots get the layer's texture (else a dummy).
+- `Bindings`: the slots one draw binds at `fl_src_texture` / `fl_original_texture` /
+  `fl_state_texture` (`None` = the backend's neutral dummy), and which user texture slots get the
+  layer's texture (else a dummy).
 - `PassStep`, `CompositeStep`, `ChainPlan`: the draws of one run, in order, and the pool size.
 - `Allocations`: the allocated size of every slot's texture (backends report them).
 - `TextureMapping`: capture uv -> storage uv of one texture content (`clamp(uv) * scale -
@@ -42,6 +47,15 @@ slot (wgpu `@group(1 + i)`, glow unit `4 + i`) and the backend's dummy where non
 the composite binds dummies (its module reads none). Their uv is the texture's own, so they need
 no mapping and are independent of windows and scales. Backend-specific uniform flags (`flip_y`, fragment mode) stay in the
 `FrameUniforms` each backend passes in.
+State (F7): state passes (`Effect::new_state`) are STATE steps: they read the display chain's
+current input as `src` (the display input does not advance past them), the latest state at
+binding 5, and write the OTHER state texture (`StateA` / `StateB` ping-pong, swapped after every
+state step), `ceil(capture * state scale)` texels over the whole capture. Display steps bind the
+latest state (the last state step before them, or last run's). A state with no content yet (new,
+reset) is cleared first (`StatePlan::clear`). A repeated run in the same frame (`step = false`)
+skips the state steps: its display steps read the state as it is. The read mapping of the latest
+content uses ITS size, the writes the new size, so a resized layer reads the previous state
+stretched. Stateful runs cover the whole capture only (never tiled).
 Scale (F6): a pass with `scale < 1` renders `scaled_px(capture, scale)` pixels holding the WHOLE
 capture at that resolution (at the texture origin); readers map it with `TextureMapping::of(
 scaled, allocated, 0)`, so `uv` keeps its capture meaning and bilinear sampling resamples (the
@@ -65,6 +79,54 @@ pub(crate) enum Slot {
     Ping,
     /// The second ping-pong intermediate.
     Pong,
+    /// State texture 0 of the layer (F7).
+    StateA,
+    /// State texture 1 of the layer (F7).
+    StateB,
+}
+
+impl Slot {
+    /// The state slot of index `index` (0 = [`Slot::StateA`], anything else = [`Slot::StateB`]).
+    #[must_use]
+    pub(crate) fn state(index: u8) -> Self {
+        if index == 0 { Self::StateA } else { Self::StateB }
+    }
+}
+
+/// What a step writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepKind {
+    /// A display pass: writes the display chain's next input (a ping-pong slot).
+    Display,
+    /// A state pass: writes the next state (a state slot).
+    State,
+}
+
+/// What the caller knows of a stateful layer's state before a run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StatePlanInput {
+    /// `StateOptions::scale`: the state holds `scaled_px(capture, scale)` texels.
+    pub scale: f32,
+    /// Which state slot (0 / 1) holds the latest state.
+    pub current: u8,
+    /// The size of the latest state content; `None` = no content (new or reset): cleared first.
+    pub previous_px: Option<[u32; 2]>,
+    /// Whether this run steps the state (false: repeated paint in the same frame; state steps
+    /// are skipped).
+    pub step: bool,
+}
+
+/// What a stateful run does with the state textures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StatePlan {
+    /// Clear this slot (the whole texture) to transparent before any draw: it has no content.
+    pub clear: Option<Slot>,
+    /// Both state textures must hold at least this many texels (grown keeping their content).
+    pub target_px: [u32; 2],
+    /// Which state slot (0 / 1) holds the latest state after the run.
+    pub final_index: u8,
+    /// The size of that content.
+    pub final_px: [u32; 2],
 }
 
 /// The slots one draw binds; `None` means the backend's neutral dummy texture for that binding.
@@ -76,6 +138,10 @@ pub(crate) struct Bindings {
     /// draw. `None` = a transparent dummy (its `internal_aux_*` mapping then keeps the frame's
     /// identity value); no current plan produces it.
     pub original: Option<Slot>,
+    /// Bound at `fl_state_texture` (`state()`): the latest state for every pass step of a
+    /// stateful run, `None` (a transparent 1x1 dummy, i.e. zero state) otherwise and for the
+    /// composite.
+    pub state: Option<Slot>,
     /// Per user texture slot: `true` = bind the texture the layer attached there, `false` = the
     /// backend's dummy (nothing attached, or the composite).
     pub user: [bool; TEXTURE_SLOTS],
@@ -114,6 +180,12 @@ impl Content {
 pub(crate) struct PassStep {
     /// Index into the chain's passes (whose effect and parameters this draw runs).
     pub pass: usize,
+    /// Display or state step (which chain its output continues).
+    pub kind: StepKind,
+    /// Its index among the run's steps of its kind (`fl.pass_index`).
+    pub pass_index: u32,
+    /// What its state slot holds (`bindings.state`), when it binds one.
+    pub state: Option<Content>,
     /// The textures it reads.
     pub bindings: Bindings,
     /// What its `src` slot holds when it runs.
@@ -146,7 +218,7 @@ pub(crate) struct CompositeStep {
 /// Every draw of one chain run, in execution order.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ChainPlan {
-    /// The effect passes (never empty).
+    /// The effect passes (empty only for a repeated stateful run of a chain of state passes).
     pub steps: Vec<PassStep>,
     /// The composite that writes the result.
     pub composite: CompositeStep,
@@ -159,6 +231,8 @@ pub(crate) struct ChainPlan {
     /// bilinear weights) whatever the scales; larger (grow-only) targets are fine, the mappings
     /// use the actual allocation.
     pub target_px: [u32; 2],
+    /// The state textures' part of the run (stateful runs only).
+    pub state: Option<StatePlan>,
 }
 
 /// The allocated size of every slot's texture in one run, in pixels (reported by the backend
@@ -169,6 +243,8 @@ pub(crate) struct Allocations {
     pub source: [u32; 2],
     /// Of [`Slot::Ping`] and [`Slot::Pong`].
     pub ping_pong: [[u32; 2]; 2],
+    /// Of [`Slot::StateA`] and [`Slot::StateB`] (zero without state).
+    pub state: [[u32; 2]; 2],
 }
 
 impl Allocations {
@@ -179,6 +255,8 @@ impl Allocations {
             Slot::Source => self.source,
             Slot::Ping => self.ping_pong[0],
             Slot::Pong => self.ping_pong[1],
+            Slot::StateA => self.state[0],
+            Slot::StateB => self.state[1],
         }
     }
 }
@@ -203,56 +281,84 @@ pub(crate) fn scaled_px(side: u32, scale: f32) -> u32 {
 /// a capture of `capture` pixels, whose composite puts capture pixel `(0, 0)` at
 /// `composite_origin` of its render target (target pixels, top-left origin). `attached[i]`: the
 /// layer attached a user texture at slot `i` (every pass step binds it; see
-/// [`check_textures`] for the slots the effects need).
+/// [`check_textures`] for the slots the effects need). `state`: the layer's state, required when
+/// a pass is a state pass (`Effect::new_state`), see the file notes.
 ///
 /// Returns `None` when there is nothing to draw (no passes, an empty / negative window) or the
-/// run cannot be planned: a chain with a scaled pass ([`Pass::is_scaled`]) over anything but the
-/// whole capture (callers that tile refuse such chains first, `OfflineError::NotTileable`).
+/// run cannot be planned: a chain with a scaled pass ([`Pass::is_scaled`]) or a stateful run over
+/// anything but the whole capture (callers that tile refuse such chains first,
+/// `OfflineError::NotTileable`), or a chain with a state pass and no `state`.
 #[must_use]
-pub(crate) fn plan(passes: &[Pass], capture: [i32; 2], window: PxRect, composite_origin: [i32; 2], attached: [bool; TEXTURE_SLOTS]) -> Option<ChainPlan> {
+pub(crate) fn plan(passes: &[Pass], capture: [i32; 2], window: PxRect, composite_origin: [i32; 2], attached: [bool; TEXTURE_SLOTS], state: Option<StatePlanInput>) -> Option<ChainPlan> {
     if passes.is_empty() || window.w <= 0 || window.h <= 0 || window.x < 0 || window.y < 0 {
         return None;
     }
+    let has_state_steps = passes.iter().any(|pass| pass.effect().is_state());
+    if has_state_steps && state.is_none() {
+        return None;
+    }
     let whole = window.x == 0 && window.y == 0 && window.size() == capture;
-    if !whole && passes.iter().any(Pass::is_scaled) {
+    if !whole && (state.is_some() || passes.iter().any(Pass::is_scaled)) {
         return None;
     }
     let capture_px = capture.map(|side| u32::try_from(side).unwrap_or(0));
     let origin = [u32::try_from(window.x).ok()?, u32::try_from(window.y).ok()?];
     let source = Content { logical_px: capture_px, origin_px: origin, full: true };
-    let output_of = |index: usize| if index.is_multiple_of(2) { Slot::Ping } else { Slot::Pong };
+    // The whole capture at `px` texels, at the texture origin (scaled images and states).
+    let whole_at = |px: [u32; 2]| Content { logical_px: px, origin_px: [0, 0], full: px == capture_px };
+    let state_px = state.map(|state| capture_px.map(|side| scaled_px(side, state.scale)));
+    // The latest state: its slot index and content (a cleared state reads as the new size).
+    let mut latest = state.zip(state_px).map(|(state, px)| (state.current, whole_at(state.previous_px.unwrap_or(px))));
     let mut steps = Vec::with_capacity(passes.len());
-    let mut input = source;
+    let (mut input, mut input_slot) = (source, Slot::Source);
+    let (mut display_count, mut state_count) = (0_u32, 0_u32);
     for (index, pass) in passes.iter().enumerate() {
+        let state_binding = latest.map(|(slot, _)| Slot::state(slot));
+        let state_content = latest.map(|(_, content)| content);
+        let bindings = Bindings { src: input_slot, original: Some(Slot::Source), state: state_binding, user: attached };
+        if pass.effect().is_state() {
+            // `state` and `state_px` are `Some` here (checked above); a repeated run skips it.
+            let (Some(state), Some(px), Some((read, _))) = (state, state_px, latest) else {
+                return None;
+            };
+            if !state.step {
+                continue;
+            }
+            let write = u8::from(read == 0);
+            let written = whole_at(px);
+            let used = px.map(|side| i32::try_from(side).unwrap_or(i32::MAX));
+            steps.push(PassStep { pass: index, kind: StepKind::State, pass_index: state_count, state: state_content, bindings, input, output: Slot::state(write), written, scale: state.scale, used_px: used, frag_offset: [0.0, 0.0] });
+            latest = Some((write, written));
+            state_count += 1;
+            continue;
+        }
+        let output = if display_count.is_multiple_of(2) { Slot::Ping } else { Slot::Pong };
         let (written, used_px, frag_offset) = if pass.is_scaled() {
             // Whole capture only (checked above): the smaller image starts at capture uv 0.
             let logical = capture_px.map(|side| scaled_px(side, pass.scale()));
-            let used = logical.map(|side| i32::try_from(side).unwrap_or(i32::MAX));
-            (Content { logical_px: logical, origin_px: [0, 0], full: false }, used, [0.0, 0.0])
+            (whole_at(logical), logical.map(|side| i32::try_from(side).unwrap_or(i32::MAX)), [0.0, 0.0])
         } else {
             (source, window.size(), [px_f32(window.x), px_f32(window.y)])
         };
-        steps.push(PassStep {
-            pass: index,
-            // Every pass may read the untouched capture through `original()` (F1).
-            bindings: Bindings { src: if index == 0 { Slot::Source } else { output_of(index - 1) }, original: Some(Slot::Source), user: attached },
-            input,
-            output: output_of(index),
-            written,
-            scale: pass.scale(),
-            used_px,
-            frag_offset,
-        });
-        input = written;
+        // Every pass may read the untouched capture through `original()` (F1).
+        steps.push(PassStep { pass: index, kind: StepKind::Display, pass_index: display_count, state: state_content, bindings, input, output, written, scale: pass.scale(), used_px, frag_offset });
+        (input, input_slot) = (written, output);
+        display_count += 1;
     }
     let composite = CompositeStep {
-        // The composite module reads no user texture: dummies.
-        bindings: Bindings { src: output_of(passes.len() - 1), original: Some(Slot::Source), user: [false; TEXTURE_SLOTS] },
+        // The composite module reads no user texture and no state: dummies.
+        bindings: Bindings { src: input_slot, original: Some(Slot::Source), state: None, user: [false; TEXTURE_SLOTS] },
         input,
         frag_offset: [-px_f32(composite_origin[0]), -px_f32(composite_origin[1])],
     };
     let target_px = window.size().map(|side| u32::try_from(side).unwrap_or(0));
-    Some(ChainPlan { steps, composite, source, target_px })
+    let state = state.zip(state_px).zip(latest).map(|((state, px), (final_index, content))| StatePlan {
+        clear: state.previous_px.is_none().then_some(Slot::state(state.current)),
+        target_px: px,
+        final_index,
+        final_px: content.logical_px,
+    });
+    Some(ChainPlan { steps, composite, source, target_px, state })
 }
 
 /// Checks that every user texture slot an effect of `passes` may read
@@ -328,6 +434,10 @@ struct Draw {
     written: Option<Content>,
     /// `fl.pass_scale`.
     scale: f32,
+    /// What its state slot holds (`bindings.state`), when it binds one.
+    state: Option<Content>,
+    /// `fl.pass_index`.
+    pass_index: u32,
 }
 
 /// The uniform block of one draw: `frame` (the layer's values and the backend's flags) with the
@@ -345,6 +455,14 @@ fn draw_uniforms(frame: &FrameUniforms, draw: &Draw, allocations: &Allocations, 
         out.aux_scale = aux.scale;
         out.aux_offset = aux.offset;
     }
+    // A dummy state keeps the frame's neutral values (identity mapping, one 1x1 texel).
+    if let (Some(slot), Some(content)) = (draw.bindings.state, draw.state) {
+        let mapping = content.mapping(allocations.of(slot));
+        out.state = [mapping.scale, mapping.offset];
+        out.state_texel = content.texel(frame);
+        out.state_size = content.logical_px.map(to_f32_exact);
+    }
+    out.pass_index = draw.pass_index;
     out.frag_offset = draw.frag_offset;
     out.frag_texel = draw.written.map_or(frame.texel, |written| written.texel(frame));
     out.pass_scale = draw.scale;
@@ -355,7 +473,7 @@ fn draw_uniforms(frame: &FrameUniforms, draw: &Draw, allocations: &Allocations, 
 /// backend's `FrameUniforms::for_layer` value (with its `flip_y` / fragment-mode flags).
 #[must_use]
 pub(crate) fn step_uniforms(frame: &FrameUniforms, plan: &ChainPlan, step: &PassStep, allocations: &Allocations, pass: &Pass) -> [u8; UNIFORM_BLOCK_SIZE] {
-    let draw = Draw { bindings: step.bindings, input: step.input, original: plan.source, frag_offset: step.frag_offset, written: Some(step.written), scale: step.scale };
+    let draw = Draw { bindings: step.bindings, input: step.input, original: plan.source, frag_offset: step.frag_offset, written: Some(step.written), scale: step.scale, state: step.state, pass_index: step.pass_index };
     draw_uniforms(frame, &draw, allocations, pass.params())
 }
 
@@ -364,7 +482,7 @@ pub(crate) fn step_uniforms(frame: &FrameUniforms, plan: &ChainPlan, step: &Pass
 #[must_use]
 pub(crate) fn composite_uniforms(frame: &FrameUniforms, plan: &ChainPlan, allocations: &Allocations, geometry: &LayerGeometry) -> [u8; UNIFORM_BLOCK_SIZE] {
     let composite = &plan.composite;
-    let draw = Draw { bindings: composite.bindings, input: composite.input, original: plan.source, frag_offset: composite.frag_offset, written: None, scale: 1.0 };
+    let draw = Draw { bindings: composite.bindings, input: composite.input, original: plan.source, frag_offset: composite.frag_offset, written: None, scale: 1.0, state: None, pass_index: 0 };
     draw_uniforms(frame, &draw, allocations, &geometry.composite_params())
 }
 
@@ -422,13 +540,13 @@ mod tests {
     #[test]
     fn steps_follow_the_ping_pong_order() {
         let window = PxRect { x: 16, y: 32, w: 100, h: 50 };
-        let Some(plan) = plan(&passes(3), [200, 100], window, [4, 8], NO_TEXTURES) else { panic!("three passes over a non-empty window") };
+        let Some(plan) = plan(&passes(3), [200, 100], window, [4, 8], NO_TEXTURES, None) else { panic!("three passes over a non-empty window") };
         let reads: Vec<Slot> = plan.steps.iter().map(|step| step.bindings.src).collect();
         let writes: Vec<Slot> = plan.steps.iter().map(|step| step.output).collect();
         assert_eq!(reads, [Slot::Source, Slot::Ping, Slot::Pong]);
         assert_eq!(writes, [Slot::Ping, Slot::Pong, Slot::Ping]);
         assert!(plan.steps.iter().enumerate().all(|(index, step)| step.pass == index && step.used_px == [100, 50]));
-        assert_eq!(plan.composite.bindings, Bindings { src: Slot::Ping, original: Some(Slot::Source), user: NO_TEXTURES });
+        assert_eq!(plan.composite.bindings, Bindings { src: Slot::Ping, original: Some(Slot::Source), state: None, user: NO_TEXTURES });
         assert_eq!(plan.composite.frag_offset.map(f32::to_bits), [-4.0_f32, -8.0].map(f32::to_bits));
         assert_eq!(plan.steps[0].frag_offset.map(f32::to_bits), [16.0_f32, 32.0].map(f32::to_bits));
         assert_eq!(plan.target_px, [100, 50], "the pool holds the window");
@@ -436,11 +554,11 @@ mod tests {
         assert_eq!(plan.source, window_content);
         assert!(plan.steps.iter().all(|step| step.input == window_content && step.written == window_content && (step.scale - 1.0).abs() < f32::EPSILON));
 
-        let Some(single) = super::plan(&passes(1), [200, 100], window, [0, 0], NO_TEXTURES) else { panic!("one pass") };
+        let Some(single) = super::plan(&passes(1), [200, 100], window, [0, 0], NO_TEXTURES, None) else { panic!("one pass") };
         assert_eq!(single.composite.bindings.src, Slot::Ping);
-        assert!(super::plan(&[], [200, 100], window, [0, 0], NO_TEXTURES).is_none(), "no passes, nothing to draw");
-        assert!(super::plan(&passes(1), [200, 100], PxRect { x: 0, y: 0, w: 0, h: 5 }, [0, 0], NO_TEXTURES).is_none(), "empty window");
-        assert!(super::plan(&passes(1), [200, 100], PxRect { x: -1, y: 0, w: 5, h: 5 }, [0, 0], NO_TEXTURES).is_none(), "negative origin");
+        assert!(super::plan(&[], [200, 100], window, [0, 0], NO_TEXTURES, None).is_none(), "no passes, nothing to draw");
+        assert!(super::plan(&passes(1), [200, 100], PxRect { x: 0, y: 0, w: 0, h: 5 }, [0, 0], NO_TEXTURES, None).is_none(), "empty window");
+        assert!(super::plan(&passes(1), [200, 100], PxRect { x: -1, y: 0, w: 5, h: 5 }, [0, 0], NO_TEXTURES, None).is_none(), "negative origin");
     }
 
     #[test]
@@ -448,8 +566,8 @@ mod tests {
         let effect = identity();
         let passes: Vec<Pass> = (0..3).map(|index| Pass::new(&effect).with_param(0, [f32::from(u8::try_from(index).unwrap_or(0)); 4]).unwrap_or_else(|error| panic!("{error}"))).collect();
         // Capture 64x32; window (16, 8) 16x16; textures: source 32x32, ping 64x16, pong 32x64.
-        let allocations = Allocations { source: [32, 32], ping_pong: [[64, 16], [32, 64]] };
-        let Some(plan) = plan(&passes, [64, 32], PxRect { x: 16, y: 8, w: 16, h: 16 }, [4, 8], NO_TEXTURES) else { panic!("planned") };
+        let allocations = Allocations { source: [32, 32], ping_pong: [[64, 16], [32, 64]], state: [[0, 0]; 2] };
+        let Some(plan) = plan(&passes, [64, 32], PxRect { x: 16, y: 8, w: 16, h: 16 }, [4, 8], NO_TEXTURES, None) else { panic!("planned") };
         let frame = FrameUniforms { aux_scale: [3.0, 3.0], texel: [0.25, 0.5], ..FrameUniforms::default() };
         let blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = plan.steps.iter().map(|step| step_uniforms(&frame, &plan, step, &allocations, &passes[step.pass])).collect();
         // Pass 0 reads the source, pass 1 ping, pass 2 pong: capture / allocated, origin / allocated.
@@ -460,7 +578,7 @@ mod tests {
         assert!(blocks.iter().all(|block| holds(block, offsets::AUX_SCALE, [2.0, 1.0]) && holds(block, offsets::AUX_OFFSET, [0.5, 0.25])));
         // Full resolution: both texels are the frame's, the pass scale 1.
         assert!(blocks.iter().all(|block| holds(block, offsets::SRC_TEXEL, [0.25, 0.5]) && holds(block, offsets::FRAG_TEXEL, [0.25, 0.5]) && (read(block, offsets::PASS_SCALE) - 1.0).abs() < f32::EPSILON));
-        let dummy_draw = Draw { bindings: Bindings { src: Slot::Ping, original: None, user: NO_TEXTURES }, input: plan.source, original: plan.source, frag_offset: [0.0; 2], written: None, scale: 1.0 };
+        let dummy_draw = Draw { bindings: Bindings { src: Slot::Ping, original: None, state: None, user: NO_TEXTURES }, input: plan.source, original: plan.source, frag_offset: [0.0; 2], written: None, scale: 1.0, state: None, pass_index: 0 };
         let dummy = draw_uniforms(&frame, &dummy_draw, &allocations, passes[0].params());
         assert!(holds(&dummy, offsets::AUX_SCALE, [3.0, 3.0]), "a dummy original keeps the frame's aux mapping");
         assert!(holds(&blocks[2], offsets::PARAMS, [2.0, 2.0]));
@@ -489,7 +607,7 @@ mod tests {
     fn every_step_binds_the_capture_as_its_original() {
         for pass_count in 1..=5 {
             for window in [PxRect { x: 0, y: 0, w: 64, h: 32 }, PxRect { x: 16, y: 8, w: 7, h: 9 }] {
-                let Some(plan) = plan(&passes(pass_count), [64, 32], window, [3, 5], NO_TEXTURES) else { panic!("{pass_count} passes over a non-empty window") };
+                let Some(plan) = plan(&passes(pass_count), [64, 32], window, [3, 5], NO_TEXTURES, None) else { panic!("{pass_count} passes over a non-empty window") };
                 assert_eq!(plan.steps.len(), pass_count);
                 assert!(plan.steps.iter().all(|step| step.bindings.original == Some(Slot::Source)), "{pass_count} passes: every step maps the original");
                 assert_eq!(plan.composite.bindings.original, Some(Slot::Source));
@@ -523,7 +641,7 @@ mod tests {
         let chain: Vec<Pass> = scales.iter().map(|&scale| Pass::new(&effect).with_scale(scale)).collect();
         let capture = [101, 51];
         let whole = PxRect { x: 0, y: 0, w: 101, h: 51 };
-        let Some(plan) = plan(&chain, capture, whole, [7, 9], NO_TEXTURES) else { panic!("a scaled chain over the whole capture") };
+        let Some(plan) = plan(&chain, capture, whole, [7, 9], NO_TEXTURES, None) else { panic!("a scaled chain over the whole capture") };
         let used: Vec<[i32; 2]> = plan.steps.iter().map(|step| step.used_px).collect();
         assert_eq!(used, [[51, 26], [26, 13], [51, 26], [101, 51]]);
         assert_eq!(plan.target_px, [101, 51]);
@@ -532,7 +650,7 @@ mod tests {
         assert_eq!(plan.steps[3].written, plan.source, "a full step after scaled ones writes the capture resolution");
         assert_eq!(plan.composite.input, plan.source);
 
-        let allocations = Allocations { source: [101, 51], ping_pong: [[128, 64], [101, 51]] };
+        let allocations = Allocations { source: [101, 51], ping_pong: [[128, 64], [101, 51]], state: [[0, 0]; 2] };
         let frame = FrameUniforms { texel: [1.0 / 101.0, 1.0 / 51.0], ..FrameUniforms::default() };
         let blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = plan.steps.iter().map(|step| step_uniforms(&frame, &plan, step, &allocations, &chain[step.pass])).collect();
         // Step 0: full-resolution input (the source), 51x26 output.
@@ -550,7 +668,7 @@ mod tests {
         assert!(blocks.iter().all(|block| holds(block, offsets::AUX_SCALE, [1.0, 1.0])));
 
         // Ending on a scaled pass: the composite upsamples it (maps the small image, full texel).
-        let Some(ending) = super::plan(&chain[..2], capture, whole, [0, 0], NO_TEXTURES) else { panic!("planned") };
+        let Some(ending) = super::plan(&chain[..2], capture, whole, [0, 0], NO_TEXTURES, None) else { panic!("planned") };
         assert_eq!(ending.composite.input, ending.steps[1].written);
         assert_eq!(ending.target_px, [101, 51], "the pool is the window, also without a full-resolution step");
         assert!(ending.steps.iter().all(|step| step.used_px[0] <= 101 && step.used_px[1] <= 51));
@@ -561,10 +679,10 @@ mod tests {
         assert!(holds(&composite, offsets::FRAG_TEXEL, frame.texel) && (read(&composite, offsets::PASS_SCALE) - 1.0).abs() < f32::EPSILON);
 
         // A scaled chain over a window of the capture cannot be planned (tiling refuses it).
-        assert!(super::plan(&chain, capture, PxRect { x: 0, y: 0, w: 50, h: 51 }, [0, 0], NO_TEXTURES).is_none());
-        assert!(super::plan(&chain, capture, PxRect { x: 1, y: 0, w: 100, h: 51 }, [0, 0], NO_TEXTURES).is_none());
+        assert!(super::plan(&chain, capture, PxRect { x: 0, y: 0, w: 50, h: 51 }, [0, 0], NO_TEXTURES, None).is_none());
+        assert!(super::plan(&chain, capture, PxRect { x: 1, y: 0, w: 100, h: 51 }, [0, 0], NO_TEXTURES, None).is_none());
         // Unscaled chains keep planning windows.
-        assert!(super::plan(&passes(2), capture, PxRect { x: 1, y: 0, w: 100, h: 51 }, [0, 0], NO_TEXTURES).is_some());
+        assert!(super::plan(&passes(2), capture, PxRect { x: 1, y: 0, w: 100, h: 51 }, [0, 0], NO_TEXTURES, None).is_some());
     }
 
     /// F4: a step binds its pass's named block (layout-sized), a module without `struct Params`
@@ -591,12 +709,91 @@ mod tests {
         let chain = vec![Pass::new(&identity()), Pass::new(&reads_one)];
         let window = PxRect { x: 0, y: 0, w: 8, h: 8 };
         let attached = [false, true, false];
-        let Some(plan) = plan(&chain, [8, 8], window, [0, 0], attached) else { panic!("planned") };
+        let Some(plan) = plan(&chain, [8, 8], window, [0, 0], attached, None) else { panic!("planned") };
         assert!(plan.steps.iter().all(|step| step.bindings.user == attached));
         assert_eq!(plan.composite.bindings.user, NO_TEXTURES);
         assert_eq!(check_textures(&chain, attached), Ok(()));
         assert_eq!(check_textures(&chain, [true, false, true]), Err(TextureError::NotAttached { effect: "one".to_owned(), pass: 1, slot: 1 }));
         assert_eq!(check_textures(&passes(2), NO_TEXTURES), Ok(()), "effects reading no texture need none");
+    }
+
+    /// A state pass effect writing `state + 0.25`.
+    fn stepper() -> Effect {
+        match Effect::new_state("step", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state(uv) + vec4<f32>(0.25); }") {
+            Ok(effect) => effect,
+            Err(error) => panic!("the state stepper must compile: {error}"),
+        }
+    }
+
+    /// F7: state steps read the latest state and write the other state slot (swapping after each
+    /// step: substeps read what the previous one wrote), keep the display input for the pass after
+    /// them, number themselves apart from display steps, and display steps read the latest state.
+    #[test]
+    fn state_steps_ping_pong_the_state_and_keep_the_display_input() {
+        let (display, state) = (identity(), stepper());
+        let chain = vec![Pass::new(&display), Pass::new(&state), Pass::new(&state), Pass::new(&display)];
+        let capture = [101, 51];
+        let whole = PxRect { x: 0, y: 0, w: 101, h: 51 };
+        let input = StatePlanInput { scale: 0.5, current: 1, previous_px: Some([30, 20]), step: true };
+        let Some(plan) = plan(&chain, capture, whole, [0, 0], NO_TEXTURES, Some(input)) else { panic!("a stateful chain over the whole capture") };
+        let kinds: Vec<(StepKind, u32)> = plan.steps.iter().map(|step| (step.kind, step.pass_index)).collect();
+        assert_eq!(kinds, [(StepKind::Display, 0), (StepKind::State, 0), (StepKind::State, 1), (StepKind::Display, 1)]);
+        let wiring: Vec<(Slot, Option<Slot>, Slot)> = plan.steps.iter().map(|step| (step.bindings.src, step.bindings.state, step.output)).collect();
+        assert_eq!(
+            wiring,
+            [(Slot::Source, Some(Slot::StateB), Slot::Ping), (Slot::Ping, Some(Slot::StateB), Slot::StateA), (Slot::Ping, Some(Slot::StateA), Slot::StateB), (Slot::Ping, Some(Slot::StateB), Slot::Pong)],
+            "the display input does not advance past state steps; each state step reads what the previous wrote"
+        );
+        let previous = Content { logical_px: [30, 20], origin_px: [0, 0], full: false };
+        let stepped = Content { logical_px: [51, 26], origin_px: [0, 0], full: false };
+        assert_eq!(plan.steps.iter().map(|step| step.state).collect::<Vec<_>>(), [Some(previous), Some(previous), Some(stepped), Some(stepped)]);
+        assert!(plan.steps[1..3].iter().all(|step| step.written == stepped && step.used_px == [51, 26] && step.frag_offset == [0.0, 0.0] && (step.scale - 0.5).abs() < f32::EPSILON));
+        assert_eq!(plan.steps[1].input, plan.steps[0].written, "a state pass's src is the display chain's input");
+        assert_eq!(plan.composite.bindings, Bindings { src: Slot::Pong, original: Some(Slot::Source), state: None, user: NO_TEXTURES });
+        assert_eq!(plan.state, Some(StatePlan { clear: None, target_px: [51, 26], final_index: 1, final_px: [51, 26] }));
+
+        // Uniforms: a state read maps the content it reads (previous size first, new after).
+        let allocations = Allocations { source: [101, 51], ping_pong: [[101, 51]; 2], state: [[64, 32], [32, 32]] };
+        let frame = FrameUniforms { texel: [1.0 / 101.0, 1.0 / 51.0], ..FrameUniforms::default() };
+        let blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = plan.steps.iter().map(|step| step_uniforms(&frame, &plan, step, &allocations, &chain[step.pass])).collect();
+        assert!(holds(&blocks[1], offsets::STATE_SCALE, [30.0 / 32.0, 20.0 / 32.0]) && holds(&blocks[1], offsets::STATE_OFFSET, [0.0, 0.0]));
+        assert!(holds(&blocks[1], offsets::STATE_SIZE, [30.0, 20.0]) && holds(&blocks[1], offsets::STATE_TEXEL, [1.0 / 30.0, 1.0 / 20.0]));
+        assert!(holds(&blocks[1], offsets::FRAG_TEXEL, [1.0 / 51.0, 1.0 / 26.0]) && (read(&blocks[1], offsets::PASS_SCALE) - 0.5).abs() < f32::EPSILON);
+        assert!(holds(&blocks[2], offsets::STATE_SCALE, [51.0 / 64.0, 26.0 / 32.0]) && holds(&blocks[2], offsets::STATE_SIZE, [51.0, 26.0]));
+        let pass_index = |block: &[u8; UNIFORM_BLOCK_SIZE]| u32::from_ne_bytes([block[offsets::PASS_INDEX], block[offsets::PASS_INDEX + 1], block[offsets::PASS_INDEX + 2], block[offsets::PASS_INDEX + 3]]);
+        assert_eq!(blocks.iter().map(pass_index).collect::<Vec<_>>(), [0, 0, 1, 1]);
+        assert!(holds(&blocks[3], offsets::STATE_SCALE, [51.0 / 32.0, 26.0 / 32.0]), "the last display step reads state B at the new size");
+        let geometry = LayerGeometry { region: whole, capture: whole, rect_uv: [0.0; 4], region_uv: [0.0; 4], mask_rect_px: [0.0; 4], mask_radii_px: [0.0; 4], pixels_per_layer_point: 1.0 };
+        let composite = composite_uniforms(&frame, &plan, &allocations, &geometry);
+        assert!(holds(&composite, offsets::STATE_SIZE, frame.state_size) && holds(&composite, offsets::STATE_SCALE, frame.state[0]), "the composite binds the dummy state: the frame's neutral values");
+    }
+
+    /// F7: a new or reset state is cleared first (its readers see the new size); a repeated run
+    /// in the same frame skips the state steps; a chain of state passes only composites its input.
+    #[test]
+    fn state_plans_clear_skip_and_refuse() {
+        let (display, state) = (identity(), stepper());
+        let chain = vec![Pass::new(&display), Pass::new(&state)];
+        let whole = PxRect { x: 0, y: 0, w: 40, h: 20 };
+        let fresh = StatePlanInput { scale: 1.0, current: 0, previous_px: None, step: true };
+        let Some(cleared) = plan(&chain, [40, 20], whole, [0, 0], NO_TEXTURES, Some(fresh)) else { panic!("planned") };
+        let full = Content { logical_px: [40, 20], origin_px: [0, 0], full: true };
+        assert_eq!(cleared.state, Some(StatePlan { clear: Some(Slot::StateA), target_px: [40, 20], final_index: 1, final_px: [40, 20] }));
+        assert_eq!(cleared.steps[0].state, Some(full), "readers before the first write see the cleared state at the new size");
+
+        let repeat = StatePlanInput { scale: 1.0, current: 1, previous_px: Some([40, 20]), step: false };
+        let Some(skipped) = plan(&chain, [40, 20], whole, [0, 0], NO_TEXTURES, Some(repeat)) else { panic!("planned") };
+        assert_eq!(skipped.steps.len(), 1, "the state step is skipped");
+        assert_eq!(skipped.steps[0].bindings.state, Some(Slot::StateB));
+        assert_eq!(skipped.state, Some(StatePlan { clear: None, target_px: [40, 20], final_index: 1, final_px: [40, 20] }), "the state is left as it is");
+
+        let Some(only_state) = plan(&[Pass::new(&state)], [40, 20], whole, [0, 0], NO_TEXTURES, Some(repeat)) else { panic!("planned") };
+        assert!(only_state.steps.is_empty() && only_state.composite.bindings.src == Slot::Source);
+
+        assert!(plan(&chain, [40, 20], whole, [0, 0], NO_TEXTURES, None).is_none(), "a state pass needs the state");
+        assert!(plan(&chain, [40, 20], PxRect { x: 0, y: 0, w: 20, h: 20 }, [0, 0], NO_TEXTURES, Some(fresh)).is_none(), "stateful runs are never windowed");
+        let Some(stateless) = plan(&chain[..1], [40, 20], whole, [0, 0], NO_TEXTURES, None) else { panic!("planned") };
+        assert_eq!((stateless.steps[0].bindings.state, stateless.state), (None, None));
     }
 
     #[test]
