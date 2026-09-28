@@ -31,6 +31,10 @@ image = ["wgpu", "dep:image"]
 ## No extra Rust dependencies; the ffmpeg adapters need the `ffmpeg` and `ffprobe` programs.
 ## Image-sequence adapters when `image` is enabled too.
 video = ["wgpu"]
+## Hot reload of custom effects from WGSL files (`HotEffect`, `rebind`): a std thread polls the
+## file's modification time and recompiles it off the GUI thread. No extra dependencies. Native
+## only: on wasm32 (no file system, no threads) the feature compiles to nothing.
+hot-reload = []
 
 [dependencies]
 egui = { version = "0.36", default-features = false }

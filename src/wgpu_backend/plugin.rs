@@ -26,6 +26,12 @@ requested a discard gets no filter output for that pass.
 
 The capture is cleared like eframe clears the viewport the layer was painted in: immediate
 viewports to transparent, all others to `WgpuOptions::clear_color()`.
+
+The layer's attached user textures (F8) are resolved here too, at the end of the pass that
+painted it, exactly like the textures of its beneath meshes (`textures.rs`); a layer attaching an
+id that cannot be resolved is not planned (it draws nothing) and the id is reported once
+(`Shared::fail_texture`). The plan holds the bind groups (`Arc`-backed handles), so the textures
+stay alive until the frame is rendered even if egui frees them afterwards.
 */
 
 use std::sync::Arc;
@@ -33,7 +39,7 @@ use std::sync::Arc;
 use egui::{FullOutput, Shape};
 
 use super::beneath::{capture_points, find_callback, select_beneath, strip_callbacks};
-use super::textures::snapshot_textures;
+use super::textures::{resolve_user_textures, snapshot_textures};
 use super::{BeneathPlan, LoggedOnce, Pending, Shared};
 use crate::geometry::transform_scale;
 
@@ -123,6 +129,13 @@ fn plan_layer(ctx: &egui::Context, shared: &Shared, shapes: &[egui::epaint::Clip
     };
     let transform_scale = transform_scale(pending.rect, callback.rect);
     let capture = capture_points(callback.rect, clipped.clip_rect, pending.padding_points, transform_scale, pixels_per_point)?;
+    let user_textures = match resolve_user_textures(shared, pending.textures) {
+        Ok(resolved) => resolved,
+        Err(id) => {
+            shared.fail_texture(id);
+            return None;
+        }
+    };
 
     let selection = select_beneath(shapes.get(..index)?, capture);
     let mut primitives = ctx.tessellate(selection.shapes, pixels_per_point);
@@ -139,7 +152,7 @@ fn plan_layer(ctx: &egui::Context, shared: &Shared, shapes: &[egui::epaint::Clip
     #[allow(clippy::redundant_closure_for_method_calls)]
     let font_size = ctx.fonts(|fonts| fonts.font_image_size());
     let textures = snapshot_textures(shared, &primitives, font_size);
-    Some(BeneathPlan { callback_rect: callback.rect, clip_rect: clipped.clip_rect, transform_scale, primitives, textures, clear_color })
+    Some(BeneathPlan { callback_rect: callback.rect, clip_rect: clipped.clip_rect, transform_scale, primitives, textures, clear_color, user_textures })
 }
 
 #[cfg(test)]

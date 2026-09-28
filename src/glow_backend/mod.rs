@@ -8,7 +8,8 @@ and the latched state shared between the GUI thread and the paint callbacks.
 Key structures:
 - `GlowBackend`: the registered backend (`Arc<Mutex<GlowState>>` + chosen GLSL dialect).
 - `GlowState`: lazily created `Resources`, per-effect program cache, failure latches, effects
-  under per-pass GL error diagnosis (`suspects`).
+  under per-pass GL error diagnosis (`suspects`), attached user textures that could not be
+  resolved (`failed_textures`).
 
 Key functions:
 - `install_glow()`, `destroy_glow()` (public).
@@ -21,7 +22,10 @@ error latches the WHOLE backend (logged once at error level, reported by `status
 per-effect failure (GLSL translation, driver compile/link, or a GL error raised by that effect's
 draw) latches only that effect (layers using it are skipped, reported by `failed_effects()`); a
 framebuffer whose colour format cannot be captured skips only the layers painted into it (logged
-once per format). Nothing is retried per frame. Re-installing on the same context frees the
+once per format). An attached user texture `egui_glow::Painter::texture` does not know (freed,
+foreign) skips the layers attaching it (logged once per id, reported by `failed_textures()`);
+egui_glow applies a frame's texture deltas before painting and frees after, so a live id always
+resolves to its current texture. Nothing is retried per frame. Re-installing on the same context frees the
 previous glow backend's GL objects first.
 */
 
@@ -35,8 +39,8 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use glow::HasContext as _;
 
-use crate::backend::{Backend, BackendKind, BackendStatus, EffectFailure, InstallError, LayerJob, installed, register, uninstall};
-use crate::effect::CompiledModule;
+use crate::backend::{Backend, BackendKind, BackendStatus, EffectFailure, InstallError, LayerJob, TextureFailure, installed, register, uninstall};
+use crate::effect::{CompiledModule, TEXTURE_SLOTS};
 use glsl::{GlslTarget, glsl_target, translate};
 use resources::{GlError, Resources, build_program};
 
@@ -72,6 +76,9 @@ pub(crate) struct GlowState {
     /// Effects of a chain whose passes raised a GL error that could not be attributed to one of
     /// them; chains containing one run with a `glGetError` after every pass until attributed.
     suspects: HashSet<u64>,
+    /// Attached user textures `egui_glow::Painter::texture` could not resolve, by id (egui never
+    /// reuses an id, so an entry is permanent).
+    failed_textures: HashMap<egui::TextureId, TextureFailure>,
     /// Set by `destroy_glow`; a late callback must not recreate resources.
     destroyed: bool,
 }
@@ -131,6 +138,20 @@ impl GlowState {
         self.failed_effects.insert(module.id, FailedEffect { module: Arc::downgrade(module), failure });
     }
 
+    /// Records that the attached user texture `id` could not be resolved (logged once per id).
+    fn fail_texture(&mut self, id: egui::TextureId) {
+        if self.failed_textures.contains_key(&id) {
+            return;
+        }
+        let error = "egui_glow's painter has no texture with this id (freed, or never allocated on this painter)".to_owned();
+        log::error!(
+            "egui_filter_layers (glow): a filter layer attaches texture {id:?}, which cannot be resolved; layers attaching it draw nothing extra.\n\
+             Error: {error}\n\
+             Possible cause: the TextureHandle was dropped (egui freed the texture) while the layer still attaches its id."
+        );
+        self.failed_textures.insert(id, TextureFailure { id, error });
+    }
+
     /// The program for `module`, building and caching it on first use.
     ///
     /// Returns `None` when this effect failed (now or earlier); the failure is logged once.
@@ -177,6 +198,7 @@ impl GlowState {
             }
         }
         self.failed_effects.clear();
+        self.failed_textures.clear();
         self.suspects.clear();
         self.destroyed = true;
     }
@@ -234,6 +256,10 @@ impl Backend for GlowBackend {
         self.lock().failed_effects.values().map(|entry| entry.failure.clone()).collect()
     }
 
+    fn failed_textures(&self) -> Vec<TextureFailure> {
+        self.lock().failed_textures.values().cloned().collect()
+    }
+
     fn paint_layer(&self, painter: &egui::Painter, job: LayerJob) {
         let Ok(target) = self.target.clone() else {
             return;
@@ -242,10 +268,24 @@ impl Backend for GlowBackend {
         let rect = job.rect;
         let callback = egui_glow::CallbackFn::new(move |info, glow_painter| {
             let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+            // egui_glow applied this frame's texture deltas before painting, so a live id maps to
+            // its current texture; an unknown one skips the layer (no dummy stands in for it).
+            let mut user_textures = [None; TEXTURE_SLOTS];
+            for (resolved, id) in user_textures.iter_mut().zip(job.textures) {
+                let Some(id) = id else {
+                    continue;
+                };
+                let Some(texture) = glow_painter.texture(id) else {
+                    state.fail_texture(id);
+                    return;
+                };
+                *resolved = Some(texture);
+            }
             // SAFETY: egui_glow invokes paint callbacks on the thread that owns the current
             // context, between its own draws; `render::paint_layer` restores the framebuffer
-            // bindings and leaves none of its objects bound (egui re-runs prepare_painting).
-            unsafe { render::paint_layer(glow_painter.gl(), &mut state, target, &info, &job) };
+            // bindings and leaves none of its objects bound (egui re-runs prepare_painting). The
+            // user textures belong to `glow_painter`, alive for this callback.
+            unsafe { render::paint_layer(glow_painter.gl(), &mut state, target, &info, &job, user_textures) };
         });
         painter.add(egui::PaintCallback { rect, callback: Arc::new(callback) });
     }

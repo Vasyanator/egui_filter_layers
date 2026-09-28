@@ -215,8 +215,9 @@ impl egui_wgpu::CallbackTrait for FilterCallback {
         let Some(plan) = plan else {
             if LoggedOnce::first(&self.shared.logged.missing_plan) {
                 log::debug!(
-                    "egui_filter_layers (wgpu): a filter layer reached the renderer without its backdrop plan (invisible, or painted \
-                     outside an egui pass that ended with Context::end_pass); it draws nothing this frame. Logged once."
+                    "egui_filter_layers (wgpu): a filter layer reached the renderer without its backdrop plan (invisible, an attached \
+                     texture that cannot be resolved (see failed_textures), or painted outside an egui pass that ended with \
+                     Context::end_pass); it draws nothing this frame. Logged once."
                 );
             }
             return Vec::new();
@@ -310,6 +311,7 @@ impl FilterCallback {
             input: self.job.frame_input.resolve(rec.pixels_per_point, rec.geometry.capture),
             passes: &self.job.passes,
             pipelines,
+            user_textures: plan.user_textures.each_ref().map(Option::as_ref),
         };
         targets.composite = resources.chain.record(&mut chain_rec, &mut targets.chain, &job);
     }

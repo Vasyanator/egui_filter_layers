@@ -11,10 +11,11 @@ render target. Holds no egui state: callers bring `&wgpu::Device`, `&wgpu::Queue
 device use exactly the same objects, formats, uniform layout and pass order.
 
 Key structures:
-- `ChainResources`: per-device objects (linear and nearest samplers, the ONE `@group(0)` bind
-  group layout of every effect and composite pipeline, dummies for bindings a draw leaves unused,
-  intermediate format, uniform offset alignment, effect pipeline cache); builds composite pipelines for any
-  output format.
+- `ChainResources`: per-device objects (the linear sampler, the ONE `@group(0)` bind group layout
+  of every effect and composite pipeline, the user texture group layout (egui-wgpu's texture
+  layout, groups 1..=3 of effect pipelines), dummies for bindings a draw leaves unused,
+  intermediate format, uniform offset alignment, effect pipeline cache); builds composite
+  pipelines for any output format.
 - `ChainTargets`: per-concurrent-run ping-pong intermediates and the uniform buffer.
 - `ChainSource`, `ChainRecording`, `ChainJob`, `ChainWindow`: the inputs of one recorded run.
 
@@ -31,9 +32,12 @@ Key functions:
 Notes:
 One uniform buffer per run holds, for draw `i` (plan step `i`; draw `n` = the composite), its
 `fl` block and then its named-parameter block, each at an offset aligned to the device's
-`min_uniform_buffer_offset_alignment` (`[fl_0, p_0, fl_1, p_1, …]`). Every draw binds all eight
+`min_uniform_buffer_offset_alignment` (`[fl_0, p_0, fl_1, p_1, …]`). Every draw binds all seven
 `@group(0)` entries of the prelude's layout; a texture binding the plan leaves empty gets a dummy
-(transparent texture, white coverage).
+(transparent texture, white coverage). Effect pipelines have three more groups, the user texture
+slots (`@group(1 + i)`): each step binds the caller's bind group of the attached texture (egui's
+own in the UI, the renderer's in offline runs) where the plan says so, a dummy group elsewhere.
+Composite pipelines read no user texture and use the group-0-only layout.
 Textures are stored top-down on wgpu, so `flip_y` is false.
 A run computes a WINDOW of the capture (`ChainWindow`): the UI always uses the whole capture; the
 offline tiler runs one window per tile. Fragments derive their capture uv from their pixel
@@ -44,10 +48,10 @@ arithmetic does not depend on which window computed it.
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
-use super::gpu::{GrowBuffer, Target, begin_pass, pass_pipeline, renderable_and_filterable, sampler_entry, texture_entry, uniform_entry, with_error_scope};
+use super::gpu::{GrowBuffer, Target, begin_pass, egui_texture_entries, pass_pipeline, renderable_and_filterable, sampler_entry, texture_entry, uniform_entry, with_error_scope};
 use crate::effect::{
-    BINDING_COVERAGE_TEXTURE, BINDING_NEAREST_SAMPLER, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, CompiledModule, composite_add_linear_module, composite_add_module,
-    composite_erase_module, composite_linear_module, composite_module,
+    BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, CompiledModule, TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING, USER_TEXTURE_GROUP_BASE,
+    composite_add_linear_module, composite_add_module, composite_erase_module, composite_linear_module, composite_module,
 };
 use crate::geometry::{LayerGeometry, PxRect, px_f32};
 use crate::pass::{FrameUniforms, InputUniforms, Pass, UNIFORM_BLOCK_SIZE};
@@ -98,14 +102,18 @@ pub(crate) struct ChainResources {
     /// Alignment of every block's offset in a run's uniform buffer
     /// (`min_uniform_buffer_offset_alignment`).
     uniform_alignment: u64,
-    /// Linear, clamp-to-edge sampler (`fl_sampler`).
+    /// Linear, clamp-to-edge sampler (`fl_sampler`; also the dummy user group's sampler).
     sampler: wgpu::Sampler,
-    /// Nearest, clamp-to-edge sampler (`fl_nearest_sampler`).
-    nearest_sampler: wgpu::Sampler,
     /// The `@group(0)` layout of the prelude, shared by every effect and composite pipeline.
     layout: wgpu::BindGroupLayout,
-    /// Pipeline layout of every effect and composite pipeline.
+    /// Layout of each user texture group (`@group(1..=3)`): egui-wgpu's texture layout.
+    user_layout: wgpu::BindGroupLayout,
+    /// Pipeline layout of every composite pipeline (`@group(0)` only).
     pipeline_layout: wgpu::PipelineLayout,
+    /// Pipeline layout of every effect pipeline: `@group(0)` and the three user texture groups.
+    effect_pipeline_layout: wgpu::PipelineLayout,
+    /// Bound at a user texture group the plan leaves empty (transparent 1x1, linear sampler).
+    dummy_user: wgpu::BindGroup,
     /// Bound where a draw has no texture: 1x1 transparent (state; an original the plan leaves empty).
     transparent: wgpu::TextureView,
     /// Bound where a draw has no mask coverage texture: 1x1 opaque white.
@@ -133,7 +141,6 @@ impl ChainResources {
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             });
-            let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("egui_filter_layers nearest sampler"), ..Default::default() });
             // A layout may hold entries a shader does not use, so this one layout serves every
             // module; the params block is unsized (`None`): a module may declare any size there
             // (wgpu checks the bound range against the pipeline's struct size at draw time).
@@ -147,12 +154,27 @@ impl ChainResources {
                     uniform_entry(BINDING_PARAMS, None),
                     texture_entry(BINDING_STATE_TEXTURE),
                     texture_entry(BINDING_COVERAGE_TEXTURE),
-                    sampler_entry(BINDING_NEAREST_SAMPLER),
                 ],
             });
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("egui_filter_layers group 0"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+            // egui-wgpu's texture layout, so egui's own per-texture bind groups bind here.
+            let user_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers user texture"), entries: &egui_texture_entries() });
+            let effect_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("egui_filter_layers effect"),
+                bind_group_layouts: &[Some(&layout), Some(&user_layout), Some(&user_layout), Some(&user_layout)],
+                immediate_size: 0,
+            });
             // Zero-initialized by wgpu (textures and buffers are cleared before first use).
             let transparent = dummy_texture(device, "egui_filter_layers transparent dummy");
+            let transparent = transparent.create_view(&wgpu::TextureViewDescriptor::default());
+            let dummy_user = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("egui_filter_layers empty user texture"),
+                layout: &user_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: USER_TEXTURE_BINDING, resource: wgpu::BindingResource::TextureView(&transparent) },
+                    wgpu::BindGroupEntry { binding: USER_SAMPLER_BINDING, resource: wgpu::BindingResource::Sampler(&sampler) },
+                ],
+            });
             let white_texture = dummy_texture(device, "egui_filter_layers white dummy");
             queue.write_texture(white_texture.as_image_copy(), &[u8::MAX; 4], wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) }, wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 });
             Self {
@@ -160,10 +182,12 @@ impl ChainResources {
                 intermediate_format,
                 uniform_alignment,
                 sampler,
-                nearest_sampler,
                 layout,
+                user_layout,
                 pipeline_layout,
-                transparent: transparent.create_view(&wgpu::TextureViewDescriptor::default()),
+                effect_pipeline_layout,
+                dummy_user,
+                transparent,
                 white: white_texture.create_view(&wgpu::TextureViewDescriptor::default()),
                 pipelines: HashMap::new(),
             }
@@ -190,10 +214,18 @@ impl ChainResources {
         if let Some(entry) = self.pipelines.get(&module.id) {
             return Ok(entry.pipeline.clone());
         }
-        let pipeline = with_error_scope(device, || pass_pipeline(device, &self.pipeline_layout, module, self.intermediate_format, None, wgpu::MultisampleState::default(), None))?;
+        let pipeline = with_error_scope(device, || pass_pipeline(device, &self.effect_pipeline_layout, module, self.intermediate_format, None, wgpu::MultisampleState::default(), None))?;
         log::debug!("egui_filter_layers (wgpu): built pipeline for effect `{}`", module.label);
         self.pipelines.insert(module.id, CachedPipeline { module: Arc::downgrade(module), pipeline: pipeline.clone() });
         Ok(pipeline)
+    }
+
+    /// The layout of a user texture group (egui-wgpu's texture layout: texture at
+    /// `USER_TEXTURE_BINDING`, its sampler at `USER_SAMPLER_BINDING`). Callers that own their
+    /// textures (offline) create their `ChainJob::user_textures` bind groups with it.
+    #[cfg_attr(not(any(feature = "image", feature = "video")), allow(dead_code))] // The UI binds egui's own bind groups.
+    pub(crate) fn user_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.user_layout
     }
 
     /// Drops pipelines of effects whose last clone was dropped.
@@ -247,7 +279,8 @@ impl ChainResources {
         if job.pipelines.len() != job.passes.len() {
             return None;
         }
-        let plan = plan(job.passes, job.geometry.capture.size(), job.window.rect, job.window.composite_origin)?;
+        let attached = job.user_textures.map(|texture| texture.is_some());
+        let plan = plan(job.passes, job.geometry.capture.size(), job.window.rect, job.window.composite_origin, attached)?;
         // Both ping-pong targets hold every step's viewport (the plan's pool size) at least.
         let needed = [plan.target_px[0].max(job.window.min_target_size[0]), plan.target_px[1].max(job.window.min_target_size[1])];
         for (index, slot) in targets.ping_pong.iter_mut().enumerate() {
@@ -281,7 +314,6 @@ impl ChainResources {
                     wgpu::BindGroupEntry { binding: BINDING_PARAMS, resource: wgpu::BindingResource::Buffer(params) },
                     wgpu::BindGroupEntry { binding: BINDING_STATE_TEXTURE, resource: wgpu::BindingResource::TextureView(&self.transparent) },
                     wgpu::BindGroupEntry { binding: BINDING_COVERAGE_TEXTURE, resource: wgpu::BindingResource::TextureView(&self.white) },
-                    wgpu::BindGroupEntry { binding: BINDING_NEAREST_SAMPLER, resource: wgpu::BindingResource::Sampler(&self.nearest_sampler) },
                 ],
             })
         };
@@ -293,6 +325,11 @@ impl ChainResources {
             pass.set_viewport(0.0, 0.0, px_f32(step.used_px[0]), px_f32(step.used_px[1]), 0.0, 1.0);
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &group, &[]);
+            for ((group, bind), texture) in (USER_TEXTURE_GROUP_BASE..).zip(step.bindings.user).zip(job.user_textures) {
+                // The plan binds a slot only where the caller attached a bind group (`attached`
+                // came from `job.user_textures`), so `texture` is `Some` whenever `bind` holds.
+                pass.set_bind_group(group, texture.filter(|_| bind).unwrap_or(&self.dummy_user), &[]);
+            }
             pass.draw(0..3, 0..1);
         }
         Some(bind_group(uniforms.draws.get(plan.steps.len())?, plan.composite.bindings))
@@ -390,6 +427,9 @@ pub(crate) struct ChainJob<'a> {
     pub passes: &'a [Pass],
     /// `passes[i]`'s pipeline from `ChainResources::effect_pipeline`, same order and length.
     pub pipelines: &'a [wgpu::RenderPipeline],
+    /// The bind group of the texture attached at each user texture slot, in the layout of
+    /// [`ChainResources::user_layout`] (egui's own bind groups in the UI); `None` = nothing attached.
+    pub user_textures: [Option<&'a wgpu::BindGroup>; TEXTURE_SLOTS],
 }
 
 /// The layer's `FrameUniforms` with the wgpu flags: textures are stored top-down, like the effect
@@ -490,7 +530,7 @@ mod tests {
         let mut passes: Vec<Pass> = (0..3).map(|index| Pass::new(&effect).with_param(0, [f32::from(u8::try_from(index).unwrap_or(0)); 4]).unwrap_or_else(|error| panic!("{error}"))).collect();
         passes[1] = Pass::new(&named).with("color", [1.0, 2.0, 3.0, 4.0]).unwrap_or_else(|error| panic!("{error}"));
         let window = PxRect { x: 0, y: 0, w: 40, h: 30 };
-        let Some(plan) = plan(&passes, window.size(), window, [5, 6]) else { panic!("planned") };
+        let Some(plan) = plan(&passes, window.size(), window, [5, 6], [false; TEXTURE_SLOTS]) else { panic!("planned") };
         let geometry = LayerGeometry { region: window, capture: window, rect_uv: [0.0, 0.0, 1.0, 1.0], region_uv: [0.0, 0.0, 1.0, 1.0], mask_rect_px: [0.0, 0.0, 40.0, 30.0], mask_radii_px: [0.0; 4], pixels_per_layer_point: 1.0 };
         let allocations = Allocations { source: [64, 64], ping_pong: [[40, 30], [128, 32]] };
         let frame = frame_uniforms(&geometry, 0.5);

@@ -97,6 +97,22 @@ pub enum OfflineError {
         /// Why the chain cannot be tiled.
         reason: String,
     },
+    /// The attached user textures cannot serve the chain: an invalid slot, or an effect reading a
+    /// slot with no texture (see [`OfflineOptions::with_texture`](super::OfflineOptions::with_texture)).
+    #[error("the chain's textures are unusable: {0}")]
+    Texture(#[from] crate::TextureError),
+    /// A user texture is larger than the device can hold.
+    #[error("the texture at slot {slot} is {width}x{height} pixels, but this device allows at most {max} per side")]
+    TextureTooLarge {
+        /// The slot.
+        slot: usize,
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// The device's `max_texture_dimension_2d`.
+        max: u32,
+    },
     /// The device rejected an effect's shader or pipeline.
     #[error("effect `{label}` was rejected by the GPU: {message}")]
     Effect {

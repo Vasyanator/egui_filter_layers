@@ -30,7 +30,9 @@ frame stream needs (`video/` builds on exactly that).
 ## Files and submodules
 - `mod.rs`: `OfflineRenderer` (constructors, `process` / `process_into` / `process_async`,
   `run`, per-tile recording), `frame_geometry`, upload / readback copies.
-- `options.rs`: `OfflineOptions` (validated before GPU work; `delta_time` / `frame` remember
+- `texture.rs`: `OfflineTexture` (owned premultiplied RGBA8 + egui `TextureOptions`, shared by
+  clones; `from_color_image` = egui's upload bytes; identity decides re-uploads).
+- `options.rs`: `OfflineOptions` (user textures per slot, `with_texture`; validated before GPU work; `delta_time` / `frame` remember
   whether they were set, so a video processor fills only unset ones), `PointerState` (frame uv),
   `input_uniforms` (the run's `fl.delta_time` / `fl.frame` / `fl.pointer`, the pointer through
   the UI's `geometry::pointer_uniform`).
@@ -59,6 +61,11 @@ frame stream needs (`video/` builds on exactly that).
   one tile, `run` returns `OfflineError::NotTileable` before any GPU work (scaled sizes are
   rounded over the WHOLE frame; tile windows cannot reproduce them). Whole-frame runs equal the
   UI bit for bit (same targets, same plan).
+- User textures: checked against the chain with the UI's `plan::check_textures` before any GPU
+  work (`OfflineError::Texture`); each slot's upload (`Rgba8Unorm`, egui-wgpu's sampler for its
+  options, `ChainResources::user_layout`) is kept while the same `OfflineTexture` stays attached
+  and dropped when the slot empties; uploads run in awaited `ErrorScopes`. They are sampled in
+  their own uv, so tiles need nothing for them (tiled == whole, tested).
 - Tiles overlap by the chain padding + 1 px; effects must read no further than their sample radius
   (the `lens` preset needs an explicit radius when tiled).
 - Every size is checked (`MAX_SIDE` = 2^24 - 1 per side, `usize` / `u32` / `u64` arithmetic);

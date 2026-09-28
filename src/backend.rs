@@ -11,10 +11,12 @@ Key structures:
 - `FrameInput` / `PointerInput` (crate-internal): the per-frame input a layer reads on the GUI
   thread (`fl.delta_time`, `fl.frame`, `fl.pointer`), resolved per capture by `FrameInput::resolve`.
 - `BackendKind`, `BackendStatus`, `EffectFailure`, `InstallError` (public).
+- `TextureError` (public): a layer's user textures cannot serve its effects (checked before any
+  backend work); `TextureFailure` (public): an attached texture a backend could not resolve.
 
 Key functions:
 - `register()` / `installed()` / `uninstall()` (crate-internal): the per-context registry.
-- `status()`, `failed_effects()` (public, re-exported at the crate root).
+- `status()`, `failed_effects()`, `failed_textures()` (public, re-exported at the crate root).
 
 Notes:
 The registry is one `Arc<dyn Backend>` held by a hook-less egui plugin (`Registry`), so any code
@@ -27,8 +29,9 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use egui::{Context, CornerRadius, Painter, Pos2, Rect};
+use egui::{Context, CornerRadius, Painter, Pos2, Rect, TextureId};
 
+use crate::effect::TEXTURE_SLOTS;
 use crate::geometry::{PxRect, pointer_uniform};
 use crate::pass::{InputUniforms, Pass};
 
@@ -110,6 +113,45 @@ pub struct EffectFailure {
     pub error: String,
 }
 
+/// Why a layer's user textures cannot serve its effects. Checked before any GPU work:
+/// [`crate::FilterLayer::check_textures`] (what `FilterLayer::paint` runs; the layer is then
+/// skipped and the error logged once per context) and the offline renderer
+/// (`OfflineError::Texture`).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum TextureError {
+    /// A texture was attached at a slot that does not exist.
+    #[error("texture slot {slot} does not exist; the slots are 0..{TEXTURE_SLOTS}")]
+    InvalidSlot {
+        /// The slot given.
+        slot: usize,
+    },
+    /// An effect of the chain reads a slot (`tex`, `tex_size`, `tex_load`; see
+    /// [`crate::Effect::reads_texture`]) where nothing is attached.
+    #[error("effect `{effect}` (pass {pass}) reads texture slot {slot}, but no texture is attached there")]
+    NotAttached {
+        /// The effect's label.
+        effect: String,
+        /// Index of its pass in the chain.
+        pass: usize,
+        /// The slot it reads.
+        slot: usize,
+    },
+}
+
+/// An attached user texture the installed backend could not resolve when it painted a layer:
+/// the `TextureId` is unknown to egui's renderer (freed, or never allocated on this painter).
+/// Layers attaching it draw nothing extra. egui never reuses a `TextureId`, so the entry stays
+/// for the backend's lifetime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TextureFailure {
+    /// The texture.
+    pub id: TextureId,
+    /// Why it could not be used.
+    pub error: String,
+}
+
 /// Why a backend could not be installed.
 #[derive(Clone, Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -139,6 +181,9 @@ pub(crate) struct LayerJob {
     pub time: f32,
     /// Per-frame input read at paint time (`fl.delta_time`, `fl.frame`, `fl.pointer`).
     pub frame_input: FrameInput,
+    /// The user texture attached at each slot (`FilterLayer::texture`); every slot an effect of
+    /// `passes` reads is `Some` (checked by `plan::check_textures` before the job is built).
+    pub textures: [Option<TextureId>; TEXTURE_SLOTS],
 }
 
 /// The pointer as the GUI thread saw it when the layer was painted.
@@ -190,6 +235,8 @@ pub(crate) trait Backend: Send + Sync + 'static {
     fn status(&self) -> BackendStatus;
     /// Effects this backend failed to build.
     fn failed_effects(&self) -> Vec<EffectFailure>;
+    /// Attached user textures this backend could not resolve.
+    fn failed_textures(&self) -> Vec<TextureFailure>;
     /// Paints one filter layer. Must never panic; failures are latched and logged.
     fn paint_layer(&self, painter: &Painter, job: LayerJob);
     /// Downcasting hook for backend-specific teardown (e.g. `destroy_glow`).
@@ -253,6 +300,14 @@ pub fn failed_effects(ctx: &Context) -> Vec<EffectFailure> {
     installed(ctx).map_or_else(Vec::new, |backend| backend.failed_effects())
 }
 
+/// Attached user textures (`FilterLayer::texture`) the installed backend could not resolve when
+/// painting (freed or foreign `TextureId`s); layers using them draw nothing extra. Each is also
+/// logged once at `error` level. Empty when none failed or none installed.
+#[must_use]
+pub fn failed_textures(ctx: &Context) -> Vec<TextureFailure> {
+    installed(ctx).map_or_else(Vec::new, |backend| backend.failed_textures())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +317,7 @@ mod tests {
         let ctx = Context::default();
         assert_eq!(status(&ctx), BackendStatus::NotInstalled);
         assert!(failed_effects(&ctx).is_empty());
+        assert!(failed_textures(&ctx).is_empty());
         assert!(!status(&ctx).is_usable());
     }
 
@@ -276,6 +332,9 @@ mod tests {
             BackendStatus::Installed { backend: BackendKind::Glow }
         }
         fn failed_effects(&self) -> Vec<EffectFailure> {
+            Vec::new()
+        }
+        fn failed_textures(&self) -> Vec<TextureFailure> {
             Vec::new()
         }
         fn paint_layer(&self, _painter: &Painter, _job: LayerJob) {}

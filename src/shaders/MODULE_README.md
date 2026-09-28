@@ -5,8 +5,11 @@ WGSL sources compiled into the crate with `include_str!` (by `effect.rs`).
 
 ## Files
 - `prelude.wgsl`: prepended to every effect. Declares `FlUniforms` / `fl`, the WHOLE `@group(0)`
-  resource layout (bindings 0-3 and 5-7; 4 is the named-parameter block `p: Params`, which
-  `effect/` appends AFTER a snippet declaring `struct Params`), the public helpers (`src`, `src_px`, `src_texel`, `out_texel`, `original`, `params`, colour helpers), and both entry points
+  resource layout (bindings 0-3 and 5-6; 4 is the named-parameter block `p: Params`, which
+  `effect/` appends AFTER a snippet declaring `struct Params`), the user texture groups 1..=3
+  (`fl_userN` at 0, `fl_userN_sampler` at 1: egui-wgpu's texture layout), the public helpers
+  (`src`, `src_px`, `src_texel`, `out_texel`, `original`, `params`, `tex`, `tex_size`,
+  `tex_load`, colour helpers), and both entry points
   (`fl_vertex`: attribute-less full-viewport triangle; `fl_fragment`: computes the fragment's
   capture uv with `fl_capture_uv` and calls the user's `effect`).
   It must stay BEFORE user code so snippet line numbers are a plain offset.
@@ -35,5 +38,9 @@ WGSL sources compiled into the crate with `include_str!` (by `effect.rs`).
   `clamp(uv) * internal_*_scale - internal_*_offset`; offsets are 0 for a whole-capture window, so
   glow and the UI see exactly the pre-window arithmetic. The edge clamp uses the SAMPLED image's
   pixel: `internal_src_texel` for `src` (a scaled input), `fl.texel` for `original`.
-- Only `textureSampleLevel` is used (valid in non-uniform control flow, translates to `textureLod`).
+- Only `textureSampleLevel` (valid in non-uniform control flow, translates to `textureLod`) and
+  `textureLoad` (`texelFetch`) read textures. The slot helpers `tex` / `tex_size` / `tex_load` take
+  the slot as their FIRST argument and `switch` on it (a slot `>= 3` yields zero); `effect/`'s
+  `texture_slots` relies on that signature and on these three being the only prelude functions
+  that name `fl_user*` globals.
 - Public names listed in the crate docs are API; `fl_*` / `internal_*` names are private.

@@ -488,6 +488,8 @@ Each phase is marked done here in the same commit that lands it.
 - Phase 2c (F4 named parameters: `struct Params` detected by a pre-parse token scan, crate tail `@group(0) @binding(4) var<uniform> p: Params;`, `ParamLayout` = naga offsets (= std140), unsupported members / arrays with a non-16 stride / > 16 KiB rejected as located `EffectError::Interface`; `Effect::params()` / `param()`, `Pass::set` / `with` / `set_slice` / `get` / `get_slice`, `ParamError`; `plan::params_block` owns binding 4's bytes; wgpu `[fl_i, p_i]` at offset alignment, glow second UBO at binding point 1; `effect.rs` split into `src/effect/`): done.
 - Phase 3b (F6: `Pass::with_scale` clamped to `[MIN_PASS_SCALE = 1/1024, 1]`, non-finite = 1; `plan.rs` owns per-step `Content` (resolution + window), viewports `scaled_px = ceil(capture * s)` (f32 rounding error removed), the pool size `target_px`, per-step `src_texel` / `frag_texel` / `pass_scale`; the composite upsamples a scaled last output; `internal_src_texel` added to `FlUniforms` (432 bytes); prelude `src_texel()` / `out_texel()`, `src_px` in input pixels; both backends size targets and viewports from the plan; offline `OfflineError::NotTileable` when a scaled chain would need tiles; presets `kawase_blur(radius)` (dual-Kawase pyramid, up to 8 levels) and `bloom(threshold, intensity, radius)`; GPU tests wgpu + glow + offline, UI == offline bit for bit for scaled chains): done.
 - Phase 3a (F3 `Impulses` in `src/impulses.rs` + `presets::click_ripples`: layer-rect uv, oldest-first drop at 16 / `with_capacity`, `pack` / `apply` into named params `impulses` / `impulse_count`, `request_repaint_if_alive` the only `Context` use; compact-support wave packet clamped to `|amplitude|` = sample radius; GPU tests wgpu + glow): done.
+- Phase 6 (F5 hot reload, feature `hot-reload`, `src/hot.rs`: `HotEffect::watch` / `watch_with` + `HotOptions` (interval, repaint `Context`, set-up closure), `poll` -> `HotReloadEvent`, `current` / `error` / `status_text`, `HotReloadError` (missing / io / compile with diagnostic / spawn / stopped), free fn `rebind(&Pass, &Effect) -> Rebound`; not compiled on wasm32): done.
+- Phase 3c (F8 user textures: `FilterLayer::texture(slot, TextureId)` / `texture_at` / `check_textures`, `TEXTURE_SLOTS` = 3; prelude `tex(i, uv)` (the texture's own sampler = its egui `TextureOptions`), `tex_size(i)`, `tex_load(i, px)` (`textureLoad`); `fl_user0..2` + samplers at `@group(1..=3)` = egui-wgpu's texture layout; binding 7 (`fl_nearest_sampler`) removed; `Effect::reads_texture` from an IR scan (constant slot = that slot, computed = all); `plan::check_textures` refuses a layer / offline run reading an unattached slot (`TextureError`, logged once per context in the UI); `plan::Bindings::user`; wgpu binds egui's own bind group per slot (kept copies for full uploads not yet applied), dummy groups elsewhere, composites group 0 only; glow units 4..6 from `Painter::texture`; unresolvable ids skip the layer and are reported by `failed_textures()` (`TextureFailure`, latched per id); offline `OfflineTexture` (`new` / `from_color_image`) + `OfflineOptions::with_texture`, uploaded once per texture identity, `OfflineError::Texture` / `TextureTooLarge`; glow params UBO grow-only + `glBufferSubData`; GPU tests wgpu + glow + offline (UI == offline bit for bit, tiled == whole), glow scenes for `original()` in later passes and `fl.pointer` / `delta_time` / `frame`): done.
 
 ## 18. Findings during execution
 - Phase 1: naga's GLSL writer rejects one texture read through two samplers in one module
@@ -549,3 +551,49 @@ Each phase is marked done here in the same commit that lands it.
   of scaled passes only: sizing it to the largest scaled viewport would let the UI allocate
   smaller targets than the offline run (which pins them to the frame), changing the bilinear
   weights of the upsample; with the window both match bit for bit (tested).
+- Phase 6 (F5): deviations from §10. The FIRST compile is asynchronous too (`current()` is
+  `Option<&Effect>`, `None` until it succeeds; `watch` fails only when the thread cannot spawn):
+  a synchronous first read + naga compile would be file I/O and heavy work on the GUI thread
+  (AGENTS.md §5). The re-bind helper is the free function `hot::rebind` (re-exported), not
+  `Pass::rebind`: `pass.rs` belonged to the parallel phase 3c, and the public `Pass` API suffices,
+  except that a sample-radius override is inferred (effective radius != old effect's radius).
+  Moving it to `Pass::rebind` later is a pure relocation. `watch_state` is left to F7 (phase 4).
+  `HotReloadEvent` carries no payload (the error is read through `error()`); `Reloaded` wins when
+  one poll drains both a reload and a later failure, so a caller never misses a rebind.
+  On wasm32 the feature is accepted and compiles to nothing (a `compile_error!` would break
+  `--all-features` wasm builds).
+- Phase 3c (F8): §6's `tex_linear(i, uv)` / `tex_nearest(i, uv)` (crate samplers) are NOT
+  provided: with the texture's own sampler they would read one texture through two samplers,
+  which naga's GLSL writer rejects (Phase 1 finding). Each texture has ONE sampler (its egui
+  `TextureOptions`, which the app chooses at `load_texture`) and exact reads go through
+  `tex_load(i, px)` = `textureLoad`, which naga's writer combines with that same sampler (one
+  GLSL `sampler2D`, `textureLod` + `texelFetch`; pinned by
+  `user_texture_helpers_translate_one_unit_per_slot`). Nothing else used `fl_nearest_sampler`, so
+  binding 7 is gone (layout: 7 entries in group 0; glow units 0..=6, no sampler objects); F7's
+  `state(uv)` should read with `textureLoad` too. The glow failure-scene test now provokes the
+  "multiple samplers" error with `fl_user0_sampler` on `fl_src_texture` (the layers attach slot 0);
+  `textureNumLevels` was no alternative (naga translates it for GLSL 330).
+- Phase 3c: missing vs. unresolvable textures are two different contracts. A slot an effect
+  reads with nothing attached is known on the GUI thread from the IR, so it is a typed
+  `TextureError` from `FilterLayer::check_textures` (what `paint` runs: the layer draws nothing,
+  logged once per context and message; offline `OfflineError::Texture`) — never a dummy. Whether an
+  attached id is alive is only known where the renderer is (wgpu: the end-of-pass plugin; glow:
+  the paint callback), so an unknown / freed id skips the layer there, is logged once per id and
+  listed by the new `failed_textures(ctx)` (`TextureFailure { id, error }`), permanent per id since
+  egui never reuses `TextureId`s. Slot detection is conservative: a computed slot index (or a
+  helper call in an unused function) demands every slot; the helpers take the slot as their first
+  argument by contract.
+- Phase 3c: API deviations from §6. Offline textures are an owned `OfflineTexture` (not a
+  borrowed `FrameRef` in the options, which would give `OfflineOptions` a lifetime and break its
+  `Clone` / video use): `OfflineOptions::with_texture(slot, OfflineTexture)`. The renderer keeps
+  each slot's upload while the same `OfflineTexture` (identity, `PartialEq`) stays attached, so
+  the roadmap's "uploaded every call" and a separate `VideoProcessor::set_texture` are unneeded: a
+  video passes the same texture with every frame's options. `OfflineTexture::from_color_image`
+  holds egui's upload bytes, the equivalence path. `FilterLayer::texture_at` (accessor) added.
+- Phase 3c: the wgpu effect pipelines need groups 1..=3 set for EVERY draw (wgpu validates every
+  group of the pipeline layout), so empty slots get a dummy bind group (1x1 transparent + the
+  linear sampler); composite pipelines keep a group-0-only layout and bind nothing more. egui's
+  per-texture bind groups (and `TextureCopies`' kept copies, and native textures) bind to the
+  crate's layout because every such layout is created from one descriptor
+  (`gpu::egui_texture_entries`); egui-wgpu textures are `Rgba8Unorm`, so `tex()` returns the same
+  gamma bytes as `src()` on every backend (egui_glow uploads RGBA8 too, `srgb_textures = false`).

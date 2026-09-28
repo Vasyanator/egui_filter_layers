@@ -17,31 +17,37 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
    capture texture;
 5. plan the run (`plan::plan`, whole capture), grow the ping-pong targets to the plan's
    `target_px`, and run its pass steps into them at `(0, 0, used_px)` (smaller for scaled
-   passes; mode-0 uv interpolation over that viewport needs nothing else), binding every `@group(0)` texture unit per draw (the plan's slots, dummies
-   elsewhere) and uploading `plan::step_uniforms` (binding point 0) and `plan::params_block`
-   (binding point 1, `glBufferData` per draw: the size varies by effect);
+   passes; mode-0 uv interpolation over that viewport needs nothing else), binding every texture
+   unit per draw (the plan's `@group(0)` slots and attached user textures, dummies elsewhere) and
+   uploading `plan::step_uniforms` (binding point 0) and `plan::params_block` (binding point 1,
+   a grow-only buffer written with `glBufferSubData`, re-allocated only when a block outgrows it);
 6. composite back into the original framebuffer over the visible region, scissor re-enabled
    (`plan::composite_uniforms`);
 7. `apply_outcome`: latch / per-effect failure / suspects / once-per-format rejection log.
 
 ## Files
-- `mod.rs`: `install_glow`, `destroy_glow`, `GlowBackend` (`Backend` impl), `GlowState`, latches.
+- `mod.rs`: `install_glow`, `destroy_glow`, `GlowBackend` (`Backend` impl), `GlowState`, latches;
+  the paint callback resolves the layer's user textures through `egui_glow::Painter::texture`
+  (an unknown id skips the layer: `GlowState::fail_texture`, `failed_textures()`).
 - `glsl.rs`: pure WGSL->GLSL translation (naga `glsl-out`, empty writer flags), dialect choice,
   the reflected `fl` and named-parameter block names (by `@binding` 0 / 4), and the texture-unit table of the prelude's layout (`GROUP0_TEXTURE_BINDINGS`,
-  `NEAREST_UNIT_BASE`).
-- `resources.rs`: `GlError`, `RenderTarget`, `Resources` (incl. dummy textures and the nearest
-  sampler object), `build_program` (all GL object code).
+  `USER_UNIT_BASE`).
+- `resources.rs`: `GlError`, `RenderTarget`, `ParamsBuffer` (grow-only params UBO), `Resources`
+  (incl. dummy textures), `build_program` (all GL object code).
 - `render.rs`: the per-layer GL sequence and state restoration.
 
 ## Contracts and invariants
 - All GL calls happen with the context current (inside the callback or in `on_exit`).
 - egui_glow re-runs `prepare_painting` after each callback; this module restores only what that
-  does not: framebuffer bindings, textures and sampler objects on units 0-3 / 7-10,
-  uniform-buffer bindings (points 0 and 1), own VAO/program.
-- Texture units: `GROUP0_TEXTURE_BINDINGS[i]` is unit `i` through the linear sampler (the
-  texture's own `LINEAR` parameters) and unit `NEAREST_UNIT_BASE + i` (7-10) through the nearest
-  sampler object; 4-6 are free for user textures. Max unit 10 < the 16 GLES 3 / WebGL2 guarantee.
-  naga cannot translate a texture read through both samplers in one module.
+  does not: framebuffer bindings, textures on units 0-6, uniform-buffer bindings (points 0 and
+  1), own VAO/program. No sampler object is ever bound.
+- Texture units: `GROUP0_TEXTURE_BINDINGS[i]` is unit `i` (the texture's own `LINEAR`
+  parameters); user texture slot `i` is unit `USER_UNIT_BASE + i` (4-6), egui_glow's own texture
+  object with the parameters egui_glow set from its `TextureOptions`. Max unit 6 < the 16 GLES 3 /
+  WebGL2 guarantee. naga cannot translate a texture read through two samplers in one module, so
+  the prelude has one sampler per texture and exact reads via `textureLoad` (`texelFetch`).
+- User textures are only read, never modified or kept: egui_glow applies a frame's texture deltas
+  before painting and frees after it, so an id resolved in the callback is current and alive.
 - Every wiring decision (which slot a draw binds and writes, mappings, uniform bytes) comes from
   `src/plan.rs`; this module maps `plan::Slot` to `RenderTarget`s only.
 - Backend-wide failures (resource creation, unexplained capture / composite GL error) latch
@@ -62,7 +68,8 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   glow_headless -- --ignored`) paints real egui frames through `egui_glow::Painter` on a
   windowless EGL device context into a plain / 4x MSAA FBO and checks read-back pixels
   (invert, lossless identity, rounded mask, multi-pass chains, zoom, alpha, per-effect failure,
-  named parameters per pass).
+  named parameters per pass, `original()` in later passes, pointer / frame counters, scaled
+  passes, user textures: exact / nearest / linear, updates, three slots, unknown / freed ids).
   Extend it with every change to this backend; the demo example needs a display and is no test.
 
 ## Editing map

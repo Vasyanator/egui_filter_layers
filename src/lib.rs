@@ -10,8 +10,10 @@ Key items:
 - `presets` module
 - `Impulses` (+ `Impulse`, `ImpulsePack`, param-name constants): input-driven transient effects
 - `install_glow()` / `destroy_glow()` (feature `glow`), `install_wgpu()` / `WgpuOptions`
-  (feature `wgpu`), `status()`, `failed_effects()`
+  (feature `wgpu`), `status()`, `failed_effects()`, `failed_textures()`
+- user textures: `TEXTURE_SLOTS`, `TextureError`, `TextureFailure` (`FilterLayer::texture`)
 - `offline` module and its re-exports (`OfflineRenderer`, ...; features `image` / `video`)
+- `HotEffect`, `rebind` (+ options, events, errors; feature `hot-reload`, native only)
 
 Notes:
 Backends plug in behind the crate-internal `backend::Backend` trait; nothing outside a backend
@@ -88,6 +90,9 @@ module names a backend type.
 //! | `fl.pass_scale` | this pass's output resolution relative to the capture ([`Pass::with_scale`]; `1` = full) |
 //! | `to_linear(c)`, `to_gamma(c)` | sRGB transfer functions on `rgb` (alpha untouched) |
 //! | `premultiply(c)`, `unpremultiply(c)`, `luma(rgb)` | colour helpers |
+//! | `tex(i, uv)` | user texture `i` (`0..`[`TEXTURE_SLOTS`], attached with [`FilterLayer::texture`]) at `uv` in the TEXTURE's own `0..1` coordinates (top-left origin), through its own sampler (its egui `TextureOptions`: filters, wrap mode; mip level 0) |
+//! | `tex_size(i)` | size of user texture `i` in texels (`vec2<f32>`) |
+//! | `tex_load(i, px)` | the exact texel `px` (`vec2<i32>`, clamped to the texture) of user texture `i`, no filtering |
 //!
 //! An effect whose code reads `fl.time` is **animated**: painting a layer that uses it requests
 //! an egui repaint every frame, so it keeps moving in an otherwise idle app. The detection walks
@@ -133,6 +138,36 @@ module names a backend type.
 //! struct over 16 KiB (the WebGL2 uniform block limit) is an [`EffectError::Interface`] pointing
 //! at the declaration. The snippet must not declare its own module-scope `p`. Named and
 //! anonymous (`params(i)`) parameters can be used together.
+//!
+//! ## Textures
+//!
+//! A layer attaches up to [`TEXTURE_SLOTS`] (3, on every backend) egui textures with
+//! [`FilterLayer::texture`] — noise, normal maps, lookup tables, images — which its effects read
+//! with `tex(i, uv)`, `tex_size(i)` and `tex_load(i, px)`. Values are premultiplied gamma RGBA,
+//! like `src()`. Each texture is read through its own sampler only (its `TextureOptions`); exact
+//! reads use `tex_load`, which needs none.
+//!
+//! ```
+//! use egui_filter_layers::{Effect, FilterLayer, Pass};
+//! # fn frame(ui: &mut egui::Ui, noise: &egui::TextureHandle, rect: egui::Rect) -> Result<(), egui_filter_layers::EffectError> {
+//! // `noise` from `ctx.load_texture(.., egui::TextureOptions::LINEAR_REPEAT)`, kept alive.
+//! let displace = Effect::new("displace", "
+//! fn effect(uv: vec2<f32>) -> vec4<f32> {
+//!     let n = tex(0u, uv * 4.0).rg - vec2<f32>(0.5);
+//!     return src(uv + n * 8.0 * fl.texel);
+//! }")?.with_sample_radius(4.0);
+//! assert!(displace.reads_texture(0) && !displace.reads_texture(1));
+//! FilterLayer::new(rect, Pass::new(&displace)).texture(0, noise.id()).paint(ui.painter());
+//! # Ok(()) }
+//! ```
+//!
+//! Which slots an effect reads is found in naga's IR ([`Effect::reads_texture`]; a slot index
+//! that is not a constant counts as every slot). A layer whose effect reads a slot with nothing
+//! attached is refused before drawing — [`FilterLayer::check_textures`] returns the
+//! [`TextureError`], `paint` draws nothing and logs it once — never silently fed a dummy. A
+//! texture id the renderer does not know (freed: keep the `TextureHandle` alive) skips the
+//! layers attaching it and is listed by [`failed_textures`]. Offline runs attach an
+//! `OfflineTexture` with `OfflineOptions::with_texture` (features `image` / `video`).
 //!
 //! ## Impulses: transient effects from input
 //!
@@ -195,6 +230,15 @@ module names a backend type.
 //! layer over that frame in the UI under the conditions listed in the `offline` module docs.
 //! `video` adds a frame-stream processor, source / sink traits and ffmpeg adapters.
 #![cfg_attr(any(feature = "image", feature = "video"), doc = "See [`offline`].")]
+//!
+//! # Hot reload
+//!
+//! With the `hot-reload` feature (native only; on wasm32 it compiles to nothing), a `HotEffect`
+//! follows a WGSL file on disk: a background thread polls its modification time, recompiles it
+//! off the GUI thread, and `HotEffect::poll` (once per frame, never blocking) swaps in the new
+//! effect. While the file is broken the last good effect keeps rendering and the error, with
+//! naga's diagnostic, is available for an overlay. `rebind` rebuilds a `Pass` on the reloaded
+//! effect, keeping named parameter values whose name and type still match.
 
 // docs.rs builds with `--cfg docsrs` on nightly: badge feature-gated items with their feature.
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -225,8 +269,13 @@ mod wgpu_backend;
 #[cfg(any(feature = "image", feature = "video"))]
 pub mod offline;
 
-pub use backend::{BackendKind, BackendStatus, EffectFailure, InstallError, failed_effects, status};
-pub use effect::{Effect, EffectError, ParamError, ParamInfo, ParamType, ParamValue, SnippetLocation};
+// Hot reload needs a file system and threads: native only. On wasm32 the feature is accepted
+// (so `--all-features` builds everywhere) but the module is absent.
+#[cfg(all(feature = "hot-reload", not(target_arch = "wasm32")))]
+mod hot;
+
+pub use backend::{BackendKind, BackendStatus, EffectFailure, InstallError, TextureError, TextureFailure, failed_effects, failed_textures, status};
+pub use effect::{Effect, EffectError, ParamError, ParamInfo, ParamType, ParamValue, SnippetLocation, TEXTURE_SLOTS};
 pub use impulses::{IMPULSE_COUNT_PARAM, IMPULSE_SLOTS, IMPULSES_PARAM, Impulse, ImpulsePack, Impulses};
 pub use layer::FilterLayer;
 pub use pass::{FilterChain, MIN_PASS_SCALE, PARAM_SLOTS, ParamIndexError, Params, Pass};
@@ -236,4 +285,6 @@ pub use glow_backend::{destroy_glow, install_glow};
 #[cfg(feature = "wgpu")]
 pub use wgpu_backend::{WgpuOptions, install_wgpu};
 #[cfg(any(feature = "image", feature = "video"))]
-pub use offline::{AlphaMode, FrameRef, OfflineError, OfflineOptions, OfflineRenderer, PointerState, RgbaFrame};
+pub use offline::{AlphaMode, FrameRef, OfflineError, OfflineOptions, OfflineRenderer, OfflineTexture, PointerState, RgbaFrame};
+#[cfg(all(feature = "hot-reload", not(target_arch = "wasm32")))]
+pub use hot::{DEFAULT_POLL_INTERVAL, HotEffect, HotOptions, HotReloadError, HotReloadEvent, MIN_POLL_INTERVAL, Rebound, rebind};

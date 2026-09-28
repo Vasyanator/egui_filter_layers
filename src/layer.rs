@@ -11,6 +11,7 @@ Key structures:
 
 Key functions:
 - `FilterLayer::paint()`.
+- `FilterLayer::texture()` / `check_textures()`: user textures (F8) and the check `paint` runs.
 - `frame_input()`: the per-frame input (`fl.delta_time`, `fl.frame`, `fl.pointer`) read from the
   context on the GUI thread.
 
@@ -18,13 +19,17 @@ Notes:
 Never panics and never draws a fake: with no backend installed it logs one warning per
 `egui::Context` (latched in the context's temporary memory, see `warn_not_installed_once`) and
 paints nothing, leaving the backdrop unfiltered. A failed backend is skipped the same way, and
-neither case requests repaints for animated chains.
+neither case requests repaints for animated chains. A layer whose user textures cannot serve its
+effects (`TextureError`: an invalid slot, or a slot an effect reads with nothing attached) is
+skipped too, its error logged once per context and message (`log_texture_error_once`).
 */
 
-use egui::{Context, CornerRadius, Id, Painter, Rect};
+use egui::{Context, CornerRadius, Id, Painter, Rect, TextureId};
 
-use crate::backend::{FrameInput, LayerJob, PointerInput, installed};
+use crate::backend::{FrameInput, LayerJob, PointerInput, TextureError, installed};
+use crate::effect::TEXTURE_SLOTS;
 use crate::pass::FilterChain;
+use crate::plan::check_textures;
 
 /// Sets `ctx`'s "no backend installed" latch; returns whether it was unset (i.e. whether to warn).
 fn first_not_installed_warning(ctx: &Context) -> bool {
@@ -44,6 +49,22 @@ fn warn_not_installed_once(ctx: &Context) {
         log::warn!(
             "egui_filter_layers: a FilterLayer was painted but no backend is installed on this egui::Context; \
              call egui_filter_layers::install_glow (or the wgpu installer) at startup. Layers draw nothing until then."
+        );
+    }
+}
+
+/// Logs `error` (a layer skipped for its textures) the first time this message is seen on `ctx`.
+/// The latch is per message in `ctx`'s temporary memory, like `warn_not_installed_once`: the same
+/// misuse repeats every frame, a different one (another effect or slot) is logged once more.
+fn log_texture_error_once(ctx: &Context, error: &TextureError) {
+    let message = error.to_string();
+    let first = ctx.data_mut(|data| !std::mem::replace(data.get_temp_mut_or_default::<bool>(Id::new(("egui_filter_layers::texture_error", &message))), true));
+    if first {
+        log::error!(
+            "egui_filter_layers: a FilterLayer was skipped (it draws nothing extra) because its textures cannot serve its effects.\n\
+             Error: {message}\n\
+             Fix: attach a texture to every slot the chain's effects read (`FilterLayer::texture(slot, id)`, slots 0..{TEXTURE_SLOTS}); \
+             `FilterLayer::check_textures` reports this without painting. Logged once per message."
         );
     }
 }
@@ -86,13 +107,59 @@ pub struct FilterLayer {
     chain: FilterChain,
     /// Rounded-corner mask; outside it the backdrop is left untouched.
     corner_radius: CornerRadius,
+    /// The user texture attached at each slot (`tex(i, uv)` in effects).
+    textures: [Option<TextureId>; TEXTURE_SLOTS],
+    /// The first out-of-range slot given to [`FilterLayer::texture`], reported by
+    /// [`FilterLayer::check_textures`] (the builder cannot return an error).
+    invalid_slot: Option<usize>,
 }
 
 impl FilterLayer {
     /// A layer filtering `rect` (points) through `chain` (a `Pass`, `Vec<Pass>` or `FilterChain`).
     #[must_use]
     pub fn new(rect: Rect, chain: impl Into<FilterChain>) -> Self {
-        Self { rect, chain: chain.into(), corner_radius: CornerRadius::ZERO }
+        Self { rect, chain: chain.into(), corner_radius: CornerRadius::ZERO, textures: [None; TEXTURE_SLOTS], invalid_slot: None }
+    }
+
+    /// Attaches the egui texture `id` at user texture `slot` (`0..TEXTURE_SLOTS`), which effects
+    /// read with `tex(slot, uv)` (the texture's own uv and sampler, from the `TextureOptions` it
+    /// was loaded with), `tex_size(slot)` and `tex_load(slot, px)`. Any egui texture works: a
+    /// `TextureHandle` from `Context::load_texture` (`handle.id()`), a native texture registered
+    /// with the renderer. Replaces an earlier texture at that slot.
+    ///
+    /// Keep the texture alive while the layer is painted: a freed `id` makes the backend skip the
+    /// layer and report it in [`crate::failed_textures`]. A `slot` out of range makes the layer
+    /// fail [`FilterLayer::check_textures`] (and so draw nothing).
+    #[must_use]
+    pub fn texture(mut self, slot: usize, id: TextureId) -> Self {
+        match self.textures.get_mut(slot) {
+            Some(entry) => *entry = Some(id),
+            None => {
+                self.invalid_slot.get_or_insert(slot);
+            }
+        }
+        self
+    }
+
+    /// The texture attached at `slot`, if any.
+    #[must_use]
+    pub fn texture_at(&self, slot: usize) -> Option<TextureId> {
+        self.textures.get(slot).copied().flatten()
+    }
+
+    /// Whether the attached textures can serve the chain: every slot given to
+    /// [`FilterLayer::texture`] exists, and every slot an effect reads
+    /// ([`crate::Effect::reads_texture`]) has a texture. [`FilterLayer::paint`] runs this and
+    /// skips the layer on an error (logged once per context). It cannot see whether a texture id
+    /// is still alive; the backend reports that ([`crate::failed_textures`]).
+    ///
+    /// # Errors
+    /// [`TextureError::InvalidSlot`] or [`TextureError::NotAttached`].
+    pub fn check_textures(&self) -> Result<(), TextureError> {
+        if let Some(slot) = self.invalid_slot {
+            return Err(TextureError::InvalidSlot { slot });
+        }
+        check_textures(self.chain.passes(), self.textures.map(|texture| texture.is_some()))
     }
 
     /// Restricts the filter to a rounded rect (anti-aliased edge).
@@ -134,6 +201,12 @@ impl FilterLayer {
         if !backend.status().is_usable() {
             return;
         }
+        // Refused before any backend work: an effect reading an empty slot would otherwise sample
+        // a dummy texture, a silent wrong result.
+        if let Err(error) = self.check_textures() {
+            log_texture_error_once(ctx, &error);
+            return;
+        }
         // An effect reading `fl.time` must keep moving in an otherwise idle app.
         if self.chain.is_animated() {
             ctx.request_repaint();
@@ -144,7 +217,7 @@ impl FilterLayer {
         let time = ctx.input(|input| input.time) as f32;
         let frame_input = frame_input(ctx);
         let padding_points = self.chain.padding_points();
-        let job = LayerJob { rect: self.rect, corner_radius: self.corner_radius, passes: self.chain.into_passes(), padding_points, time, frame_input };
+        let job = LayerJob { rect: self.rect, corner_radius: self.corner_radius, passes: self.chain.into_passes(), padding_points, time, frame_input, textures: self.textures };
         backend.paint_layer(painter, job);
     }
 }
@@ -158,7 +231,7 @@ mod tests {
     use egui::{LayerId, pos2, vec2};
 
     use super::*;
-    use crate::backend::{Backend, BackendKind, BackendStatus, EffectFailure, register};
+    use crate::backend::{Backend, BackendKind, BackendStatus, EffectFailure, TextureFailure, register};
     use crate::presets;
 
     /// A backend with a fixed status that counts `paint_layer` calls.
@@ -175,6 +248,9 @@ mod tests {
             self.status.clone()
         }
         fn failed_effects(&self) -> Vec<EffectFailure> {
+            Vec::new()
+        }
+        fn failed_textures(&self) -> Vec<TextureFailure> {
             Vec::new()
         }
         fn paint_layer(&self, _painter: &Painter, _job: LayerJob) {
@@ -232,6 +308,9 @@ mod tests {
         fn failed_effects(&self) -> Vec<EffectFailure> {
             Vec::new()
         }
+        fn failed_textures(&self) -> Vec<TextureFailure> {
+            Vec::new()
+        }
         fn paint_layer(&self, _painter: &Painter, job: LayerJob) {
             self.inputs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(job.frame_input);
         }
@@ -272,6 +351,33 @@ mod tests {
         assert_eq!(last.frame, 2, "two frames completed before the third");
         assert_eq!(last.pointer, Some(PointerInput { pos: pos2(12.0, 7.0), pressed: true }));
         assert!(inputs.iter().any(|input| input.pointer == Some(PointerInput { pos: pos2(12.0, 7.0), pressed: false })), "the move frame: present, not pressed");
+    }
+
+    /// F8: a layer whose effect reads a texture slot with nothing attached (or with an invalid
+    /// slot) never reaches the backend; attaching the texture makes it paint, with the ids in the job.
+    #[test]
+    fn texture_misuse_skips_the_layer_before_the_backend() {
+        let Ok(effect) = crate::Effect::new("textured", "fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(2u, uv); }") else { panic!("must compile") };
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0));
+        let id = TextureId::User(7);
+        let layer = FilterLayer::new(rect, crate::Pass::new(&effect));
+        assert_eq!(layer.check_textures(), Err(TextureError::NotAttached { effect: "textured".to_owned(), pass: 0, slot: 2 }));
+        assert_eq!(layer.clone().texture(0, id).check_textures().map_err(|error| matches!(error, TextureError::NotAttached { slot: 2, .. })), Err(true));
+        assert_eq!(layer.clone().texture(2, id).texture(3, id).check_textures(), Err(TextureError::InvalidSlot { slot: 3 }));
+        assert_eq!(layer.clone().texture(2, id).texture_at(2), Some(id));
+
+        let ctx = Context::default();
+        let backend = Arc::new(Counting { status: BackendStatus::Installed { backend: BackendKind::Glow }, painted: AtomicUsize::new(0) });
+        register(&ctx, Arc::clone(&backend) as Arc<dyn Backend>);
+        for attach in [false, true] {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let painter = Painter::new(ui.ctx().clone(), LayerId::background(), Rect::EVERYTHING);
+                let layer = FilterLayer::new(rect, crate::Pass::new(&effect));
+                if attach { layer.texture(2, id) } else { layer }.paint(&painter);
+            });
+            output.textures_delta.clear();
+            assert_eq!(backend.painted.swap(0, Ordering::Relaxed) > 0, attach, "attached: {attach}");
+        }
     }
 
     /// The "no backend installed" latch is per `Context`: set once per context, independent between contexts.

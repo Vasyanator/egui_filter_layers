@@ -12,6 +12,8 @@ Key structures:
 Key functions:
 - `TextureCopies::observe()`: records one pass's `TexturesDelta` (called for EVERY pass).
 - `snapshot_textures()`: per texture id, egui-wgpu's own bind group or the kept copy's.
+- `resolve_user_textures()`: the same resolution for a layer's attached user textures (F8), with
+  unresolvable ids reported instead of skipped.
 
 Notes:
 - egui-wgpu applies a frame's deltas (all passes appended) only when it paints, after every
@@ -30,7 +32,9 @@ Notes:
   partial updates into that same texture before the frame's command buffer runs.
 - Anything else missing (unknown id, a font atlas whose renderer copy does not match the CPU
   atlas size) is skipped for that frame, debug-logged once per install
-  (`Shared::logged`).
+  (`Shared::logged`). A user texture a layer ATTACHES is different: its id must resolve, or the
+  layer is not planned and the id is reported (`Shared::fail_texture`, `failed_textures()`).
+  User textures are sampled in their own uv, so the font atlas size check does not apply there.
 - egui-wgpu's `Renderer` is read-locked only briefly; eframe write-locks it only while it paints,
   never across the egui pass, so this cannot deadlock.
 */
@@ -38,10 +42,12 @@ Notes:
 use std::collections::{HashMap, HashSet};
 
 use egui::TextureId;
-use egui::epaint::textures::{TextureFilter, TextureOptions, TextureWrapMode, TexturesDelta};
+use egui::epaint::textures::{TextureOptions, TexturesDelta};
 use egui::epaint::{ClippedPrimitive, ImageData, ImageDelta, Primitive};
 
+use super::gpu::{egui_sampler_descriptor, egui_texture_entries};
 use super::{LoggedOnce, Shared};
+use crate::effect::TEXTURE_SLOTS;
 
 /// The GPU copy of a kept texture.
 struct KeptGpu {
@@ -81,28 +87,6 @@ pub(super) struct TextureCopies {
 /// Index of the last delta of `deltas` that replaces the whole texture.
 fn last_full_upload(deltas: &[ImageDelta]) -> Option<usize> {
     deltas.iter().rposition(|delta| delta.pos.is_none())
-}
-
-/// Maps egui texture options to a sampler descriptor exactly as egui-wgpu 0.36 does
-/// (`renderer.rs`, `create_sampler`: mipmap mode ignored).
-fn sampler_descriptor(options: TextureOptions) -> wgpu::SamplerDescriptor<'static> {
-    let filter = |filter: TextureFilter| match filter {
-        TextureFilter::Nearest => wgpu::FilterMode::Nearest,
-        TextureFilter::Linear => wgpu::FilterMode::Linear,
-    };
-    let address_mode = match options.wrap_mode {
-        TextureWrapMode::ClampToEdge => wgpu::AddressMode::ClampToEdge,
-        TextureWrapMode::Repeat => wgpu::AddressMode::Repeat,
-        TextureWrapMode::MirroredRepeat => wgpu::AddressMode::MirrorRepeat,
-    };
-    wgpu::SamplerDescriptor {
-        label: Some("egui_filter_layers texture copy"),
-        mag_filter: filter(options.magnification),
-        min_filter: filter(options.minification),
-        address_mode_u: address_mode,
-        address_mode_v: address_mode,
-        ..Default::default()
-    }
 }
 
 /// Size `[w, h]` of an image delta, if it fits a texture.
@@ -185,18 +169,9 @@ impl TextureCopies {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            let layout = self.layout.get_or_insert_with(|| {
-                let texture_entry = wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture { multisampled: false, sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2 },
-                    count: None,
-                };
-                let sampler_entry = wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None };
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers egui texture"), entries: &[texture_entry, sampler_entry] })
-            });
+            let layout = self.layout.get_or_insert_with(|| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers egui texture"), entries: &egui_texture_entries() }));
             // Like egui-wgpu, the sampler follows the full upload's options.
-            let sampler = self.samplers.entry(full.options).or_insert_with(|| device.create_sampler(&sampler_descriptor(full.options)));
+            let sampler = self.samplers.entry(full.options).or_insert_with(|| device.create_sampler(&egui_sampler_descriptor(full.options)));
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("egui_filter_layers texture copy"),
@@ -257,6 +232,29 @@ pub(super) fn snapshot_textures(shared: &Shared, primitives: &[ClippedPrimitive]
     textures
 }
 
+/// The bind group of every attached user texture of a layer (`ids[i]`), resolved like
+/// [`snapshot_textures`] (the kept copy of a texture uploaded in full this frame, else egui-wgpu's
+/// own bind group, native textures included). Unlike beneath meshes, an attached texture that
+/// cannot be resolved is not skipped: the first such id is returned as the error (the caller
+/// records it and does not plan the layer).
+pub(super) fn resolve_user_textures(shared: &Shared, ids: [Option<TextureId>; TEXTURE_SLOTS]) -> Result<[Option<wgpu::BindGroup>; TEXTURE_SLOTS], TextureId> {
+    if ids.iter().all(Option::is_none) {
+        return Ok([const { None }; TEXTURE_SLOTS]);
+    }
+    let state = &shared.render_state;
+    let mut copies = shared.texture_copies();
+    let renderer = state.renderer.read();
+    let mut resolved = [const { None }; TEXTURE_SLOTS];
+    for (slot, id) in resolved.iter_mut().zip(ids) {
+        let Some(id) = id else {
+            continue;
+        };
+        let bind_group = copies.kept_bind_group(&state.device, &state.queue, id).or_else(|| renderer.texture(&id).map(|texture| texture.bind_group.clone()));
+        *slot = Some(bind_group.ok_or(id)?);
+    }
+    Ok(resolved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,11 +275,4 @@ mod tests {
         assert_eq!(delta_size(&delta(None)), Some([2, 2]));
     }
 
-    #[test]
-    fn samplers_mirror_egui_wgpu() {
-        let descriptor = sampler_descriptor(TextureOptions::NEAREST_REPEAT);
-        assert_eq!(descriptor.mag_filter, wgpu::FilterMode::Nearest);
-        assert_eq!(descriptor.address_mode_u, wgpu::AddressMode::Repeat);
-        assert_eq!(sampler_descriptor(TextureOptions::LINEAR).min_filter, wgpu::FilterMode::Linear);
-    }
 }

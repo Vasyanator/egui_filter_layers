@@ -25,7 +25,7 @@ immediately, so a rejected shader becomes a latched failure instead of wgpu's de
 
 use super::WgpuOptions;
 use super::chain::{ChainResources, ChainTargets, CompositeOver};
-use super::gpu::{GrowBuffer, Target, sampler_entry, shader, texture_entry, uniform_entry, with_error_scope};
+use super::gpu::{GrowBuffer, Target, egui_texture_entries, shader, uniform_entry, with_error_scope};
 
 /// Format of the re-rendered backdrop: 8-bit gamma values, exactly what egui writes to a
 /// non-sRGB surface (and the bytes a `*Srgb` surface stores). Effects always sample this format.
@@ -145,7 +145,7 @@ impl WgpuResources {
             // Identical descriptor to egui-wgpu's `egui_texture_bind_group_layout`: wgpu-core
             // deduplicates equal layouts and WebGPU treats them as group-equivalent, so egui's
             // own per-texture bind groups can be bound to this pipeline unchanged.
-            let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers egui texture"), entries: &[texture_entry(0), sampler_entry(1)] });
+            let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers egui texture"), entries: &egui_texture_entries() });
             let mesh_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("egui_filter_layers mesh"),
                 bind_group_layouts: &[Some(&mesh_locals_layout), Some(&texture_layout)],

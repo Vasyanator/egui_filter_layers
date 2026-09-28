@@ -12,8 +12,9 @@ Key structures:
   depth/stencil, dithering, clear colour); setters mirror eframe's option names,
   `From<&egui_wgpu::RendererOptions>` converts a custom integration's options exactly. A mismatch
   is undetectable here (wgpu rejects egui's encoder at `finish`, outside the crate).
-- `Shared`: install-wide state — options, the `RenderState`, pending layers, health latches,
-  log-once latches (`LoggedOnce`; per install, so a re-install may log each message again).
+- `Shared`: install-wide state — options, the `RenderState`, pending layers, health latches
+  (backend, per effect, per unresolvable user texture), log-once latches (`LoggedOnce`; per
+  install, so a re-install may log each message again).
 - `LayerSlot`: one painted filter layer's hand-over cell (plan from the plugin -> `prepare`,
   drawn target from `prepare` -> `paint`).
 
@@ -48,8 +49,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use egui::epaint::ClippedPrimitive;
 use egui::{Rect, TextureId};
 
-use crate::backend::{Backend, BackendKind, BackendStatus, EffectFailure, InstallError, LayerJob, register};
-use crate::effect::CompiledModule;
+use crate::backend::{Backend, BackendKind, BackendStatus, EffectFailure, InstallError, LayerJob, TextureFailure, register};
+use crate::effect::{CompiledModule, TEXTURE_SLOTS};
 use crate::geometry::PxRect;
 use plugin::FilterLayersPlugin;
 use render::FilterCallback;
@@ -253,6 +254,8 @@ struct Pending {
     padding_points: f32,
     /// The viewport whose pass painted the layer (selects its clear colour).
     viewport: egui::ViewportId,
+    /// `LayerJob::textures`: resolved to bind groups when the layer is planned.
+    textures: [Option<TextureId>; TEXTURE_SLOTS],
 }
 
 /// What the plugin hands to `prepare`: the beneath content of one layer, tessellated.
@@ -269,6 +272,9 @@ struct BeneathPlan {
     textures: HashMap<TextureId, wgpu::BindGroup>,
     /// Premultiplied gamma-space colour the layer's viewport is cleared to (see `plugin.rs`).
     clear_color: [f32; 4],
+    /// The bind group of every attached user texture (`textures::resolve_user_textures`; a
+    /// layer with an unresolvable one is not planned).
+    user_textures: [Option<wgpu::BindGroup>; TEXTURE_SLOTS],
 }
 
 /// Where `prepare` left a layer's result, for `paint`.
@@ -319,6 +325,8 @@ struct Health {
     float_intermediates: Option<bool>,
     /// Per-effect failures by `CompiledModule::id`.
     failed_effects: HashMap<u64, FailedEffect>,
+    /// Attached user textures that could not be resolved, by id (egui never reuses an id).
+    failed_textures: HashMap<TextureId, TextureFailure>,
 }
 
 /// Per-install "logged once" latches for debug messages that would otherwise repeat every frame.
@@ -416,6 +424,21 @@ impl Shared {
         health.failed_effects.insert(module.id, FailedEffect { module: Arc::downgrade(module), failure });
     }
 
+    /// Records that the attached user texture `id` could not be resolved and logs it once.
+    fn fail_texture(&self, id: TextureId) {
+        let mut health = self.health();
+        if health.failed_textures.contains_key(&id) {
+            return;
+        }
+        let error = "egui-wgpu's renderer has no texture with this id (freed, or never registered with this renderer)".to_owned();
+        log::error!(
+            "egui_filter_layers (wgpu): a filter layer attaches texture {id:?}, which cannot be resolved; layers attaching it draw nothing extra.\n\
+             Error: {error}\n\
+             Possible cause: the TextureHandle was dropped (egui freed the texture) while the layer still attaches its id."
+        );
+        health.failed_textures.insert(id, TextureFailure { id, error });
+    }
+
     /// Whether `module` is known to fail on this device.
     fn effect_failed(&self, module: &CompiledModule) -> bool {
         self.health().failed_effects.contains_key(&module.id)
@@ -450,12 +473,16 @@ impl Backend for WgpuBackend {
         health.failed_effects.values().map(|entry| entry.failure.clone()).collect()
     }
 
+    fn failed_textures(&self) -> Vec<TextureFailure> {
+        self.shared.health().failed_textures.values().cloned().collect()
+    }
+
     fn paint_layer(&self, painter: &egui::Painter, job: LayerJob) {
         if self.shared.is_failed() {
             return;
         }
         let slot = Arc::new(LayerSlot::default());
-        let (rect, padding_points) = (job.rect, job.padding_points);
+        let (rect, padding_points, textures) = (job.rect, job.padding_points, job.textures);
         // Read during the pass: after `end_pass` the context reports the parent viewport.
         let viewport = painter.ctx().viewport_id();
         let callback = FilterCallback::new(Arc::clone(&self.shared), Arc::clone(&slot), job);
@@ -466,7 +493,7 @@ impl Backend for WgpuBackend {
             // Entries whose callback died without being planned (discarded pass, other viewport
             // that never ended) are dropped here as well as in the plugin.
             pending.retain(|entry| entry.callback.strong_count() > 0);
-            pending.push(Pending { callback: weak, slot, rect, padding_points, viewport });
+            pending.push(Pending { callback: weak, slot, rect, padding_points, viewport, textures });
         }
         painter.add(paint_callback);
     }

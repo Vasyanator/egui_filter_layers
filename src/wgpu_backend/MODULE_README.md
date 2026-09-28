@@ -12,7 +12,9 @@ One frame, per filter layer:
    the callback in `FullOutput::shapes` by `Arc` address — egui's exact final paint order with layer
    transforms applied, so there is no stale layer order. Everything before it is "beneath":
    `beneath.rs` clips it to the padded capture rect and skips callbacks; `ctx.tessellate`
-   tessellates; `textures.rs` resolves texture bind groups. The `BeneathPlan` goes into the slot.
+   tessellates; `textures.rs` resolves texture bind groups, and the bind groups of the layer's
+   attached user textures (an unresolvable id: the layer is not planned, `Shared::fail_texture`).
+   The `BeneathPlan` goes into the slot.
    The hook records EVERY pass's texture delta first (`TextureCopies::observe`), then skips
    planning when egui will discard the pass (`request_discard`, `run_ui` repeats it).
 3. `FilterCallback::prepare` (`render.rs`, egui's encoder, before egui's pass) re-renders the
@@ -28,12 +30,13 @@ One frame, per filter layer:
 
 **Chain executor boundary** (`chain.rs` + `gpu.rs`): everything wgpu-specific about running a
 `FilterChain` — intermediate format, uniform buffer stride, the one `@group(0)` layout with its
-samplers and dummies, effect pipeline cache, composite pipelines for any output format — lives
+sampler and dummies, the user texture group layout (egui-wgpu's texture layout) with a dummy
+group, effect pipeline cache, composite pipelines for any output format — lives
 there, while the wiring (ping-pong order, which slot each binding gets, storage mappings, uniform
 blocks, viewports) comes from the backend-neutral `src/plan.rs`, shared with glow. It takes
 only `&wgpu::Device`, `&wgpu::Queue`, a `CommandEncoder`, a source texture view (capture at its
 origin), `LayerGeometry`, time, the resolved per-frame input (`InputUniforms`) and
-pixels-per-point. It knows nothing of egui (no
+pixels-per-point, and the bind groups of the attached user textures. It knows nothing of egui (no
 `CallbackResources`, no egui `Renderer`), so a runner on its own device reuses it unchanged; the UI
 callback adds only the backdrop re-render, the egui-pass composite pipeline and the frame pool;
 the offline renderer (`src/offline/`) adds only uploads, tiles and readback.
@@ -51,12 +54,15 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
 - `plugin.rs`: the egui plugin; matching pending layers, planning.
 - `beneath.rs`: pure selection / clipping / callback skipping (unit-tested, no GPU).
 - `textures.rs`: egui-wgpu bind groups; own copies of textures uploaded in full that egui-wgpu
-  has not applied yet (kept across the passes of a frame, partial deltas followed).
+  has not applied yet (kept across the passes of a frame, partial deltas followed);
+  `resolve_user_textures` (the same resolution for attached user textures, failures reported).
 - `chain.rs`: the chain executor (`ChainResources`, `ChainTargets`, `ChainWindow`, `record`,
   `frame_uniforms`, `chain_uniforms` = every draw's plan blocks (`fl`, then the named-parameter
   block) at the device's offset alignment (`ChainUniforms` / `DrawUniforms`); composites: replace `composite_pipeline` / `draw_composite` for offline,
   blended `CompositeOver` / `draw_composite_over` for the UI); egui-free; shared with `src/offline/`.
-- `gpu.rs`: egui-free wgpu helpers (`Target` with an optional reinterpreting render view, `GrowBuffer`, layout entries, `pass_pipeline`,
+- `gpu.rs`: egui-free wgpu helpers (`Target` with an optional reinterpreting render view, `GrowBuffer`, layout entries,
+  `egui_texture_entries` (egui-wgpu's texture layout, the one descriptor of every layout egui's bind
+  groups bind to), `egui_sampler_descriptor` (egui-wgpu's `TextureOptions` mapping), `pass_pipeline`,
   `begin_pass`, `ErrorScopes` (out-of-memory + validation + internal, awaitable) and the
   synchronous `with_error_scope` on top of it, format capability check).
 - `resources.rs`: the UI's objects: `ChainResources` + egui-pass blended composite pipelines +
@@ -67,12 +73,20 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   path, `fs_main_linear` = linear framebuffer path).
 
 ## Contracts and invariants
-- Every effect and composite pipeline uses ONE pipeline layout (`ChainResources::layout`, all
-  eight prelude bindings); every draw's bind group fills all eight, dummies where the plan binds
-  no texture. The params binding (4) is unsized so modules may declare any block size there;
-  every draw binds its own `plan::params_block` range of the run's uniform buffer.
-- The mesh pipeline's group 1 layout is the SAME descriptor as egui-wgpu's texture layout, so
-  egui's per-texture bind groups bind unchanged (wgpu-core dedups layouts; WebGPU group-equivalence).
+- Every effect and composite pipeline shares ONE `@group(0)` layout (`ChainResources::layout`,
+  all seven prelude bindings); every draw's bind group fills all seven, dummies where the plan
+  binds no texture. Effect pipelines add the three user texture groups (`effect_pipeline_layout`;
+  every step sets all three: the caller's bind group where the plan binds one, `dummy_user`
+  elsewhere); composite pipelines are group 0 only. The params binding (4) is unsized so modules
+  may declare any block size there; every draw binds its own `plan::params_block` range of the
+  run's uniform buffer.
+- The mesh pipeline's group 1 layout and the user texture groups are the SAME descriptor as
+  egui-wgpu's texture layout (`gpu::egui_texture_entries`), so egui's per-texture bind groups
+  (native textures included) bind unchanged (wgpu-core dedups layouts; WebGPU group-equivalence).
+- A user texture a layer attaches is resolved at the end of the pass that painted it, like beneath
+  textures (kept copy of a full upload not yet applied, else egui-wgpu's bind group; partial
+  updates land in that texture before the frame's command buffer); the plan holds its bind group
+  until the frame is rendered, so a texture egui frees after the frame is still valid there.
 - Both ping-pong targets are grown to at least the plan's `target_px` (every scaled step's
   image sits at the target origin; viewports and mappings come from the plan).
 - Every layer of a frame gets its own `LayerTargets` (pool index = prepare order, reset in

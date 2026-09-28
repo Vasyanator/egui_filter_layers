@@ -12,7 +12,10 @@
 //! composite's alpha over a transparent frame; the same scenes into a 4x multisampled
 //! renderbuffer (the backend resolves before capturing); and an effect whose GLSL translation
 //! fails, which must disable only that effect while the backend stays `Active`. Reduced-resolution
-//! passes (F6): the same scaled-identity, kawase and bloom scenes as `wgpu_headless.rs`.
+//! passes (F6): the same scaled-identity, kawase and bloom scenes as `wgpu_headless.rs`, and like
+//! it: `original()` in later passes (F1), `fl.pointer` / `fl.delta_time` / `fl.frame` (F2), and
+//! user textures (F8: exact / nearest / linear reads, full and partial updates, three slots,
+//! unknown / freed / missing textures).
 //!
 //! Linux only (EGL device platform, Mesa or a vendor EGL). Needs a GPU or Mesa's software
 //! device, so it is ignored by default: `cargo test --all-features --test glow_headless -- --ignored`.
@@ -199,7 +202,12 @@ impl Harness {
     /// Renders one egui frame through egui_glow into the target and returns its RGBA8 pixels, top
     /// row first. Asserts that the frame left no GL error behind.
     fn frame(&mut self, paint: &mut dyn FnMut(&mut egui::Ui)) -> Vec<u8> {
-        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(256.0, 128.0))), ..Default::default() };
+        self.frame_with(Vec::new(), paint)
+    }
+
+    /// [`Harness::frame`] with input `events` (the pointer persists into later frames).
+    fn frame_with(&mut self, events: Vec<egui::Event>, paint: &mut dyn FnMut(&mut egui::Ui)) -> Vec<u8> {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(256.0, 128.0))), events, ..Default::default() };
         let mut output = self.ctx.run_ui(input, |ui| paint(ui));
         let mut textures_delta = std::mem::take(&mut output.textures_delta);
         let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
@@ -488,13 +496,15 @@ fn a_multisampled_framebuffer_is_resolved_and_filtered() {
 fn a_failing_effect_is_disabled_alone() {
     let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
     // Pinned as untranslatable by `glow_backend::glsl`'s `one_texture_through_two_samplers_does_not_translate`.
-    let broken = pass("broken on glow", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) + textureSampleLevel(fl_src_texture, fl_nearest_sampler, uv, 0.0); }");
+    // Reads the pass input through user texture slot 0's sampler, so the layers attach slot 0.
+    let broken = pass("broken on glow", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) + textureSampleLevel(fl_src_texture, fl_user0_sampler, uv, 0.0); }");
+    let texture = harness.texture.id();
     let mut paint = |ui: &mut egui::Ui| {
         let painter = ui.painter();
         halves(painter);
-        FilterLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(120.0, 120.0)), broken.clone()).paint(painter);
+        FilterLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(120.0, 120.0)), broken.clone()).texture(0, texture).paint(painter);
         // A chain containing the broken effect is skipped as a whole.
-        FilterLayer::new(Rect::from_min_max(pos2(136.0, 8.0), pos2(192.0, 120.0)), FilterChain::new().then(presets::invert(1.0)).then(broken.clone())).paint(painter);
+        FilterLayer::new(Rect::from_min_max(pos2(136.0, 8.0), pos2(192.0, 120.0)), FilterChain::new().then(presets::invert(1.0)).then(broken.clone())).texture(0, texture).paint(painter);
         FilterLayer::new(Rect::from_min_max(pos2(200.0, 8.0), pos2(248.0, 120.0)), presets::invert(1.0)).paint(painter);
     };
     for frame in 1..=3 {
@@ -736,4 +746,217 @@ fn bloom_brightens_around_a_bright_spot_only() {
     assert_near(&pixels, 60, 30, [40, 40, 40], "dark area beyond the reach");
     assert_near(&pixels, 200, 110, [40, 40, 40], "dark area beyond the reach");
     assert_near(&pixels, 10, 64, [40, 40, 40], "outside the layer");
+}
+
+// ---- F1 / F2 on glow (same scenes as `wgpu_headless.rs`) ----
+
+/// F1 on glow: `original(uv)` reads the unfiltered backdrop in EVERY pass, whatever earlier
+/// passes did (the capture is bound on unit 1 for every pass, not only the composite):
+/// `invert -> original` and `invert -> invert -> original` give the backdrop back, and a pass
+/// reading both `src` (inverted) and `original` sees `src + original = 1`. A large layer runs
+/// first, so the smaller one after it runs in grown targets (a storage mapping other than 1).
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn original_reads_the_backdrop_in_every_pass() {
+    let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let texture = harness.texture.clone();
+    let original = pass("original", "fn effect(uv: vec2<f32>) -> vec4<f32> { return original(uv); }");
+    let sum = pass("sum", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(abs(src(uv).rgb + original(uv).rgb - vec3<f32>(1.0)), 1.0); }");
+    let invert = || FilterChain::from(presets::invert(1.0));
+    let chains = [("invert, original", invert().then(original.clone()), false), ("invert, invert, original", invert().then(invert()).then(original.clone()), false), ("invert, sum", invert().then(sum), true)];
+    let large = Rect::from_min_max(pos2(2.0, 2.0), pos2(254.0, 126.0));
+    let small = Rect::from_min_max(pos2(20.0, 20.0), pos2(150.0, 100.0));
+    for (name, chain, black) in &chains {
+        for rect in [large, small] {
+            let mut paint = |ui: &mut egui::Ui| {
+                let painter = ui.painter();
+                halves(painter);
+                painter.rect_filled(Rect::from_min_max(pos2(60.0, 60.0), pos2(80.0, 80.0)), 0.0, Color32::from_rgb(128, 64, 32));
+                painter.image(texture.id(), Rect::from_min_max(pos2(24.0, 24.0), pos2(40.0, 40.0)), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+                FilterLayer::new(rect, chain.clone()).paint(painter);
+            };
+            harness.frame(&mut paint);
+            let pixels = harness.frame(&mut paint);
+            assert_active(&harness.ctx);
+            let what = |point: &str| format!("{name}, layer {rect:?}: {point}");
+            let expect = |colour: [u8; 3]| if *black { [0, 0, 0] } else { colour };
+            assert_near(&pixels, 100, 50, expect([255, 0, 0]), &what("red"));
+            assert_near(&pixels, 140, 50, expect([0, 0, 255]), &what("blue"));
+            assert_near(&pixels, 70, 70, expect([128, 64, 32]), &what("mid-tone"));
+            assert_near(&pixels, 30, 30, expect([0, 255, 0]), &what("user texture"));
+            assert_near(&pixels, 21, 21, expect([255, 0, 0]), &what("top-left corner (orientation)"));
+            assert_near(&pixels, 148, 98, expect([0, 0, 255]), &what("bottom-right corner (orientation)"));
+        }
+    }
+}
+
+/// F2 on glow: an effect writing `fl.pointer` sees the pointer in capture uv with the pressed /
+/// present flags (converted from screen points with the callback's pixels per point), and one
+/// writing `fl.delta_time` / `fl.frame` sees egui's `stable_dt` (1/60 s for frames without a
+/// time) and a counter that advances per frame.
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn effects_see_the_pointer_and_the_frame_counters() {
+    let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let pointer = pass("pointer", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(fl.pointer.x, fl.pointer.y, fl.pointer.z, 1.0) * fl.pointer.w + vec4<f32>(0.0, 0.0, 0.0, 1.0 - fl.pointer.w); }");
+    // Capture = region = (32, 16) .. (160, 80) pixels at 1 pixel per point (no padding).
+    let rect = Rect::from_min_max(pos2(32.0, 16.0), pos2(160.0, 80.0));
+    let mut paint_pointer = |ui: &mut egui::Ui| FilterLayer::new(rect, pointer.clone()).paint(ui.painter());
+    harness.frame(&mut paint_pointer);
+    let pixels = harness.frame(&mut paint_pointer);
+    assert_active(&harness.ctx);
+    assert_near(&pixels, 64, 40, [0, 0, 0], "no pointer yet: w = 0");
+
+    // Screen point (64, 32) = capture uv ((64 - 32) / 128, (32 - 16) / 64) = (0.25, 0.25).
+    harness.frame_with(vec![egui::Event::PointerMoved(pos2(64.0, 32.0))], &mut |_| {});
+    let pixels = harness.frame(&mut paint_pointer);
+    assert_near(&pixels, 64, 40, [64, 64, 0], "hovering pointer at uv (0.25, 0.25)");
+    harness.frame_with(vec![egui::Event::PointerButton { pos: pos2(64.0, 32.0), button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }], &mut |_| {});
+    let pixels = harness.frame(&mut paint_pointer);
+    assert_near(&pixels, 100, 70, [64, 64, 255], "pressed pointer: z = 1");
+
+    // `fl.delta_time * 60` = 1 for egui's default 1/60 s step; `fl.frame` mod 2 alternates.
+    let counters = pass("counters", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(fl.delta_time * 60.0, f32(fl.frame % 2u), 0.0, 1.0); }");
+    let mut paint_counters = |ui: &mut egui::Ui| FilterLayer::new(rect, counters.clone()).paint(ui.painter());
+    let first = harness.frame(&mut paint_counters);
+    let second = harness.frame(&mut paint_counters);
+    let [first, second] = [rgb(&first, 64, 40), rgb(&second, 64, 40)];
+    assert!(first[0] >= 252 && second[0] >= 252, "delta_time = 1/60 s: {first:?} {second:?}");
+    assert!(first[1].abs_diff(second[1]) >= 252, "fl.frame advances by one per frame: {first:?} {second:?}");
+}
+
+// ---- F8: user textures (same scenes as `wgpu_headless.rs`) ----
+
+/// A 2x2 checker: red | green over blue | white (top row first).
+fn checker() -> ColorImage {
+    ColorImage::new([2, 2], vec![Color32::RED, Color32::GREEN, Color32::BLUE, Color32::WHITE])
+}
+
+/// Slot 0 through its own (egui `TextureOptions`) sampler.
+const TEX_SAMPLED: &str = "fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(0u, uv); }";
+/// Slot 0 texel by texel (`textureLoad`, no sampler).
+const TEX_EXACT: &str = "fn effect(uv: vec2<f32>) -> vec4<f32> { return tex_load(0u, vec2<i32>(floor(uv * tex_size(0u)))); }";
+/// Slot 1 through its own sampler.
+const TEX_SLOT1: &str = "fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(1u, uv); }";
+
+/// Checks a whole-frame layer showing the 2x2 checker texel by texel: each quadrant one texel,
+/// exactly, up to the pixels next to the centre lines.
+fn check_checker_quadrants(pixels: &[u8], what: &str) {
+    for (x, y, colour) in [(64, 32, [255, 0, 0]), (192, 32, [0, 255, 0]), (64, 96, [0, 0, 255]), (192, 96, [255, 255, 255]), (127, 63, [255, 0, 0]), (128, 63, [0, 255, 0]), (127, 64, [0, 0, 255]), (128, 64, [255, 255, 255])] {
+        assert_eq!(rgb(pixels, x, y), colour, "{what}: pixel ({x}, {y})");
+    }
+}
+
+/// Checks a whole-frame layer showing the 2x2 checker bilinearly: texel colour at a texel centre,
+/// the four-texel average at the centre, a quarter step between two texels.
+fn check_checker_linear(pixels: &[u8], what: &str) {
+    // uv (0.252, 0.254): the red texel's centre.
+    assert_near(pixels, 64, 32, [255, 0, 0], &format!("{what}: at the red texel's centre"));
+    // uv (0.502, 0.504): the average of all four texels.
+    assert_near(pixels, 128, 64, [128, 128, 129], &format!("{what}: between all four texels"));
+    // uv (0.377, 0.254): a quarter of the way from red to green.
+    assert_near(pixels, 96, 32, [189, 65, 2], &format!("{what}: a quarter from red to green"));
+}
+
+/// F8 on glow: a 2x2 checker attached twice, NEAREST at slot 0 and LINEAR at slot 1 (each
+/// texture's egui `TextureOptions` is its sampler, i.e. its GL texture parameters), read exactly
+/// (`tex_load`), through the nearest sampler (`tex`) and bilinearly; then replaced in full and
+/// patched in part between frames, which the next frame must show (no stale texture).
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn user_textures_are_sampled_exactly_and_linearly() {
+    let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let mut nearest = harness.ctx.load_texture("checker nearest", checker(), TextureOptions::NEAREST);
+    let linear = harness.ctx.load_texture("checker linear", checker(), TextureOptions::LINEAR);
+    let screen = Rect::from_min_max(pos2(0.0, 0.0), pos2(256.0, 128.0));
+    let (nearest_id, linear_id) = (nearest.id(), linear.id());
+    let frames = |harness: &mut Harness, snippet: &str, count: usize| {
+        let effect = pass("textured", snippet);
+        let (nearest, linear) = (nearest_id, linear_id);
+        let mut paint = |ui: &mut egui::Ui| {
+            halves(ui.painter());
+            FilterLayer::new(screen, effect.clone()).texture(0, nearest).texture(1, linear).paint(ui.painter());
+        };
+        (1..count).for_each(|_| drop(harness.frame(&mut paint)));
+        harness.frame(&mut paint)
+    };
+    check_checker_quadrants(&frames(&mut harness, TEX_EXACT, 2), "exact");
+    check_checker_quadrants(&frames(&mut harness, TEX_SAMPLED, 2), "nearest sampler");
+    check_checker_linear(&frames(&mut harness, TEX_SLOT1, 2), "linear sampler");
+    assert_active(&harness.ctx);
+    assert!(egui_filter_layers::failed_textures(&harness.ctx).is_empty(), "{:?}", egui_filter_layers::failed_textures(&harness.ctx));
+
+    // A full re-upload, then a partial one, each visible in the very next frame.
+    nearest.set(ColorImage::new([2, 2], vec![Color32::YELLOW; 4]), TextureOptions::NEAREST);
+    let pixels = frames(&mut harness, TEX_EXACT, 1);
+    assert_eq!(rgb(&pixels, 192, 96), [255, 255, 0], "after a full update");
+    nearest.set_partial([1, 1], ColorImage::new([1, 1], vec![Color32::BLACK]), TextureOptions::NEAREST);
+    let pixels = frames(&mut harness, TEX_EXACT, 1);
+    assert_eq!((rgb(&pixels, 192, 96), rgb(&pixels, 64, 32)), ([0, 0, 0], [255, 255, 0]), "after a partial update");
+}
+
+/// F8 on glow: three slots at once, each its own texture and size: `(tex(0).r, tex(1).g,
+/// tex(2).b)` on the left half, `tex_size` of the three (2x2, 4x4, 3x1) times 32 on the right.
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn three_texture_slots_at_once() {
+    let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let checker = harness.ctx.load_texture("checker", checker(), TextureOptions::NEAREST);
+    let blue = harness.ctx.load_texture("blue 3x1", ColorImage::new([3, 1], vec![Color32::from_rgb(0, 0, 100); 3]), TextureOptions::LINEAR);
+    let ids = [checker.id(), harness.texture.id(), blue.id()];
+    let channels = pass("channels", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(tex(0u, vec2<f32>(0.25)).r, tex(1u, uv).g, tex(2u, uv).b, 1.0); }");
+    let sizes = pass("sizes", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(vec3<f32>(tex_size(0u).x, tex_size(1u).y, tex_size(2u).x) * 32.0 / 255.0, 1.0); }");
+    let mut paint = |ui: &mut egui::Ui| {
+        halves(ui.painter());
+        let attach = |layer: FilterLayer| ids.iter().enumerate().fold(layer, |layer, (slot, id)| layer.texture(slot, *id));
+        attach(FilterLayer::new(Rect::from_min_max(pos2(0.0, 0.0), pos2(128.0, 128.0)), channels.clone())).paint(ui.painter());
+        attach(FilterLayer::new(Rect::from_min_max(pos2(128.0, 0.0), pos2(256.0, 128.0)), sizes.clone())).paint(ui.painter());
+    };
+    harness.frame(&mut paint);
+    let pixels = harness.frame(&mut paint);
+    assert_active(&harness.ctx);
+    assert_near(&pixels, 64, 64, [255, 255, 100], "one channel from each slot");
+    assert_near(&pixels, 192, 64, [64, 128, 96], "each slot's own size");
+}
+
+/// F8 on glow: a layer attaching an id the painter does not know draws nothing extra and the id
+/// is reported (`failed_textures`) without disabling the backend or any effect; a texture freed
+/// by egui is reported the same way once the free was applied; a layer whose effect reads a slot
+/// with nothing attached is refused before the backend (not a backend failure).
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn unknown_freed_and_missing_textures_skip_their_layer_only() {
+    let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let unknown = egui::TextureId::User(424_242);
+    let temporary = harness.ctx.load_texture("temporary", ColorImage::new([1, 1], vec![Color32::WHITE]), TextureOptions::NEAREST);
+    let freed = temporary.id();
+    let mut temporary = Some(temporary);
+    let sampled = pass("sampled", TEX_SAMPLED);
+    let mut paint = |ui: &mut egui::Ui| {
+        let painter = ui.painter();
+        halves(painter);
+        FilterLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(56.0, 120.0)), sampled.clone()).texture(0, unknown).paint(painter);
+        FilterLayer::new(Rect::from_min_max(pos2(72.0, 8.0), pos2(120.0, 120.0)), sampled.clone()).texture(0, freed).paint(painter);
+        // Nothing attached although the effect reads slot 0.
+        FilterLayer::new(Rect::from_min_max(pos2(136.0, 8.0), pos2(184.0, 120.0)), sampled.clone()).paint(painter);
+        FilterLayer::new(Rect::from_min_max(pos2(200.0, 8.0), pos2(248.0, 120.0)), presets::invert(1.0)).paint(painter);
+    };
+    harness.frame(&mut paint);
+    let pixels = harness.frame(&mut paint);
+    assert_near(&pixels, 96, 60, [255, 255, 255], "the live texture is drawn");
+    // Dropping the handle frees the texture with the next frame's delta (after its painting).
+    temporary.take();
+    harness.frame(&mut paint);
+    let pixels = harness.frame(&mut paint);
+    assert_near(&pixels, 30, 60, [255, 0, 0], "unknown id: the backdrop stays");
+    assert_near(&pixels, 96, 60, [255, 0, 0], "freed id: the backdrop stays");
+    assert_near(&pixels, 160, 60, [0, 0, 255], "missing attachment: the backdrop stays");
+    assert_near(&pixels, 220, 60, [255, 255, 0], "a healthy layer still filters");
+    assert_active(&harness.ctx);
+    assert!(egui_filter_layers::failed_effects(&harness.ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&harness.ctx));
+    let mut failed: Vec<egui::TextureId> = egui_filter_layers::failed_textures(&harness.ctx).into_iter().map(|failure| failure.id).collect();
+    failed.sort_by_key(|id| format!("{id:?}"));
+    let mut expected = vec![unknown, freed];
+    expected.sort_by_key(|id| format!("{id:?}"));
+    assert_eq!(failed, expected);
 }

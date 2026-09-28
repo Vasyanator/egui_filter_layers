@@ -16,13 +16,14 @@ Key functions:
 - `Effect::new()` / `compile()`: detect `struct Params`, assemble (prelude + snippet + the named
   parameter tail), parse, lay out the named parameters, validate, check the resource interface.
 - `Effect::params()` / `Effect::param()`: reflection of the named parameters.
+- `Effect::reads_texture()`: which user texture slots the effect reads (IR scan, conservative).
 - `composite_module()` / `composite_linear_module()` (crate-internal): the internal replace pass
   that writes the filtered region back (gamma output / linear output for `*Srgb` targets; glow,
   offline). `composite_erase_module()` / `composite_add_module()` / `composite_add_linear_module()`:
   the two draws of the blended composite the wgpu UI draws over egui's pass.
 
 Submodules: `diagnostics.rs` (snippet-relative errors), `interface.rs` (IR checks: bindings,
-entry points, `fl.time`), `params.rs` (named parameters: detection, layout, typed values).
+entry points, `fl.time`, user texture slots), `params.rs` (named parameters: detection, layout, typed values).
 
 Notes:
 The prelude is placed BEFORE the user snippet so a naga line number maps to a snippet line by a
@@ -43,7 +44,7 @@ mod params;
 
 pub use diagnostics::SnippetLocation;
 use diagnostics::{Assembled, error_chain, error_sources, location_suffix};
-use interface::{check_interface, reads_time};
+use interface::{check_interface, reads_time, texture_slots};
 pub(crate) use params::{ParamLayout, element_range};
 pub use params::{ParamError, ParamInfo, ParamType, ParamValue};
 
@@ -74,8 +75,18 @@ pub(crate) const BINDING_PARAMS: u32 = 4;
 pub(crate) const BINDING_STATE_TEXTURE: u32 = 5;
 /// `@binding` of the mask coverage texture (`fl_coverage_texture`; a white dummy without one).
 pub(crate) const BINDING_COVERAGE_TEXTURE: u32 = 6;
-/// `@binding` of the shared nearest clamp-to-edge sampler (`fl_nearest_sampler`).
-pub(crate) const BINDING_NEAREST_SAMPLER: u32 = 7;
+
+/// How many user textures a layer can attach (`FilterLayer::texture`, offline
+/// `OfflineOptions::with_texture`); effects read slot `i` with `tex(i, uv)`, `tex_size(i)` and
+/// `tex_load(i, px)`. Three on every backend: WebGL2 allows four bind groups and `@group(0)` is
+/// the crate's.
+pub const TEXTURE_SLOTS: usize = 3;
+/// `@group` of user texture slot 0; slot `i` is `@group(USER_TEXTURE_GROUP_BASE + i)`.
+pub(crate) const USER_TEXTURE_GROUP_BASE: u32 = 1;
+/// `@binding` of a user texture inside its group (egui-wgpu's texture bind-group layout).
+pub(crate) const USER_TEXTURE_BINDING: u32 = 0;
+/// `@binding` of a user texture's own sampler inside its group (egui-wgpu's layout).
+pub(crate) const USER_SAMPLER_BINDING: u32 = 1;
 
 /// Monotonic source of `CompiledModule::id`. Ids are never reused within a process, so a backend
 /// cache keyed by id can never confuse a dropped module with a new one.
@@ -104,6 +115,9 @@ pub(crate) struct CompiledModule {
     pub(crate) info: naga::valid::ModuleInfo,
     /// The named-parameter block (`struct Params`); empty with `block_size` 0 when undeclared.
     pub(crate) params: ParamLayout,
+    /// Which user texture slots the module may read (`interface::texture_slots`; conservative:
+    /// a slot index that is not a constant counts as every slot).
+    pub(crate) texture_slots: [bool; TEXTURE_SLOTS],
 }
 
 impl fmt::Debug for CompiledModule {
@@ -312,6 +326,17 @@ impl Effect {
         self.module.params.field(name)
     }
 
+    /// Whether the effect may read user texture `slot` (`tex`, `tex_size`, `tex_load` or the
+    /// slot's `fl_user*` globals, found in naga's IR). A slot index that is not a constant
+    /// expression (a parameter, a computed value) counts as reading EVERY slot. A layer running
+    /// an effect that reads a slot must attach a texture there ([`crate::FilterLayer::texture`]),
+    /// otherwise the layer is refused ([`crate::TextureError::NotAttached`]). `false` for
+    /// `slot >= TEXTURE_SLOTS`.
+    #[must_use]
+    pub fn reads_texture(&self, slot: usize) -> bool {
+        self.module.texture_slots.get(slot).copied().unwrap_or(false)
+    }
+
     /// The shared compiled module (crate-internal: backends key their caches on it).
     pub(crate) fn module(&self) -> &Arc<CompiledModule> {
         &self.module
@@ -363,9 +388,10 @@ fn compile(label: &str, snippet: &str) -> Result<CompiledModule, EffectError> {
 
     check_interface(label, &module, declaration.is_some())?;
 
+    let texture_slots = texture_slots(&module);
     let id = NEXT_MODULE_ID.fetch_add(1, Ordering::Relaxed);
-    log::debug!("egui_filter_layers: compiled effect `{label}` (module id {id})");
-    Ok(CompiledModule { id, label: Arc::from(label), source: assembled.source, module, info, params })
+    log::debug!("egui_filter_layers: compiled effect `{label}` (module id {id}, user texture slots {texture_slots:?})");
+    Ok(CompiledModule { id, label: Arc::from(label), source: assembled.source, module, info, params, texture_slots })
 }
 
 /// `effect` wrapper appended to the composite body for targets that store gamma values as-is.
@@ -486,6 +512,34 @@ mod tests {
 }";
         let effect = Effect::new("helpers", snippet);
         assert!(effect.is_ok(), "{effect:?}");
+    }
+
+    /// F8: which user texture slots an effect reads, from naga's IR: constant slots (literal,
+    /// abstract literal, `const`) count individually, a computed slot counts as every slot, a
+    /// direct `fl_user*` reference counts, out-of-range constants and unused helpers count nothing.
+    #[test]
+    fn texture_slots_are_detected_conservatively() {
+        let slots = |snippet: &str| match Effect::new("slots", snippet) {
+            Ok(effect) => (0..=TEXTURE_SLOTS).map(|slot| effect.reads_texture(slot)).collect::<Vec<bool>>(),
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(slots("fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }"), [false, false, false, false]);
+        assert_eq!(slots("fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(1u, uv); }"), [false, true, false, false]);
+        assert_eq!(slots("fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(2, uv) * tex_size(0).x; }"), [true, false, true, false]);
+        assert_eq!(slots("const NOISE: u32 = 1u;\nfn effect(uv: vec2<f32>) -> vec4<f32> { return tex_load(NOISE, vec2<i32>(0)); }"), [false, true, false, false]);
+        assert_eq!(slots("fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(7u, uv); }"), [false, false, false, false], "slot 7 reads nothing");
+        assert_eq!(slots("fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(u32(uv.x * 3.0), uv); }"), [true, true, true, false], "a computed slot is every slot");
+        assert_eq!(slots("struct Params { slot: u32 }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return tex(p.slot, uv); }"), [true, true, true, false]);
+        assert_eq!(slots("fn effect(uv: vec2<f32>) -> vec4<f32> { if uv.x > 0.5 { return tex(0u, uv); } return textureLoad(fl_user2, vec2<i32>(0), 0); }"), [true, false, true, false], "nested blocks and direct globals");
+        assert_eq!(slots("fn unused() -> vec4<f32> { return tex(1u, vec2<f32>(0.0)); }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }"), [false, true, false, false], "any function of the module counts");
+    }
+
+    #[test]
+    fn user_texture_bindings_are_prelude_only() {
+        let foreign = "@group(1) @binding(2) var extra: texture_2d<f32>;\nfn effect(uv: vec2<f32>) -> vec4<f32> { return textureLoad(extra, vec2<i32>(0), 0); }";
+        assert!(matches!(Effect::new("foreign", foreign), Err(EffectError::Interface { .. })), "a snippet cannot bind its own resource in a user group");
+        let removed = "fn effect(uv: vec2<f32>) -> vec4<f32> { return textureSampleLevel(fl_src_texture, fl_nearest_sampler, uv, 0.0); }";
+        assert!(Effect::new("removed", removed).is_err(), "the nearest sampler (binding 7) no longer exists");
     }
 
     #[test]

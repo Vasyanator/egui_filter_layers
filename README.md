@@ -13,6 +13,9 @@ blur, colour adjustments, refraction, or your own WGSL shader.
   when you build it, with errors pointing at your snippet.
 - Named, typed effect parameters: declare `struct Params { ... }` in WGSL, set values by name
   from Rust (`pass.set("amount", 0.5)`), and reflect the members to build a UI.
+- Hot reload of custom effects from `.wgsl` files (feature `hot-reload`, native): edits recompile
+  off the GUI thread, the last good version keeps rendering while the file is broken, and named
+  parameter values survive a reload (`HotEffect`, `rebind`).
 - Rounded-rect masks with anti-aliased edges.
 - View-only: never touches egui textures or your data.
 - One shader language on every backend (WGSL, translated to GLSL for OpenGL).
@@ -159,6 +162,8 @@ Prelude available to every effect:
 | `original(uv)` | the untouched captured backdrop (before any pass), readable in every pass |
 | `p.<name>` | named parameter: member of the snippet's `struct Params` (below) |
 | `params(i)` | `vec4<f32>` anonymous parameter slot `i` (`0..16`) of the pass (untyped; prefer named) |
+| `tex(i, uv)` | user texture `i` (`0..3`, attached with `FilterLayer::texture`) at `uv` in its own 0..1 coordinates, through its own sampler (its egui `TextureOptions`) |
+| `tex_size(i)`, `tex_load(i, px)` | its size in texels; its exact texel `px` (`vec2<i32>`, clamped, no filtering) |
 | `fl.texel`, `fl.size_px` | one capture pixel in `uv` units; capture size in pixels (also in scaled passes) |
 | `fl.pass_scale` | the pass's output resolution relative to the capture (`Pass::with_scale`, 1 = full) |
 | `fl.rect_uv` | the layer rect inside the capture (`xy` min, `zw` size) |
@@ -187,6 +192,29 @@ reads that smaller image. `uv`, `src()`, `original()`, `fl.texel` and `fl.size_p
 capture meaning, so distance maths is unchanged; kernels that step in pixels use `src_px()` /
 `src_texel()` (input pixels) or `out_texel()`. `presets::kawase_blur(radius)` and
 `presets::bloom(threshold, intensity, radius)` are built from such passes.
+
+### Textures
+
+A layer can attach up to three egui textures (`TEXTURE_SLOTS`) that its effects read — noise,
+normal maps, lookup tables, images:
+
+```rust
+let noise = ctx.load_texture("noise", noise_image, egui::TextureOptions::LINEAR_REPEAT);
+let displace = Effect::new("displace", r#"
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let n = tex(0u, uv * 4.0).rg - vec2<f32>(0.5);
+    return src(uv + n * 8.0 * fl.texel);
+}
+"#)?;
+FilterLayer::new(rect, Pass::new(&displace).with_sample_radius(4.0)).texture(0, noise.id()).paint(ui.painter());
+```
+
+`tex(i, uv)` samples in the texture's own uv through the sampler of its egui `TextureOptions`
+(filters, wrap mode); `tex_load(i, px)` reads one texel exactly. Values are premultiplied gamma
+RGBA like `src()`. An effect that reads a slot with nothing attached is refused
+(`FilterLayer::check_textures`; the layer draws nothing and the error is logged once), and a
+texture id the renderer does not know (freed) skips its layer and is listed by
+`failed_textures(ctx)`. Offline, attach an `OfflineTexture` with `OfflineOptions::with_texture`.
 
 ### Named parameters
 
@@ -235,7 +263,8 @@ to named parameters.
   the same format (RGBA8, RGB8, RGB565, RGBA4, RGB5_A1, RGB10_A2, SRGB8_ALPHA8). Layers painted
   into a float / integer / other framebuffer are skipped (logged once).
 - **Failures are contained**: an effect the driver rejects (or whose draw raises a GL error) is
-  disabled alone and listed by `failed_effects`; only failures of the crate's own GPU work disable
+  disabled alone and listed by `failed_effects`; an attached texture the renderer does not know
+  skips its layers and is listed by `failed_textures`; only failures of the crate's own GPU work disable
   the backend (`status`). Either way nothing panics and the backdrop stays unfiltered. With a failed
   backend, animated layers stop requesting repaints. The one exception is a `WgpuOptions` that
   does not match egui's render pass (see the wgpu quick start): it cannot be detected, and wgpu
@@ -267,6 +296,7 @@ screen. Use it to export what an editor previews.
 | `wgpu` | yes | the `egui-wgpu` backend |
 | `image` | no | `OfflineRenderer` (implies `wgpu`) and PNG / JPEG adapters through the [`image`](https://crates.io/crates/image) crate (`default-features = false`) |
 | `video` | no | `OfflineRenderer` (implies `wgpu`) plus video processing (`offline::video`): frame streams, source / sink traits, ffmpeg command-line adapters; no extra Rust dependencies |
+| `hot-reload` | no | `HotEffect`: effects that follow a WGSL file (mtime polling on a std thread, no extra dependencies); native only, compiles to nothing on wasm32 |
 
 Offline processing is wgpu-only; a glow app enables `image` / `video` just for export (its preview and
 export then agree within rounding, not bit for bit). More image formats: enable them on your own
@@ -287,6 +317,12 @@ let result = renderer.process(&frame, &chain, &options)?; // straight-alpha RGBA
 // With the `image` feature:
 renderer.process_file("in.png".as_ref(), "out.jpg".as_ref(), &chain, &options)?;
 ```
+
+User textures: `OfflineOptions::with_texture(slot, OfflineTexture::from_color_image(&image,
+options)?)` — `from_color_image` holds exactly the bytes egui uploads for that image, so a
+textured effect matches the UI bit for bit (tested, also tiled); `OfflineTexture::new` takes a
+`FrameRef`. A texture is uploaded once and reused while the same `OfflineTexture` (or a clone)
+stays attached, so a video passes one with every frame at no cost.
 
 `process_into` reuses one output buffer for frame streams (decode a video with any library,
 pass each frame with its presentation time); `process_async` is the non-blocking variant (on the

@@ -7,7 +7,8 @@ beneath a rect through a chain of WGSL filter passes, on pluggable GPU backends.
 ## Architecture
 ```text
 user code ──► FilterLayer::paint (layer.rs)
-                 │  resolves FilterChain -> LayerJob (rect, mask, passes, padding, time, frame_input)
+                 │  checks user textures (plan::check_textures), resolves FilterChain -> LayerJob
+                 │  (rect, mask, passes, padding, time, frame_input, textures)
                  ▼
           backend registry plugin (backend.rs)       ──►  Arc<dyn Backend>
                  │                                         ├─ glow_backend/  (feature "glow")
@@ -48,23 +49,31 @@ user code ──► FilterLayer::paint (layer.rs)
   `FrameUniforms::for_layer` (the per-layer uniform values every backend uploads).
 - `plan.rs`: backend-neutral wiring of one chain run — `plan()` (steps: bindings by `Slot`,
   what each slot holds (`Content`: resolution, window), output, viewport, fragment offset; the
-  composite; the ping-pong pool size `target_px`), `scaled_px` (per-pass scale sizes),
+  composite; the ping-pong pool size `target_px`; which user texture slots each draw binds),
+  `check_textures` (every slot an effect reads is attached), `scaled_px` (per-pass scale sizes),
   `TextureMapping::of` (the one storage-uv formula), `step_uniforms` / `composite_uniforms` / `params_block` / `composite_params_block`
   (every block a backend uploads, at bindings 0 and 4).
 - `geometry.rs`: `layer_geometry` — region / capture / UV / mask math (pure, unit-tested);
   `LayerGeometry::composite_params` (the composite pass's parameter block, every backend);
   `pointer_uniform` (the one screen-points -> capture-uv conversion of `fl.pointer`).
-- `layer.rs`: `FilterLayer` and its `paint` (skips a missing or failed backend; requests a
-  repaint for animated chains only when the backend is usable; reads the per-frame input).
+- `layer.rs`: `FilterLayer` and its `paint` (skips a missing or failed backend, and a layer whose
+  user textures fail `check_textures` (logged once per context and message); requests a repaint
+  for animated chains only when the backend is usable; reads the per-frame input);
+  `FilterLayer::texture` attaches user textures (F8).
 - `backend.rs`: crate-internal `Backend` trait, `LayerJob` (backend-neutral: rect, mask, passes,
-  padding, time, `FrameInput`), registry (`register`, `installed`, `uninstall`; a hook-less egui plugin, so it
+  padding, time, `FrameInput`, attached texture ids), registry (`register`, `installed`, `uninstall`; a hook-less egui plugin, so it
   lives in the `Context` and survives `Memory` resets), public `status`, `failed_effects`,
-  `BackendStatus`, `EffectFailure`, `InstallError`.
+  `failed_textures`, `BackendStatus`, `EffectFailure`, `TextureError`, `TextureFailure`, `InstallError`.
 - `presets.rs`: built-in effects (compiled once in `OnceLock`s) and their constructors.
 - `impulses.rs`: `Impulses` (F3) — user-owned, bounded (16, oldest dropped first) timed impulses
   in layer-rect uv; packs them into the named params `impulses` / `impulse_count` (`apply`), and
   is the only thing that requests repaints for impulse-driven effects (`request_repaint_if_alive`,
   only while one is alive). No egui memory, no global state; usable offline with any clock.
+- `hot.rs` (feature `hot-reload`, not compiled on wasm32): `HotEffect` — a std thread polls a
+  WGSL file's `(mtime, length)`, reads and compiles it off the GUI thread and publishes the
+  effect / the distinct errors (logged once each) over a channel; `poll` never blocks; drop wakes
+  the thread and joins it within 100 ms or detaches it. `rebind` rebuilds a `Pass` on a new effect
+  keeping matching named params (public `Pass` API only).
 - `shaders/`: the WGSL prelude and composite pass (see its readme).
 - `glow_backend/`: the `egui_glow` backend (see its readme).
 - `wgpu_backend/`: the `egui-wgpu` backend (see its readme); its `chain.rs` is the single, egui-free
@@ -93,11 +102,22 @@ user code ──► FilterLayer::paint (layer.rs)
   composite share one layout): 0 = `fl`, 1 = pass input, 2 = linear sampler, 3 = original
   capture, 4 = the named-parameter block `p: Params` (appended by the crate after a snippet that
   declares `struct Params`; every draw binds `plan::params_block`, 16 zero bytes without one),
-  5 = state, 6 = mask coverage, 7 = nearest sampler.
+  5 = state, 6 = mask coverage. There is no nearest sampler: every texture is read through ONE
+  sampler (naga's GLSL writer rejects two per texture); exact reads use `textureLoad`.
   A binding a draw does not use gets a neutral dummy (transparent / white texture, zero buffer);
   every pass and the composite bind the capture as the original (`original()`, mapped by the
   capture's own `internal_aux_*`). The interface check accepts only these
   prelude declarations (`effect::PRELUDE_RESOURCES`): a snippet declares no binding at all.
+- User textures (F8): slot `i` of `TEXTURE_SLOTS` (3, every backend: WebGL2 has 4 bind groups)
+  is `@group(1 + i)` = egui-wgpu's texture bind-group layout (texture 0, its own sampler 1); wgpu
+  binds egui's own bind group of the texture there, glow the GL texture on unit `4 + i` (its own
+  sampling parameters), offline the renderer's upload of an `OfflineTexture`. Sampled in the
+  texture's own uv (no mapping, independent of windows and scales). Which slots an effect reads
+  is found in its IR (`Effect::reads_texture`, conservative); a layer reading an unattached slot is
+  refused before any backend work (`plan::check_textures` -> `TextureError`, UI and offline), never
+  given a dummy; an attached id the backend cannot resolve skips the layer and is reported by
+  `failed_textures` (latched per id, logged once). Unattached slots are bound to dummies only so the
+  layout is complete; no effect that reads them runs.
 - Wiring has one owner: backends never decide which slot a draw reads, which mapping or
   fragment offset it uploads; they call `plan.rs` (glow and wgpu blocks are byte-identical but for
   `flip_y` / fragment mode, pinned by `glow_and_wgpu_upload_identical_blocks`).

@@ -12,9 +12,10 @@ Key structures:
 - `ReadFormat`: the colour format of the framebuffer being captured, and the renderbuffer format
   a multisample resolve must use to match it (GLES 3 / WebGL2 require identical formats).
 - `ResolveTarget`: renderbuffer + framebuffer for that resolve, reallocated on format change.
+- `ParamsBuffer`: the grow-only named-parameter uniform buffer and its allocated size.
 - `Resources`: the shared set (VAO, `fl` and named-parameter uniform buffers, capture / resolve / ping-pong targets,
-  composite program, dummy textures and the nearest sampler object for the texture units a draw
-  leaves unused, cached default-framebuffer format).
+  composite program, dummy textures for the texture units a draw leaves unused, cached
+  default-framebuffer format).
 
 Key functions:
 - `build_program()`: compile + link a translated `GlslProgram` and bind its block / samplers.
@@ -447,6 +448,30 @@ unsafe fn dummy_texture(gl: &glow::Context, rgba: [u8; 4]) -> Result<glow::Textu
     }
 }
 
+/// The named-parameter uniform buffer (WGSL binding 4, GL binding point
+/// [`PARAMS_BINDING_POINT`]): grow-only, so a draw re-allocates it only when its block is larger
+/// than anything uploaded before (`render.rs` writes blocks with `glBufferSubData`).
+#[derive(Debug)]
+pub(super) struct ParamsBuffer {
+    /// The GL buffer.
+    pub buffer: glow::Buffer,
+    /// Its allocated size in bytes (0 until the first upload).
+    pub capacity: usize,
+}
+
+impl ParamsBuffer {
+    /// Smallest allocation: every block up to 256 bytes fits the first allocation.
+    const MIN_CAPACITY: usize = 256;
+
+    /// The capacity to re-allocate to for a `needed`-byte block, or `None` when `capacity`
+    /// already holds it. Grows to the next power of two (at least [`Self::MIN_CAPACITY`]), so a
+    /// chain alternating block sizes settles after one allocation; never shrinks.
+    #[must_use]
+    pub fn grown_capacity(capacity: usize, needed: usize) -> Option<usize> {
+        (needed > capacity).then(|| needed.checked_next_power_of_two().unwrap_or(needed).max(Self::MIN_CAPACITY))
+    }
+}
+
 /// The objects shared by every layer painted through one backend.
 #[derive(Debug)]
 pub(super) struct Resources {
@@ -455,9 +480,8 @@ pub(super) struct Resources {
     pub vertex_array: glow::VertexArray,
     /// The `fl` uniform buffer (re-filled per pass).
     pub uniform_buffer: glow::Buffer,
-    /// The named-parameter uniform buffer (re-specified per draw with that draw's block, whose
-    /// size varies by effect).
-    pub params_buffer: glow::Buffer,
+    /// The named-parameter uniform buffer (grow-only; each draw writes its block at offset 0).
+    pub params: ParamsBuffer,
     /// 8-bit copy of the backdrop.
     pub capture: RenderTarget,
     /// Screen-sized renderbuffer for resolving a multisampled framebuffer (format matched to it);
@@ -474,12 +498,11 @@ pub(super) struct Resources {
     pub ping_pong: [RenderTarget; 2],
     /// The composite program writing the result back.
     pub composite: glow::Program,
-    /// 1x1 transparent texture for texture units a draw leaves unused (original, state).
+    /// 1x1 transparent texture for texture units a draw leaves unused (original, state, user
+    /// texture slots with nothing attached).
     pub transparent: glow::Texture,
     /// 1x1 opaque white texture for the coverage units when there is no coverage texture.
     pub white: glow::Texture,
-    /// Nearest, clamp-to-edge sampler object bound on the `NEAREST_UNIT_BASE..` units.
-    pub nearest_sampler: glow::Sampler,
 }
 
 impl Resources {
@@ -521,7 +544,7 @@ impl Resources {
         unsafe {
             gl.delete_vertex_array(self.vertex_array);
             gl.delete_buffer(self.uniform_buffer);
-            gl.delete_buffer(self.params_buffer);
+            gl.delete_buffer(self.params.buffer);
             self.capture.destroy(gl);
             if let Some(resolve) = self.resolve {
                 resolve.destroy(gl);
@@ -532,7 +555,6 @@ impl Resources {
             gl.delete_program(self.composite);
             gl.delete_texture(self.transparent);
             gl.delete_texture(self.white);
-            gl.delete_sampler(self.nearest_sampler);
         }
     }
 }
@@ -549,7 +571,6 @@ struct Partial {
     pong: Option<RenderTarget>,
     transparent: Option<glow::Texture>,
     white: Option<glow::Texture>,
-    nearest_sampler: Option<glow::Sampler>,
 }
 
 impl Partial {
@@ -565,7 +586,7 @@ impl Partial {
             self.uniform_buffer = Some(buffer);
             gl.bind_buffer(glow::UNIFORM_BUFFER, Some(buffer));
             gl.buffer_data_size(glow::UNIFORM_BUFFER, UNIFORM_BLOCK_SIZE_I32, glow::DYNAMIC_DRAW);
-            // Sized per draw by `glBufferData` (`render.rs`); only the name is created here.
+            // Allocated on first use and grown by `render.rs` (`ParamsBuffer::grown_capacity`).
             self.params_buffer = Some(gl.create_buffer().map_err(|detail| GlError::CreateResource { resource: "uniform buffer", detail })?);
             gl.bind_buffer(glow::UNIFORM_BUFFER, None);
 
@@ -588,19 +609,14 @@ impl Partial {
 
             self.transparent = Some(dummy_texture(gl, [0; 4])?);
             self.white = Some(dummy_texture(gl, [u8::MAX; 4])?);
-            let sampler = gl.create_sampler().map_err(|detail| GlError::CreateResource { resource: "sampler", detail })?;
-            self.nearest_sampler = Some(sampler);
-            for (name, value) in [(glow::TEXTURE_MIN_FILTER, glow::NEAREST), (glow::TEXTURE_MAG_FILTER, glow::NEAREST), (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE), (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE)] {
-                gl.sampler_parameter_i32(sampler, name, gl_i32(value));
-            }
 
-            match (self.composite.take(), self.vertex_array.take(), self.uniform_buffer.take(), self.params_buffer.take(), self.capture.take(), self.ping.take(), self.pong.take(), self.transparent.take(), self.white.take(), self.nearest_sampler.take()) {
-                (Some(composite), Some(vertex_array), Some(uniform_buffer), Some(params_buffer), Some(capture), Some(first), Some(second), Some(transparent), Some(white), Some(nearest_sampler)) => {
+            match (self.composite.take(), self.vertex_array.take(), self.uniform_buffer.take(), self.params_buffer.take(), self.capture.take(), self.ping.take(), self.pong.take(), self.transparent.take(), self.white.take()) {
+                (Some(composite), Some(vertex_array), Some(uniform_buffer), Some(params_buffer), Some(capture), Some(first), Some(second), Some(transparent), Some(white)) => {
                     let max_size = [glow::MAX_TEXTURE_SIZE, glow::MAX_RENDERBUFFER_SIZE].into_iter().map(|limit| gl.get_parameter_i32(limit)).filter(|limit| *limit > 0).min().unwrap_or(i32::MAX);
                     Ok(Resources {
                         vertex_array,
                         uniform_buffer,
-                        params_buffer,
+                        params: ParamsBuffer { buffer: params_buffer, capacity: 0 },
                         capture,
                         resolve: None,
                         max_size,
@@ -610,7 +626,6 @@ impl Partial {
                         composite,
                         transparent,
                         white,
-                        nearest_sampler,
                     })
                 }
                 // Unreachable by construction (every field was set above); handled without a
@@ -666,9 +681,6 @@ impl Partial {
             }
             for texture in [self.transparent.take(), self.white.take()].into_iter().flatten() {
                 gl.delete_texture(texture);
-            }
-            if let Some(sampler) = self.nearest_sampler.take() {
-                gl.delete_sampler(sampler);
             }
         }
     }
@@ -771,6 +783,15 @@ mod tests {
         assert_eq!(grown_size([0, 0], [1000, 1], 1010), [1010, 64], "rounded up to 1024 but clamped to the limit");
         assert_eq!(grown_size([0, 0], [2000, 1], 1024), [2000, 64], "never below what is needed");
         assert_eq!(grown_size([0, 0], [i32::MAX, 0], i32::MAX), [i32::MAX, 1], "no overflow, no zero axis");
+    }
+
+    #[test]
+    fn the_params_buffer_only_grows_in_powers_of_two() {
+        assert_eq!(ParamsBuffer::grown_capacity(0, 16), Some(256));
+        assert_eq!(ParamsBuffer::grown_capacity(256, 16), None, "a smaller block reuses the allocation");
+        assert_eq!(ParamsBuffer::grown_capacity(256, 256), None);
+        assert_eq!(ParamsBuffer::grown_capacity(256, 272), Some(512));
+        assert_eq!(ParamsBuffer::grown_capacity(512, 16 * 1024), Some(16 * 1024), "the 16 KiB cap is a power of two");
     }
 
     #[test]

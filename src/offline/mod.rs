@@ -12,6 +12,7 @@ Key structures:
 - `OfflineRenderer` (public): device, queue, chain objects, frame textures and readback buffer,
   reused across calls (a video processes every frame through one renderer).
 - `OfflineOptions`, `PointerState` (public, `options.rs`): the settings of a run.
+- `OfflineTexture` (public, `texture.rs`): an image effects read as a user texture (F8).
 
 Key functions:
 - `OfflineRenderer::new()` / `from_render_state()` / `headless_async()` / `headless()` (native).
@@ -26,7 +27,10 @@ covering it, so the capture clamps at the image edge exactly as the UI clamps at
 Tiles are windows of that one geometry (see `tiles.rs`). Blocking entry points must not run on a
 GUI thread. All per-frame GPU work runs in awaited `ErrorScopes` (out-of-memory is a typed error);
 the readback buffer is taken out of the renderer while mapped so cancellation cannot leave it
-mapped.
+mapped. User textures are checked against the chain (`plan::check_textures`, the UI's check)
+before any GPU work, uploaded once per attached `OfflineTexture` (kept per slot while the same
+texture stays attached) into `Rgba8Unorm` textures bound through egui-wgpu's sampler mapping, and
+are independent of tiles (their uv is their own).
 */
 
 //! Offline processing: apply a [`FilterChain`] to an ordinary image or video frame on wgpu and
@@ -76,6 +80,10 @@ mapped.
 //!
 //! The pipeline is 8-bit like the UI's capture: 16-bit input is converted to 8 bits first.
 //!
+//! User textures ([`OfflineOptions::with_texture`] with an [`OfflineTexture`]) are what
+//! `FilterLayer::texture` attaches in the UI; [`OfflineTexture::from_color_image`] holds exactly
+//! the bytes egui uploads for that image, so an effect reading them agrees with the UI.
+//!
 //! Video (feature `video`): see the `video` module — frame streams, source / sink traits and
 //! ffmpeg / image-sequence adapters, all running through the same renderer.
 
@@ -85,6 +93,7 @@ mod options;
 #[cfg(feature = "image")]
 mod image;
 mod readback;
+mod texture;
 mod tiles;
 #[cfg(feature = "video")]
 pub mod video;
@@ -94,11 +103,14 @@ use egui::{Rect, pos2};
 pub use error::OfflineError;
 pub use frame::{AlphaMode, FrameRef, RgbaFrame};
 pub use options::{OfflineOptions, PointerState};
+pub use texture::OfflineTexture;
 
+use crate::effect::{TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING};
 use crate::geometry::{LayerGeometry, PxRect, layer_geometry, padding_px};
 use crate::pass::{FilterChain, InputUniforms};
+use crate::plan::check_textures;
 use crate::wgpu_backend::chain::{ChainJob, ChainRecording, ChainResources, ChainSource, ChainTargets, ChainWindow, draw_composite};
-use crate::wgpu_backend::gpu::{ErrorScopes, begin_pass};
+use crate::wgpu_backend::gpu::{ErrorScopes, begin_pass, egui_sampler_descriptor};
 use frame::{MAX_SIDE, convert_output, frame_bytes};
 use readback::{RowLayout, map_read};
 use tiles::{Tile, TilePlan};
@@ -143,6 +155,21 @@ pub struct OfflineRenderer {
     /// The prepared (premultiplied, packed) input of the current run; kept between runs so a
     /// frame stream reuses its capacity.
     scratch: Vec<u8>,
+    /// The GPU copy of the texture attached at each user texture slot by the last run (reused
+    /// while the same `OfflineTexture` stays attached, dropped when the slot empties).
+    user_textures: [Option<UploadedTexture>; TEXTURE_SLOTS],
+    /// Samplers by egui texture options (egui-wgpu's mapping), created on first use.
+    samplers: std::collections::HashMap<egui::TextureOptions, wgpu::Sampler>,
+}
+
+/// The GPU copy of an attached [`OfflineTexture`].
+#[derive(Debug)]
+struct UploadedTexture {
+    /// The texture it was uploaded from (identity: `OfflineTexture::same`).
+    source: OfflineTexture,
+    /// Texture + sampler in `ChainResources::user_layout` (the bind group keeps the GPU texture
+    /// alive: wgpu resources are reference-counted by what uses them).
+    bind_group: wgpu::BindGroup,
 }
 
 /// The textures of one allocation size: every run uses all of them at exactly `alloc`.
@@ -178,7 +205,19 @@ impl OfflineRenderer {
             chain.intermediate_format(),
             limits.max_texture_dimension_2d
         );
-        Ok(Self { device: device.clone(), queue: queue.clone(), chain, composite, max_texture_side: limits.max_texture_dimension_2d, max_readback_side, targets: None, readback: None, scratch: Vec::new() })
+        Ok(Self {
+            device: device.clone(),
+            queue: queue.clone(),
+            chain,
+            composite,
+            max_texture_side: limits.max_texture_dimension_2d,
+            max_readback_side,
+            targets: None,
+            readback: None,
+            scratch: Vec::new(),
+            user_textures: [const { None }; TEXTURE_SLOTS],
+            samplers: std::collections::HashMap::new(),
+        })
     }
 
     /// A renderer on egui-wgpu's device: the same adapter, device and shader compiler as the
@@ -270,6 +309,7 @@ impl OfflineRenderer {
     /// [`OfflineRenderer::run`] with the prepared-input buffer passed in.
     async fn run_prepared(&mut self, frame: &FrameRef<'_>, chain: &FilterChain, options: &OfflineOptions, output: &mut Vec<u8>, block: bool, pixels: &mut Vec<u8>) -> Result<(), OfflineError> {
         options.validate()?;
+        check_textures(chain.passes(), options.attached_textures())?;
         frame.premultiplied_rows_into(options.background, pixels)?;
         let pixels: &[u8] = pixels;
         let size = [frame.width(), frame.height()];
@@ -304,6 +344,7 @@ impl OfflineRenderer {
             log::debug!("egui_filter_layers (offline): {}x{} processed in {} tiles of {:?}", size[0], size[1], plan.tiles.len(), plan.alloc);
         }
         self.ensure_allocations(&plan).await?;
+        self.ensure_user_textures(options).await?;
 
         for tile in &plan.tiles {
             let run = TileRun { tile: *tile, geometry, image_width: size[0], time: options.time, input: options.input_uniforms(&geometry) };
@@ -367,6 +408,74 @@ impl OfflineRenderer {
         Ok(())
     }
 
+    /// Makes the GPU copies match the textures `options` attaches: a slot keeps its upload while
+    /// the same `OfflineTexture` stays attached, uploads a new one otherwise (inside
+    /// [`ErrorScopes`], awaited), and drops it when the slot is empty.
+    ///
+    /// # Errors
+    /// [`OfflineError::TextureTooLarge`] for a texture beyond the device's limit (before any GPU
+    /// work); [`OfflineError::OutOfMemory`] / [`OfflineError::Gpu`] from the device.
+    async fn ensure_user_textures(&mut self, options: &OfflineOptions) -> Result<(), OfflineError> {
+        let mut uploads = Vec::new();
+        for (slot, cached) in self.user_textures.iter_mut().enumerate() {
+            match options.texture(slot) {
+                None => *cached = None,
+                Some(texture) if cached.as_ref().is_some_and(|uploaded| uploaded.source.same(texture)) => {}
+                Some(texture) => {
+                    let [width, height] = texture.size();
+                    if width > self.max_texture_side || height > self.max_texture_side {
+                        return Err(OfflineError::TextureTooLarge { slot, width, height, max: self.max_texture_side });
+                    }
+                    *cached = None;
+                    uploads.push((slot, texture.clone()));
+                }
+            }
+        }
+        if uploads.is_empty() {
+            return Ok(());
+        }
+        let scopes = ErrorScopes::push(&self.device);
+        for (slot, texture) in uploads {
+            let uploaded = self.upload_texture(texture);
+            if let Some(entry) = self.user_textures.get_mut(slot) {
+                *entry = Some(uploaded);
+            }
+        }
+        if let Some(error) = scopes.pop().await {
+            self.user_textures = [const { None }; TEXTURE_SLOTS];
+            log::warn!("egui_filter_layers (offline): uploading a user texture failed: {error}");
+            return Err(offline_gpu_error(&error));
+        }
+        Ok(())
+    }
+
+    /// Creates the GPU copy of `texture` (`Rgba8Unorm`, like egui-wgpu's textures) and its bind
+    /// group with egui-wgpu's sampler for its options. Call inside [`ErrorScopes`].
+    fn upload_texture(&mut self, texture: OfflineTexture) -> UploadedTexture {
+        let [width, height] = texture.size();
+        let extent = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+        let gpu = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("egui_filter_layers offline user texture"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FRAME_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(gpu.as_image_copy(), texture.pixels(), wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width.saturating_mul(4)), rows_per_image: Some(height) }, extent);
+        let device = &self.device;
+        let sampler = self.samplers.entry(texture.options()).or_insert_with(|| device.create_sampler(&egui_sampler_descriptor(texture.options())));
+        let view = gpu.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("egui_filter_layers offline user texture"),
+            layout: self.chain.user_layout(),
+            entries: &[wgpu::BindGroupEntry { binding: USER_TEXTURE_BINDING, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: USER_SAMPLER_BINDING, resource: wgpu::BindingResource::Sampler(sampler) }],
+        });
+        UploadedTexture { source: texture, bind_group }
+    }
+
     /// Makes `targets` match the plan's allocation exactly (a different size recreates them, so
     /// every run samples textures of exactly the planned size).
     fn ensure_targets(&mut self, plan: &TilePlan) {
@@ -407,6 +516,7 @@ impl OfflineRenderer {
             return Err(OfflineError::Gpu("offline targets are missing (crate bug)".to_owned()));
         };
         let (device, queue, resources, composite) = (&self.device, &self.queue, &self.chain, &self.composite);
+        let user_textures = self.user_textures.each_ref().map(|uploaded| uploaded.as_ref().map(|uploaded| &uploaded.bind_group));
 
         let scopes = ErrorScopes::push(device);
         let recorded = 'record: {
@@ -426,6 +536,7 @@ impl OfflineRenderer {
                 input: run.input,
                 passes: chain.passes(),
                 pipelines,
+                user_textures,
             };
             let bind_group = resources.record(&mut ChainRecording { device, queue, encoder: &mut encoder }, &mut targets.chain, &job);
             let Some(bind_group) = bind_group else {

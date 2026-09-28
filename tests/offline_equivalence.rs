@@ -17,6 +17,10 @@
 //!   under 0.1% of the values).
 //! * Reduced-resolution chains (F6: `with_scale`, `kawase_blur`, `bloom`): bit for bit with the
 //!   UI when processed whole; a frame that would need tiles is refused (`NotTileable`).
+//! * User textures (F8): an effect sampling three textures (nearest, linear repeat, exact loads)
+//!   attached as egui textures in the UI and as `OfflineTexture::from_color_image` offline is bit
+//!   for bit the same, tiled or whole; textures are uploaded once per `OfflineTexture`; missing and
+//!   invalid slots are typed errors.
 //! * The GPU tests of this file run one at a time (`GPU_TESTS`, see there).
 //!
 //! Needs a GPU adapter, so the tests are ignored by default:
@@ -27,7 +31,7 @@
 use std::sync::Arc;
 
 use egui::{Color32, ColorImage, Pos2, Rect, TextureOptions, ViewportId, ViewportInfo, pos2, vec2};
-use egui_filter_layers::{AlphaMode, BackendStatus, Effect, FilterChain, FilterLayer, FrameRef, OfflineOptions, OfflineRenderer, Pass, WgpuOptions, install_wgpu, presets};
+use egui_filter_layers::{AlphaMode, BackendStatus, Effect, FilterChain, FilterLayer, FrameRef, OfflineOptions, OfflineRenderer, OfflineTexture, Pass, TEXTURE_SLOTS, WgpuOptions, install_wgpu, presets};
 
 const WIDTH: u32 = 192;
 const HEIGHT: u32 = 128;
@@ -203,6 +207,11 @@ impl Ui {
     /// The image (1:1, the whole screen) under a layer covering it, as egui-wgpu draws it;
     /// the second frame's pixels (the first uploads the textures).
     fn render(&self, chain: &FilterChain, radius: u8) -> Vec<u8> {
+        self.render_textured(chain, radius, [None; TEXTURE_SLOTS])
+    }
+
+    /// [`Ui::render`] with `textures` attached to the layer's user texture slots.
+    fn render_textured(&self, chain: &FilterChain, radius: u8, textures: [Option<egui::TextureId>; TEXTURE_SLOTS]) -> Vec<u8> {
         let points = vec2(px(WIDTH) / self.ppp, px(HEIGHT) / self.ppp);
         let rect = Rect::from_min_size(Pos2::ZERO, points);
         let mut pixels = Vec::new();
@@ -212,7 +221,11 @@ impl Ui {
             let mut output = self.ctx.run_ui(input, |ui| {
                 let painter = ui.painter();
                 painter.image(self.texture.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                FilterLayer::new(rect, chain.clone()).corner_radius(radius).paint(painter);
+                let layer = FilterLayer::new(rect, chain.clone()).corner_radius(radius);
+                textures.iter().enumerate().fold(layer, |layer, (slot, id)| match id {
+                    Some(id) => layer.texture(slot, *id),
+                    None => layer,
+                }).paint(painter);
             });
             assert!((output.pixels_per_point - self.ppp).abs() < f32::EPSILON, "ppp {}", output.pixels_per_point);
             let mut textures_delta = std::mem::take(&mut output.textures_delta);
@@ -665,4 +678,91 @@ fn scaled_chains_refuse_tiling_and_run_whole() {
     }
     // Refusal is about scaled passes only.
     assert!(offline.process(&frame, &presets::gaussian_blur(2.0), &OfflineOptions::default().with_max_tile_size(Some(128))).is_ok());
+}
+
+// ---- F8: user textures ----
+
+/// The user-texture effect: a nearest read (clamped) of slot 0, a linear read (repeating,
+/// between texel centres) of slot 1 and an exact load of slot 2, mixed with the backdrop.
+const TEXTURED_WGSL: &str = "fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let a = tex(0u, uv * 1.7);
+    let b = tex(1u, uv * 2.3 - vec2<f32>(0.4));
+    let c = tex_load(2u, vec2<i32>(floor(uv * tex_size(2u))));
+    return src(uv) * 0.25 + a * 0.25 + b * 0.25 + c * 0.25;
+}";
+
+/// The three textures of [`TEXTURED_WGSL`]: images of odd sizes (straight colours with alpha,
+/// premultiplied by `ColorImage`) and their options.
+fn texture_images() -> [(ColorImage, TextureOptions); TEXTURE_SLOTS] {
+    let image = |width: u32, height: u32, seed: u32| {
+        let pixels = test_image(width, height, |x, y| u8::try_from((x * 37 + y * 91 + seed) % 256).unwrap_or(255));
+        ColorImage::from_rgba_unmultiplied([usize::try_from(width).unwrap_or(0), usize::try_from(height).unwrap_or(0)], &pixels)
+    };
+    [(image(5, 3, 1), TextureOptions::NEAREST), (image(7, 4, 2), TextureOptions::LINEAR_REPEAT), (image(9, 6, 3), TextureOptions::LINEAR)]
+}
+
+/// F8: the same textures attached in the UI (egui textures) and offline (`OfflineTexture::
+/// from_color_image`, the bytes egui uploads) give the same pixels bit for bit, whole and tiled
+/// (user textures are sampled in their own uv, independent of windows).
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn user_textures_offline_equal_the_ui() {
+    let image = test_image(WIDTH, HEIGHT, |_, _| 255);
+    let ui = Ui::new(wgpu::TextureFormat::Rgba8Unorm, false, 1.0, &image);
+    let chain = FilterChain::from(Pass::new(&Effect::new("textured", TEXTURED_WGSL).unwrap_or_else(|error| panic!("{error}"))));
+    let images = texture_images();
+    let handles: Vec<egui::TextureHandle> = images.iter().enumerate().map(|(slot, (image, options))| ui.ctx.load_texture(format!("slot {slot}"), image.clone(), *options)).collect();
+    let ids = [Some(handles[0].id()), Some(handles[1].id()), Some(handles[2].id())];
+    let expected = ui.render_textured(&chain, 0, ids);
+
+    let mut offline = OfflineRenderer::from_render_state(&ui.state).unwrap_or_else(|error| panic!("{error}"));
+    let mut options = OfflineOptions::default().with_time(TIME).with_output_alpha(AlphaMode::Premultiplied);
+    for (slot, (image, texture_options)) in images.iter().enumerate() {
+        options = options.with_texture(slot, OfflineTexture::from_color_image(image, *texture_options).unwrap_or_else(|error| panic!("{error}")));
+    }
+    let frame = FrameRef::new(&image, WIDTH, HEIGHT, AlphaMode::Straight);
+    let whole = offline.process(&frame, &chain, &options).unwrap_or_else(|error| panic!("{error}"));
+    let (count, max, first) = compare(&expected, whole.pixels(), WIDTH, true);
+    eprintln!("textured, whole: {count} differing channel values, max diff {max}, first at {first:?}");
+    assert_eq!(max, 0, "offline must equal the UI ({count} values, first at {first:?})");
+    let tiled = offline.process(&frame, &chain, &options.clone().with_max_tile_size(Some(64))).unwrap_or_else(|error| panic!("{error}"));
+    let (count, max, first) = compare(whole.pixels(), tiled.pixels(), WIDTH, false);
+    assert_eq!(max, 0, "tiles must equal the whole frame ({count} values, first at {first:?})");
+    // The texture actually contributes: without it (other contents at slot 0) the result changes.
+    let other = OfflineTexture::from_color_image(&ColorImage::new([1, 1], vec![Color32::WHITE]), TextureOptions::NEAREST).unwrap_or_else(|error| panic!("{error}"));
+    let changed = offline.process(&frame, &chain, &options.clone().with_texture(0, other)).unwrap_or_else(|error| panic!("{error}"));
+    assert_ne!(changed.pixels(), whole.pixels(), "a different texture at slot 0 must change the result");
+    let again = offline.process(&frame, &chain, &options).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(again.pixels(), whole.pixels(), "re-attaching the first texture restores the first result");
+}
+
+/// F8 offline errors: an effect reading a slot with nothing attached, and an attachment at a
+/// slot that does not exist, are typed errors before any GPU work; a texture larger than the
+/// device allows is refused with its size.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn missing_and_invalid_textures_are_typed_errors() {
+    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
+    let image = test_image(16, 8, |_, _| 255);
+    let frame = FrameRef::new(&image, 16, 8, AlphaMode::Straight);
+    let chain = FilterChain::from(Pass::new(&Effect::new("textured", TEXTURED_WGSL).unwrap_or_else(|error| panic!("{error}"))));
+    let texture = OfflineTexture::from_color_image(&ColorImage::new([1, 1], vec![Color32::WHITE]), TextureOptions::NEAREST).unwrap_or_else(|error| panic!("{error}"));
+    let two = OfflineOptions::default().with_texture(0, texture.clone()).with_texture(1, texture.clone());
+    match offline.process(&frame, &chain, &two) {
+        Err(egui_filter_layers::OfflineError::Texture(egui_filter_layers::TextureError::NotAttached { slot: 2, pass: 0, .. })) => {}
+        other => panic!("slot 2 is read but empty: {:?}", other.map(|frame| frame.width())),
+    }
+    match offline.process(&frame, &chain, &two.clone().with_texture(3, texture.clone())) {
+        Err(egui_filter_layers::OfflineError::Texture(egui_filter_layers::TextureError::InvalidSlot { slot: 3 })) => {}
+        other => panic!("slot 3 does not exist: {:?}", other.map(|frame| frame.width())),
+    }
+    assert!(offline.process(&frame, &chain, &two.clone().with_texture(2, texture)).is_ok());
+    let side = device.limits().max_texture_dimension_2d + 1;
+    let wide = vec![255_u8; usize::try_from(side).unwrap_or(0) * 4];
+    let too_large = OfflineTexture::new(&FrameRef::new(&wide, side, 1, AlphaMode::Straight), TextureOptions::NEAREST).unwrap_or_else(|error| panic!("{error}"));
+    match offline.process(&frame, &chain, &two.with_texture(2, too_large)) {
+        Err(egui_filter_layers::OfflineError::TextureTooLarge { slot: 2, width, .. }) => assert_eq!(width, side),
+        other => panic!("a texture beyond the device limit: {:?}", other.map(|frame| frame.width())),
+    }
 }

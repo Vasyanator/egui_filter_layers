@@ -20,24 +20,29 @@ handled in the prelude's `src()` (`internal_flip_y`). Uniform-block and sampler 
 from naga's `ReflectionInfo`, never guessed: the `fl` block (binding 0) and, for effects with
 `struct Params`, the named-parameter block (binding 4) are found by their `@binding`.
 Texture units (`texture_unit`): GLSL combines texture and sampler, so a unit is chosen per
-`(texture binding, sampler binding)` pair of the prelude's `@group(0)` layout — the texture's
-position in `GROUP0_TEXTURE_BINDINGS` through the linear sampler (or with no sampler), that plus
-`NEAREST_UNIT_BASE` through `fl_nearest_sampler`. Units 4..=6 stay free for user textures. At most
-unit 10 is used: GLES 3.0 / WebGL2 guarantee 16 fragment texture units. naga's writer rejects one
-texture read through two samplers in one module ("A image was used with multiple samplers").
+`(texture, sampler)` pair of the prelude's layout — a `@group(0)` texture's position in
+`GROUP0_TEXTURE_BINDINGS` (through the linear `fl_sampler` or with no sampler, `textureLoad`), and
+user texture slot `i` (`@group(1 + i)`, through its own sampler or none) on unit
+`USER_UNIT_BASE + i` (4..=6). At most unit 6 is used: GLES 3.0 / WebGL2 guarantee 16 fragment
+texture units. naga's writer rejects one texture read through two samplers in one module ("A image
+was used with multiple samplers"), so the prelude reads every texture through one sampler and
+exact reads through `textureLoad`, which naga combines with that same sampler.
 */
 
 use naga::back::glsl;
 
-use crate::effect::{BINDING_COVERAGE_TEXTURE, BINDING_NEAREST_SAMPLER, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, CompiledModule, FRAGMENT_ENTRY, VERTEX_ENTRY};
+use crate::effect::{
+    BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, CompiledModule, FRAGMENT_ENTRY, TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING, USER_TEXTURE_GROUP_BASE,
+    VERTEX_ENTRY,
+};
 
-/// The prelude's `@group(0)` texture bindings; a texture's index here is its texture unit when
-/// read through the linear sampler (`render.rs` binds units in this same order).
+/// The prelude's `@group(0)` texture bindings; a texture's index here is its texture unit
+/// (`render.rs` binds units in this same order).
 pub(super) const GROUP0_TEXTURE_BINDINGS: [u32; 4] = [BINDING_SOURCE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_STATE_TEXTURE, BINDING_COVERAGE_TEXTURE];
 
-/// First texture unit of the nearest-sampler combinations: unit `NEAREST_UNIT_BASE + i` holds
-/// `GROUP0_TEXTURE_BINDINGS[i]` with the backend's nearest GL sampler object bound.
-pub(super) const NEAREST_UNIT_BASE: u32 = 7;
+/// Texture unit of user texture slot 0; slot `i` is unit `USER_UNIT_BASE + i` (read through the
+/// texture object's own sampling parameters: no sampler object is bound there).
+pub(super) const USER_UNIT_BASE: u32 = 4;
 
 /// Which GLSL dialect to emit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,14 +117,21 @@ pub(crate) struct TranslateError {
     pub message: String,
 }
 
-/// Texture unit of a combined sampler reading texture `texture` through sampler `sampler` (both
-/// `@binding`s; `None` = no sampler, e.g. `textureLoad`), or `None` for an unknown pair.
-fn texture_unit(texture: u32, sampler: Option<u32>) -> Option<u32> {
-    let index = u32::try_from(GROUP0_TEXTURE_BINDINGS.iter().position(|&binding| binding == texture)?).ok()?;
-    match sampler {
-        None | Some(BINDING_SAMPLER) => Some(index),
-        Some(BINDING_NEAREST_SAMPLER) => Some(NEAREST_UNIT_BASE + index),
-        Some(_) => None,
+/// Texture unit of a combined sampler reading the texture at `texture` through the sampler at
+/// `sampler` (both `(@group, @binding)`; `None` = no sampler, e.g. `textureLoad`), or `None` for a
+/// pair the layout does not have (a texture read through another texture's sampler).
+fn texture_unit(texture: (u32, u32), sampler: Option<(u32, u32)>) -> Option<u32> {
+    match texture {
+        (0, binding) => {
+            let index = u32::try_from(GROUP0_TEXTURE_BINDINGS.iter().position(|&candidate| candidate == binding)?).ok()?;
+            matches!(sampler, None | Some((0, BINDING_SAMPLER))).then_some(index)
+        }
+        (group, USER_TEXTURE_BINDING) => {
+            let slot = group.checked_sub(USER_TEXTURE_GROUP_BASE).filter(|&slot| usize::try_from(slot).is_ok_and(|slot| slot < TEXTURE_SLOTS))?;
+            // A user texture is read only through the sampler of its own group.
+            (sampler.is_none() || sampler == Some((group, USER_SAMPLER_BINDING))).then_some(USER_UNIT_BASE + slot)
+        }
+        _ => None,
     }
 }
 
@@ -144,9 +156,9 @@ pub(crate) fn translate(compiled: &CompiledModule, target: GlslTarget) -> Result
     let (vertex, _) = write_stage(compiled, target, naga::ShaderStage::Vertex, VERTEX_ENTRY)?;
     let (fragment, reflection) = write_stage(compiled, target, naga::ShaderStage::Fragment, FRAGMENT_ENTRY)?;
 
-    let binding_of = |handle: naga::Handle<naga::GlobalVariable>| compiled.module.global_variables[handle].binding.as_ref().map(|b| b.binding);
+    let binding_of = |handle: naga::Handle<naga::GlobalVariable>| compiled.module.global_variables[handle].binding.as_ref().map(|b| (b.group, b.binding));
 
-    let block_at = |binding: u32| reflection.uniforms.iter().find(|(handle, _)| binding_of(**handle) == Some(binding)).map(|(_, name)| name.clone());
+    let block_at = |binding: u32| reflection.uniforms.iter().find(|(handle, _)| binding_of(**handle) == Some((0, binding))).map(|(_, name)| name.clone());
     let uniform_block = block_at(BINDING_UNIFORMS);
     let params_block = block_at(BINDING_PARAMS);
 
@@ -245,35 +257,49 @@ mod tests {
     }
 
     #[test]
-    fn texture_units_follow_the_group0_layout() {
-        assert_eq!(texture_unit(BINDING_SOURCE_TEXTURE, Some(BINDING_SAMPLER)), Some(0));
-        assert_eq!(texture_unit(BINDING_ORIGINAL_TEXTURE, Some(BINDING_SAMPLER)), Some(1));
-        assert_eq!(texture_unit(BINDING_STATE_TEXTURE, None), Some(2));
-        assert_eq!(texture_unit(BINDING_COVERAGE_TEXTURE, Some(BINDING_SAMPLER)), Some(3));
-        assert_eq!(texture_unit(BINDING_SOURCE_TEXTURE, Some(BINDING_NEAREST_SAMPLER)), Some(7));
-        assert_eq!(texture_unit(BINDING_COVERAGE_TEXTURE, Some(BINDING_NEAREST_SAMPLER)), Some(10));
-        assert_eq!(texture_unit(BINDING_UNIFORMS, None), None);
-        assert_eq!(texture_unit(BINDING_SOURCE_TEXTURE, Some(BINDING_ORIGINAL_TEXTURE)), None);
+    fn texture_units_follow_the_prelude_layout() {
+        assert_eq!(texture_unit((0, BINDING_SOURCE_TEXTURE), Some((0, BINDING_SAMPLER))), Some(0));
+        assert_eq!(texture_unit((0, BINDING_ORIGINAL_TEXTURE), Some((0, BINDING_SAMPLER))), Some(1));
+        assert_eq!(texture_unit((0, BINDING_STATE_TEXTURE), None), Some(2));
+        assert_eq!(texture_unit((0, BINDING_COVERAGE_TEXTURE), Some((0, BINDING_SAMPLER))), Some(3));
+        assert_eq!(texture_unit((1, USER_TEXTURE_BINDING), Some((1, USER_SAMPLER_BINDING))), Some(USER_UNIT_BASE));
+        assert_eq!(texture_unit((3, USER_TEXTURE_BINDING), None), Some(USER_UNIT_BASE + 2));
+        assert_eq!(texture_unit((0, BINDING_UNIFORMS), None), None);
+        assert_eq!(texture_unit((0, BINDING_SOURCE_TEXTURE), Some((0, BINDING_ORIGINAL_TEXTURE))), None);
+        assert_eq!(texture_unit((0, BINDING_SOURCE_TEXTURE), Some((1, USER_SAMPLER_BINDING))), None, "a group-0 texture through a user sampler");
+        assert_eq!(texture_unit((2, USER_TEXTURE_BINDING), Some((1, USER_SAMPLER_BINDING))), None, "a user texture through another slot's sampler");
+        assert_eq!(texture_unit((4, USER_TEXTURE_BINDING), None), None, "only three slots");
     }
 
+    /// F8: the texture helpers translate for every dialect. Sampled (`tex`) and exact
+    /// (`tex_load`, `texelFetch`) reads of one texture share ONE combined sampler (naga's writer
+    /// allows a texture with a sampler plus sampler-less loads), so each slot is one unit.
     #[test]
-    fn a_nearest_read_gets_its_own_unit() {
-        let snippet = "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) + textureSampleLevel(fl_state_texture, fl_nearest_sampler, uv, 0.0); }";
-        let Ok(effect) = Effect::new("nearest", snippet) else { panic!("must validate") };
+    fn user_texture_helpers_translate_one_unit_per_slot() {
+        let snippet = "fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let exact = tex_load(0u, vec2<i32>(uv * tex_size(0u)));
+    return tex(0u, uv) + exact + tex(1u, uv) * tex_load(2u, vec2<i32>(1, 0)) + src(uv);
+}";
+        let effect = Effect::new("textures", snippet);
+        let Ok(effect) = effect else { panic!("{effect:?}") };
         for target in TARGETS {
             match translate(effect.module(), target) {
-                Ok(program) => check_program("nearest", &program, target, &[0, NEAREST_UNIT_BASE + 2]),
-                Err(error) => panic!("nearest {target:?}: {error}"),
+                Ok(program) => {
+                    check_program("textures", &program, target, &[0, USER_UNIT_BASE, USER_UNIT_BASE + 1, USER_UNIT_BASE + 2]);
+                    assert!(program.fragment.contains("texelFetch") && program.fragment.contains("textureLod") && program.fragment.contains("textureSize"), "{target:?}\n{}", program.fragment);
+                }
+                Err(error) => panic!("textures {target:?}: {error}"),
             }
         }
     }
 
     /// naga's GLSL back end refuses one texture read through two samplers in one program
-    /// ("A image was used with multiple samplers"), so on glow a texture is read EITHER linearly
-    /// or nearest within one module; pinned so a naga change is noticed.
+    /// ("A image was used with multiple samplers"): the reason the prelude gives every texture
+    /// exactly one sampler; pinned so a naga change is noticed. Also the trigger of the glow
+    /// per-effect failure scene (`tests/glow_headless.rs`): valid WGSL that glow cannot translate.
     #[test]
     fn one_texture_through_two_samplers_does_not_translate() {
-        let snippet = "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) + textureSampleLevel(fl_src_texture, fl_nearest_sampler, uv, 0.0); }";
+        let snippet = "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) + textureSampleLevel(fl_src_texture, fl_user0_sampler, uv, 0.0); }";
         let Ok(effect) = Effect::new("mixed", snippet) else { panic!("must validate") };
         assert!(translate(effect.module(), GlslTarget::Desktop330).is_err_and(|error| error.message.contains("multiple samplers")));
     }

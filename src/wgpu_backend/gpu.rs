@@ -2,10 +2,12 @@
 File: wgpu_backend/gpu.rs
 
 Purpose:
-Plain wgpu helpers with no egui involvement: grow-only textures and buffers, bind group layout
-entries, shader / full-viewport pipeline creation, single-attachment render passes, format
-capability checks, and error scopes. Shared by the chain executor (`chain.rs`) and the
-UI callback's own objects (`resources.rs`).
+Plain wgpu helpers with no egui state: grow-only textures and buffers, bind group layout
+entries (and the ONE descriptor of egui-wgpu's texture bind group layout, `egui_texture_entries`),
+the egui-wgpu sampler mapping of `egui::TextureOptions` (plain data), shader / full-viewport
+pipeline creation, single-attachment render passes, format capability checks, and error scopes.
+Shared by the chain executor (`chain.rs`), the UI callback's own objects (`resources.rs`,
+`textures.rs`) and the offline renderer.
 
 Key structures:
 - `Target`: grow-only 2D render target that is sampled afterwards (optionally with a second,
@@ -214,6 +216,38 @@ pub(crate) fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None }
 }
 
+/// The entries of egui-wgpu 0.36's texture bind-group layout (`renderer.rs`,
+/// `egui_texture_bind_group_layout`): a filterable 2D float texture at 0 and a filtering sampler
+/// at 1, fragment stage. Every layout that binds egui's per-texture bind groups (the mesh
+/// pipeline's group 1, the user texture groups 1..=3 of effects) is created from these, so
+/// egui's bind groups bind unchanged (wgpu-core deduplicates equal layouts; WebGPU
+/// group-equivalence).
+pub(crate) fn egui_texture_entries() -> [wgpu::BindGroupLayoutEntry; 2] {
+    [texture_entry(0), sampler_entry(1)]
+}
+
+/// Maps egui texture options to a sampler descriptor exactly as egui-wgpu 0.36 does
+/// (`renderer.rs`, `create_sampler`: mipmap mode ignored).
+pub(crate) fn egui_sampler_descriptor(options: egui::TextureOptions) -> wgpu::SamplerDescriptor<'static> {
+    let filter = |filter: egui::TextureFilter| match filter {
+        egui::TextureFilter::Nearest => wgpu::FilterMode::Nearest,
+        egui::TextureFilter::Linear => wgpu::FilterMode::Linear,
+    };
+    let address_mode = match options.wrap_mode {
+        egui::TextureWrapMode::ClampToEdge => wgpu::AddressMode::ClampToEdge,
+        egui::TextureWrapMode::Repeat => wgpu::AddressMode::Repeat,
+        egui::TextureWrapMode::MirroredRepeat => wgpu::AddressMode::MirrorRepeat,
+    };
+    wgpu::SamplerDescriptor {
+        label: Some("egui_filter_layers egui texture sampler"),
+        mag_filter: filter(options.magnification),
+        min_filter: filter(options.minification),
+        address_mode_u: address_mode,
+        address_mode_v: address_mode,
+        ..Default::default()
+    }
+}
+
 /// Creates a WGSL shader module.
 pub(crate) fn shader(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ShaderModule {
     device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)) })
@@ -270,6 +304,15 @@ pub(crate) fn begin_pass<'e>(encoder: &'e mut wgpu::CommandEncoder, view: &wgpu:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn samplers_mirror_egui_wgpu() {
+        let descriptor = egui_sampler_descriptor(egui::TextureOptions::NEAREST_REPEAT);
+        assert_eq!(descriptor.mag_filter, wgpu::FilterMode::Nearest);
+        assert_eq!(descriptor.address_mode_u, wgpu::AddressMode::Repeat);
+        assert_eq!(egui_sampler_descriptor(egui::TextureOptions::LINEAR).min_filter, wgpu::FilterMode::Linear);
+        assert_eq!(egui_sampler_descriptor(egui::TextureOptions::LINEAR_MIRRORED_REPEAT).address_mode_v, wgpu::AddressMode::MirrorRepeat);
+    }
 
     /// A refused allocation is reported by `ErrorScopes` instead of reaching wgpu's default
     /// uncaptured-error handler (which panics), and the scopes leave the stack balanced.

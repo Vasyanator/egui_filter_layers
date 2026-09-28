@@ -15,7 +15,7 @@ Key structures:
 - `Content`: what a slot holds at one point of the run (the whole capture at some resolution, or
   a window of it at the texture origin).
 - `Bindings`: the slots one draw binds at `fl_src_texture` / `fl_original_texture` (`None` = the
-  backend's neutral dummy).
+  backend's neutral dummy), and which user texture slots get the layer's texture (else a dummy).
 - `PassStep`, `CompositeStep`, `ChainPlan`: the draws of one run, in order, and the pool size.
 - `Allocations`: the allocated size of every slot's texture (backends report them).
 - `TextureMapping`: capture uv -> storage uv of one texture content (`clamp(uv) * scale -
@@ -23,6 +23,8 @@ Key structures:
 
 Key functions:
 - `plan()`: the draws of a run over a window of the capture.
+- `check_textures()`: every user texture slot an effect of the chain reads has a texture
+  attached (the one check the UI layer and the offline renderer run before drawing).
 - `scaled_px()`: the output size of a scaled pass (`ceil(side * scale)`, at least 1).
 - `TextureMapping::of()`: the ONE formula for a texture's storage-uv mapping.
 - `step_uniforms()` / `composite_uniforms()`: the full `FlUniforms` block of one draw.
@@ -35,7 +37,10 @@ Pass `i` reads the capture (i = 0) or pass `i - 1`'s output and writes `Ping` (e
 binds the capture as the original (`original(uv)`, prelude), mapped with the capture's own
 storage mapping (`internal_aux_*`), which may differ from the ping-pong `src` mapping (grow-only
 targets of other sizes). Every other texture binding of the layout (state, coverage) is the
-backend's dummy. Backend-specific uniform flags (`flip_y`, fragment mode) stay in the
+backend's dummy. User textures (F8): every pass step binds the layer's attached texture of each
+slot (wgpu `@group(1 + i)`, glow unit `4 + i`) and the backend's dummy where none is attached;
+the composite binds dummies (its module reads none). Their uv is the texture's own, so they need
+no mapping and are independent of windows and scales. Backend-specific uniform flags (`flip_y`, fragment mode) stay in the
 `FrameUniforms` each backend passes in.
 Scale (F6): a pass with `scale < 1` renders `scaled_px(capture, scale)` pixels holding the WHOLE
 capture at that resolution (at the texture origin); readers map it with `TextureMapping::of(
@@ -46,6 +51,8 @@ at most the capture, so the two ping-pong targets sized `ChainPlan::target_px` (
 every step.
 */
 
+use crate::backend::TextureError;
+use crate::effect::TEXTURE_SLOTS;
 use crate::geometry::{LayerGeometry, PxRect, px_f32};
 use crate::pass::{FrameUniforms, Params, Pass, UNIFORM_BLOCK_SIZE, pack_uniforms};
 
@@ -69,6 +76,9 @@ pub(crate) struct Bindings {
     /// draw. `None` = a transparent dummy (its `internal_aux_*` mapping then keeps the frame's
     /// identity value); no current plan produces it.
     pub original: Option<Slot>,
+    /// Per user texture slot: `true` = bind the texture the layer attached there, `false` = the
+    /// backend's dummy (nothing attached, or the composite).
+    pub user: [bool; TEXTURE_SLOTS],
 }
 
 /// What a slot's texture holds at one point of a run: the whole capture rendered at
@@ -191,13 +201,15 @@ pub(crate) fn scaled_px(side: u32, scale: f32) -> u32 {
 
 /// Plans a run of `passes` over `window` (capture pixels; the whole capture when not tiled) of
 /// a capture of `capture` pixels, whose composite puts capture pixel `(0, 0)` at
-/// `composite_origin` of its render target (target pixels, top-left origin).
+/// `composite_origin` of its render target (target pixels, top-left origin). `attached[i]`: the
+/// layer attached a user texture at slot `i` (every pass step binds it; see
+/// [`check_textures`] for the slots the effects need).
 ///
 /// Returns `None` when there is nothing to draw (no passes, an empty / negative window) or the
 /// run cannot be planned: a chain with a scaled pass ([`Pass::is_scaled`]) over anything but the
 /// whole capture (callers that tile refuse such chains first, `OfflineError::NotTileable`).
 #[must_use]
-pub(crate) fn plan(passes: &[Pass], capture: [i32; 2], window: PxRect, composite_origin: [i32; 2]) -> Option<ChainPlan> {
+pub(crate) fn plan(passes: &[Pass], capture: [i32; 2], window: PxRect, composite_origin: [i32; 2], attached: [bool; TEXTURE_SLOTS]) -> Option<ChainPlan> {
     if passes.is_empty() || window.w <= 0 || window.h <= 0 || window.x < 0 || window.y < 0 {
         return None;
     }
@@ -223,7 +235,7 @@ pub(crate) fn plan(passes: &[Pass], capture: [i32; 2], window: PxRect, composite
         steps.push(PassStep {
             pass: index,
             // Every pass may read the untouched capture through `original()` (F1).
-            bindings: Bindings { src: if index == 0 { Slot::Source } else { output_of(index - 1) }, original: Some(Slot::Source) },
+            bindings: Bindings { src: if index == 0 { Slot::Source } else { output_of(index - 1) }, original: Some(Slot::Source), user: attached },
             input,
             output: output_of(index),
             written,
@@ -234,12 +246,27 @@ pub(crate) fn plan(passes: &[Pass], capture: [i32; 2], window: PxRect, composite
         input = written;
     }
     let composite = CompositeStep {
-        bindings: Bindings { src: output_of(passes.len() - 1), original: Some(Slot::Source) },
+        // The composite module reads no user texture: dummies.
+        bindings: Bindings { src: output_of(passes.len() - 1), original: Some(Slot::Source), user: [false; TEXTURE_SLOTS] },
         input,
         frag_offset: [-px_f32(composite_origin[0]), -px_f32(composite_origin[1])],
     };
     let target_px = window.size().map(|side| u32::try_from(side).unwrap_or(0));
     Some(ChainPlan { steps, composite, source, target_px })
+}
+
+/// Checks that every user texture slot an effect of `passes` may read
+/// (`Effect::reads_texture`) has a texture attached (`attached[i]`).
+///
+/// # Errors
+/// [`TextureError::NotAttached`] naming the first pass (in chain order) and slot that lacks one.
+pub(crate) fn check_textures(passes: &[Pass], attached: [bool; TEXTURE_SLOTS]) -> Result<(), TextureError> {
+    for (pass_index, pass) in passes.iter().enumerate() {
+        if let Some(slot) = (0..TEXTURE_SLOTS).find(|&slot| pass.effect().reads_texture(slot) && !attached[slot]) {
+            return Err(TextureError::NotAttached { effect: pass.effect().label().to_owned(), pass: pass_index, slot });
+        }
+    }
+    Ok(())
 }
 
 /// How capture uv maps into one texture's storage uv: `clamp(uv) * scale - offset` (the
@@ -366,6 +393,9 @@ mod tests {
     use crate::effect::Effect;
     use crate::pass::offsets;
 
+    /// No user texture attached.
+    const NO_TEXTURES: [bool; TEXTURE_SLOTS] = [false; TEXTURE_SLOTS];
+
     /// Whether the two `f32`s at `offset` equal `expected` (all test values are exact in f32).
     fn holds(bytes: &[u8], offset: usize, expected: [f32; 2]) -> bool {
         let read = |at: usize| f32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
@@ -392,13 +422,13 @@ mod tests {
     #[test]
     fn steps_follow_the_ping_pong_order() {
         let window = PxRect { x: 16, y: 32, w: 100, h: 50 };
-        let Some(plan) = plan(&passes(3), [200, 100], window, [4, 8]) else { panic!("three passes over a non-empty window") };
+        let Some(plan) = plan(&passes(3), [200, 100], window, [4, 8], NO_TEXTURES) else { panic!("three passes over a non-empty window") };
         let reads: Vec<Slot> = plan.steps.iter().map(|step| step.bindings.src).collect();
         let writes: Vec<Slot> = plan.steps.iter().map(|step| step.output).collect();
         assert_eq!(reads, [Slot::Source, Slot::Ping, Slot::Pong]);
         assert_eq!(writes, [Slot::Ping, Slot::Pong, Slot::Ping]);
         assert!(plan.steps.iter().enumerate().all(|(index, step)| step.pass == index && step.used_px == [100, 50]));
-        assert_eq!(plan.composite.bindings, Bindings { src: Slot::Ping, original: Some(Slot::Source) });
+        assert_eq!(plan.composite.bindings, Bindings { src: Slot::Ping, original: Some(Slot::Source), user: NO_TEXTURES });
         assert_eq!(plan.composite.frag_offset.map(f32::to_bits), [-4.0_f32, -8.0].map(f32::to_bits));
         assert_eq!(plan.steps[0].frag_offset.map(f32::to_bits), [16.0_f32, 32.0].map(f32::to_bits));
         assert_eq!(plan.target_px, [100, 50], "the pool holds the window");
@@ -406,11 +436,11 @@ mod tests {
         assert_eq!(plan.source, window_content);
         assert!(plan.steps.iter().all(|step| step.input == window_content && step.written == window_content && (step.scale - 1.0).abs() < f32::EPSILON));
 
-        let Some(single) = super::plan(&passes(1), [200, 100], window, [0, 0]) else { panic!("one pass") };
+        let Some(single) = super::plan(&passes(1), [200, 100], window, [0, 0], NO_TEXTURES) else { panic!("one pass") };
         assert_eq!(single.composite.bindings.src, Slot::Ping);
-        assert!(super::plan(&[], [200, 100], window, [0, 0]).is_none(), "no passes, nothing to draw");
-        assert!(super::plan(&passes(1), [200, 100], PxRect { x: 0, y: 0, w: 0, h: 5 }, [0, 0]).is_none(), "empty window");
-        assert!(super::plan(&passes(1), [200, 100], PxRect { x: -1, y: 0, w: 5, h: 5 }, [0, 0]).is_none(), "negative origin");
+        assert!(super::plan(&[], [200, 100], window, [0, 0], NO_TEXTURES).is_none(), "no passes, nothing to draw");
+        assert!(super::plan(&passes(1), [200, 100], PxRect { x: 0, y: 0, w: 0, h: 5 }, [0, 0], NO_TEXTURES).is_none(), "empty window");
+        assert!(super::plan(&passes(1), [200, 100], PxRect { x: -1, y: 0, w: 5, h: 5 }, [0, 0], NO_TEXTURES).is_none(), "negative origin");
     }
 
     #[test]
@@ -419,7 +449,7 @@ mod tests {
         let passes: Vec<Pass> = (0..3).map(|index| Pass::new(&effect).with_param(0, [f32::from(u8::try_from(index).unwrap_or(0)); 4]).unwrap_or_else(|error| panic!("{error}"))).collect();
         // Capture 64x32; window (16, 8) 16x16; textures: source 32x32, ping 64x16, pong 32x64.
         let allocations = Allocations { source: [32, 32], ping_pong: [[64, 16], [32, 64]] };
-        let Some(plan) = plan(&passes, [64, 32], PxRect { x: 16, y: 8, w: 16, h: 16 }, [4, 8]) else { panic!("planned") };
+        let Some(plan) = plan(&passes, [64, 32], PxRect { x: 16, y: 8, w: 16, h: 16 }, [4, 8], NO_TEXTURES) else { panic!("planned") };
         let frame = FrameUniforms { aux_scale: [3.0, 3.0], texel: [0.25, 0.5], ..FrameUniforms::default() };
         let blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = plan.steps.iter().map(|step| step_uniforms(&frame, &plan, step, &allocations, &passes[step.pass])).collect();
         // Pass 0 reads the source, pass 1 ping, pass 2 pong: capture / allocated, origin / allocated.
@@ -430,7 +460,7 @@ mod tests {
         assert!(blocks.iter().all(|block| holds(block, offsets::AUX_SCALE, [2.0, 1.0]) && holds(block, offsets::AUX_OFFSET, [0.5, 0.25])));
         // Full resolution: both texels are the frame's, the pass scale 1.
         assert!(blocks.iter().all(|block| holds(block, offsets::SRC_TEXEL, [0.25, 0.5]) && holds(block, offsets::FRAG_TEXEL, [0.25, 0.5]) && (read(block, offsets::PASS_SCALE) - 1.0).abs() < f32::EPSILON));
-        let dummy_draw = Draw { bindings: Bindings { src: Slot::Ping, original: None }, input: plan.source, original: plan.source, frag_offset: [0.0; 2], written: None, scale: 1.0 };
+        let dummy_draw = Draw { bindings: Bindings { src: Slot::Ping, original: None, user: NO_TEXTURES }, input: plan.source, original: plan.source, frag_offset: [0.0; 2], written: None, scale: 1.0 };
         let dummy = draw_uniforms(&frame, &dummy_draw, &allocations, passes[0].params());
         assert!(holds(&dummy, offsets::AUX_SCALE, [3.0, 3.0]), "a dummy original keeps the frame's aux mapping");
         assert!(holds(&blocks[2], offsets::PARAMS, [2.0, 2.0]));
@@ -459,7 +489,7 @@ mod tests {
     fn every_step_binds_the_capture_as_its_original() {
         for pass_count in 1..=5 {
             for window in [PxRect { x: 0, y: 0, w: 64, h: 32 }, PxRect { x: 16, y: 8, w: 7, h: 9 }] {
-                let Some(plan) = plan(&passes(pass_count), [64, 32], window, [3, 5]) else { panic!("{pass_count} passes over a non-empty window") };
+                let Some(plan) = plan(&passes(pass_count), [64, 32], window, [3, 5], NO_TEXTURES) else { panic!("{pass_count} passes over a non-empty window") };
                 assert_eq!(plan.steps.len(), pass_count);
                 assert!(plan.steps.iter().all(|step| step.bindings.original == Some(Slot::Source)), "{pass_count} passes: every step maps the original");
                 assert_eq!(plan.composite.bindings.original, Some(Slot::Source));
@@ -493,7 +523,7 @@ mod tests {
         let chain: Vec<Pass> = scales.iter().map(|&scale| Pass::new(&effect).with_scale(scale)).collect();
         let capture = [101, 51];
         let whole = PxRect { x: 0, y: 0, w: 101, h: 51 };
-        let Some(plan) = plan(&chain, capture, whole, [7, 9]) else { panic!("a scaled chain over the whole capture") };
+        let Some(plan) = plan(&chain, capture, whole, [7, 9], NO_TEXTURES) else { panic!("a scaled chain over the whole capture") };
         let used: Vec<[i32; 2]> = plan.steps.iter().map(|step| step.used_px).collect();
         assert_eq!(used, [[51, 26], [26, 13], [51, 26], [101, 51]]);
         assert_eq!(plan.target_px, [101, 51]);
@@ -520,7 +550,7 @@ mod tests {
         assert!(blocks.iter().all(|block| holds(block, offsets::AUX_SCALE, [1.0, 1.0])));
 
         // Ending on a scaled pass: the composite upsamples it (maps the small image, full texel).
-        let Some(ending) = super::plan(&chain[..2], capture, whole, [0, 0]) else { panic!("planned") };
+        let Some(ending) = super::plan(&chain[..2], capture, whole, [0, 0], NO_TEXTURES) else { panic!("planned") };
         assert_eq!(ending.composite.input, ending.steps[1].written);
         assert_eq!(ending.target_px, [101, 51], "the pool is the window, also without a full-resolution step");
         assert!(ending.steps.iter().all(|step| step.used_px[0] <= 101 && step.used_px[1] <= 51));
@@ -531,10 +561,10 @@ mod tests {
         assert!(holds(&composite, offsets::FRAG_TEXEL, frame.texel) && (read(&composite, offsets::PASS_SCALE) - 1.0).abs() < f32::EPSILON);
 
         // A scaled chain over a window of the capture cannot be planned (tiling refuses it).
-        assert!(super::plan(&chain, capture, PxRect { x: 0, y: 0, w: 50, h: 51 }, [0, 0]).is_none());
-        assert!(super::plan(&chain, capture, PxRect { x: 1, y: 0, w: 100, h: 51 }, [0, 0]).is_none());
+        assert!(super::plan(&chain, capture, PxRect { x: 0, y: 0, w: 50, h: 51 }, [0, 0], NO_TEXTURES).is_none());
+        assert!(super::plan(&chain, capture, PxRect { x: 1, y: 0, w: 100, h: 51 }, [0, 0], NO_TEXTURES).is_none());
         // Unscaled chains keep planning windows.
-        assert!(super::plan(&passes(2), capture, PxRect { x: 1, y: 0, w: 100, h: 51 }, [0, 0]).is_some());
+        assert!(super::plan(&passes(2), capture, PxRect { x: 1, y: 0, w: 100, h: 51 }, [0, 0], NO_TEXTURES).is_some());
     }
 
     /// F4: a step binds its pass's named block (layout-sized), a module without `struct Params`
@@ -550,6 +580,23 @@ mod tests {
         assert_eq!(block.len(), 32, "span 20 padded to 32");
         assert!(holds(block, 16, [2.0, 0.0]));
         assert_eq!(composite_params_block(), &EMPTY_PARAMS_BLOCK);
+    }
+
+    /// F8: every pass step binds the attached user textures, the composite dummies; a chain whose
+    /// effect reads a slot with nothing attached is refused, naming the pass and the slot.
+    #[test]
+    fn user_textures_bind_where_attached_and_are_required_where_read() {
+        let reads_one = Effect::new("one", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * tex(1u, uv); }");
+        let Ok(reads_one) = reads_one else { panic!("{reads_one:?}") };
+        let chain = vec![Pass::new(&identity()), Pass::new(&reads_one)];
+        let window = PxRect { x: 0, y: 0, w: 8, h: 8 };
+        let attached = [false, true, false];
+        let Some(plan) = plan(&chain, [8, 8], window, [0, 0], attached) else { panic!("planned") };
+        assert!(plan.steps.iter().all(|step| step.bindings.user == attached));
+        assert_eq!(plan.composite.bindings.user, NO_TEXTURES);
+        assert_eq!(check_textures(&chain, attached), Ok(()));
+        assert_eq!(check_textures(&chain, [true, false, true]), Err(TextureError::NotAttached { effect: "one".to_owned(), pass: 1, slot: 1 }));
+        assert_eq!(check_textures(&passes(2), NO_TEXTURES), Ok(()), "effects reading no texture need none");
     }
 
     #[test]

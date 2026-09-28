@@ -15,18 +15,22 @@ Effect::new(label, snippet)
        params::ParamLayout::from_module         member types / strides / 16 KiB cap -> Interface
        naga Validator                           -> EffectError::Validation (located)
        interface::check_interface               bindings / entry points / `override`
-  -> CompiledModule { id, label, source, module, info, params: ParamLayout }
+       interface::texture_slots                 user texture slots the module may read
+  -> CompiledModule { id, label, source, module, info, params: ParamLayout, texture_slots }
 ```
 Detection runs BEFORE the parse because a snippet reading `p.x` does not parse without the
 appended `var<uniform> p: Params;`; naga's IR then confirms it (the struct is found by name).
 
 ## Files and submodules
-- `mod.rs`: `Effect`, `EffectError`, `CompiledModule`, binding constants, `compile()`, the
-  internal composite modules.
+- `mod.rs`: `Effect` (incl. `reads_texture`), `EffectError`, `CompiledModule`, binding constants
+  (`@group(0)` bindings, user texture groups, public `TEXTURE_SLOTS`), `compile()`, the internal
+  composite modules.
 - `diagnostics.rs`: `SnippetLocation`, `Assembled` (where prelude / snippet / tail lie; naga
   location -> snippet location + hint; `codespan-reporting` rendering against the snippet).
-- `interface.rs`: `PRELUDE_RESOURCES`, `check_interface` (only prelude bindings, plus the crate's
-  `p` at binding 4 when `struct Params` was detected), `reads_time` (animated detection).
+- `interface.rs`: `PRELUDE_RESOURCES` (`(name, group, binding)`: `@group(0)` and the user
+  texture groups 1..=3), `check_interface` (only prelude bindings, plus the crate's `p` at binding
+  4 when `struct Params` was detected), `reads_time` (animated detection), `texture_slots` (which
+  user texture slots a module reads).
 - `params.rs`: public `ParamType` / `ParamInfo` / `ParamValue` / `ParamError`; crate-internal
   `ParamLayout` (members + padded block size), the scan, element ranges, value (de)serialization.
 
@@ -45,6 +49,10 @@ appended `var<uniform> p: Params;`; naga's IR then confirms it (the struct is fo
 - Values are native-endian, like `pass::pack_uniforms`. No implicit type conversions.
 - Colour values are premultiplied gamma space (`From<Color32>`, matching `src()`); linear only via
   `ParamValue::linear_rgba`. `ParamValue` is `#[non_exhaustive]`.
+- `texture_slots` is conservative like `reads_time`: a helper call (`tex`, `tex_size`,
+  `tex_load`) with a constant slot counts that slot, any other slot expression counts every slot,
+  a direct `fl_user*` reference counts its slot. A false "reads" only makes a layer demand a
+  texture; a false "does not read" would let an effect sample a dummy.
 - Public API never panics on user input.
 
 ## Editing map

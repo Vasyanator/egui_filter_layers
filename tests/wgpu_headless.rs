@@ -13,7 +13,10 @@
 //! `original(uv)` after passes that changed the image must give the backdrop back in every pass.
 //! Reduced-resolution passes (F6): a scaled identity chain matches the unscaled one on a smooth
 //! backdrop; `kawase_blur` spreads a dot symmetrically and normalized; `bloom` glows around a
-//! bright spot only.
+//! bright spot only. User textures (F8): a 2x2 checker read exactly, through a nearest and a
+//! linear sampler, updated in full and in part between frames; three slots at once; unknown and
+//! freed ids reported (`failed_textures`) and a missing attachment refused, each skipping only its
+//! layer.
 //!
 //! Needs a GPU adapter (Vulkan, Metal, DX12 or GL), so it is ignored by default:
 //! `cargo test --all-features -- --ignored`.
@@ -104,7 +107,8 @@ fn render_frame(ctx: &egui::Context, state: &egui_wgpu::RenderState, targets: &T
         }
         renderer.update_buffers(device, queue, &mut encoder, &primitives, &screen)
     };
-    // Applied above (nothing is freed in this test); egui asserts deltas are handled.
+    // Frees are applied after the frame is rendered, as eframe does; egui asserts deltas are handled.
+    let freed = std::mem::take(&mut textures_delta.free);
     textures_delta.clear();
     {
         let renderer = state.renderer.read();
@@ -144,6 +148,10 @@ fn render_frame(ctx: &egui::Context, state: &egui_wgpu::RenderState, targets: &T
         Err(error) => panic!("readback not mapped: {error:?}"),
     };
     readback.unmap();
+    let mut renderer = state.renderer.write();
+    for id in &freed {
+        renderer.free_texture(id);
+    }
     (pixels, passes)
 }
 
@@ -827,4 +835,147 @@ fn bloom_brightens_around_a_bright_spot_only() {
     assert_near(&pixels, 60, 30, [40, 40, 40], "dark area beyond the reach");
     assert_near(&pixels, 200, 110, [40, 40, 40], "dark area beyond the reach");
     assert_near(&pixels, 10, 64, [40, 40, 40], "outside the layer");
+}
+
+// ---- F8: user textures (same scenes as `glow_headless.rs`) ----
+
+/// A 2x2 checker: red | green over blue | white (top row first).
+fn checker() -> ColorImage {
+    ColorImage::new([2, 2], vec![Color32::RED, Color32::GREEN, Color32::BLUE, Color32::WHITE])
+}
+
+/// Slot 0 through its own (egui `TextureOptions`) sampler.
+const TEX_SAMPLED: &str = "fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(0u, uv); }";
+/// Slot 0 texel by texel (`textureLoad`, no sampler).
+const TEX_EXACT: &str = "fn effect(uv: vec2<f32>) -> vec4<f32> { return tex_load(0u, vec2<i32>(floor(uv * tex_size(0u)))); }";
+/// Slot 1 through its own sampler.
+const TEX_SLOT1: &str = "fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(1u, uv); }";
+
+/// Red | blue halves split at x = 128.
+fn halves(painter: &egui::Painter) {
+    painter.rect_filled(Rect::from_min_max(pos2(0.0, 0.0), pos2(128.0, 128.0)), 0.0, Color32::RED);
+    painter.rect_filled(Rect::from_min_max(pos2(128.0, 0.0), pos2(256.0, 128.0)), 0.0, Color32::BLUE);
+}
+
+/// Checks a whole-frame layer showing the 2x2 checker texel by texel: each quadrant one texel,
+/// exactly, up to the pixels next to the centre lines.
+fn check_checker_quadrants(pixels: &[u8], what: &str) {
+    for (x, y, colour) in [(64, 32, [255, 0, 0]), (192, 32, [0, 255, 0]), (64, 96, [0, 0, 255]), (192, 96, [255, 255, 255]), (127, 63, [255, 0, 0]), (128, 63, [0, 255, 0]), (127, 64, [0, 0, 255]), (128, 64, [255, 255, 255])] {
+        assert_eq!(rgb(pixels, x, y), colour, "{what}: pixel ({x}, {y})");
+    }
+}
+
+/// Checks a whole-frame layer showing the 2x2 checker bilinearly: texel colour at a texel centre,
+/// the four-texel average at the centre, a quarter step between two texels.
+fn check_checker_linear(pixels: &[u8], what: &str) {
+    // uv (0.252, 0.254): the red texel's centre.
+    assert_near(pixels, 64, 32, [255, 0, 0], &format!("{what}: at the red texel's centre"));
+    // uv (0.502, 0.504): the average of all four texels.
+    assert_near(pixels, 128, 64, [128, 128, 129], &format!("{what}: between all four texels"));
+    // uv (0.377, 0.254): a quarter of the way from red to green.
+    assert_near(pixels, 96, 32, [189, 65, 2], &format!("{what}: a quarter from red to green"));
+}
+
+/// F8: a 2x2 checker attached twice, NEAREST at slot 0 and LINEAR at slot 1 (each texture's egui
+/// `TextureOptions` is its sampler: egui-wgpu's bind group is bound as the slot's group), read
+/// exactly (`tex_load`), through the nearest sampler (`tex`) and bilinearly; then replaced in
+/// full (egui-wgpu applies that after the pass: the crate's kept copy serves it) and patched in
+/// part between frames, which the next frame must show.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn user_textures_are_sampled_exactly_and_linearly() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let mut nearest = ctx.load_texture("checker nearest", checker(), TextureOptions::NEAREST);
+    let linear = ctx.load_texture("checker linear", checker(), TextureOptions::LINEAR);
+    let (nearest_id, linear_id) = (nearest.id(), linear.id());
+    let screen = Rect::from_min_max(pos2(0.0, 0.0), pos2(256.0, 128.0));
+    let frames = |snippet: &str, count: usize| {
+        let effect = pass_of("textured", snippet);
+        let mut paint = |ui: &mut egui::Ui| {
+            halves(ui.painter());
+            FilterLayer::new(screen, effect.clone()).texture(0, nearest_id).texture(1, linear_id).paint(ui.painter());
+        };
+        (1..count).for_each(|_| drop(render_frame(&ctx, &state, &target, &mut paint)));
+        render_frame(&ctx, &state, &target, &mut paint).0
+    };
+    // The first frame uploads the textures in full: the kept copies serve them.
+    check_checker_quadrants(&frames(TEX_EXACT, 1), "exact, first frame");
+    check_checker_quadrants(&frames(TEX_EXACT, 2), "exact");
+    check_checker_quadrants(&frames(TEX_SAMPLED, 2), "nearest sampler");
+    check_checker_linear(&frames(TEX_SLOT1, 2), "linear sampler");
+    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(egui_filter_layers::failed_textures(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_textures(&ctx));
+
+    nearest.set(ColorImage::new([2, 2], vec![Color32::YELLOW; 4]), TextureOptions::NEAREST);
+    let pixels = frames(TEX_EXACT, 1);
+    assert_eq!(rgb(&pixels, 192, 96), [255, 255, 0], "after a full update");
+    nearest.set_partial([1, 1], ColorImage::new([1, 1], vec![Color32::BLACK]), TextureOptions::NEAREST);
+    let pixels = frames(TEX_EXACT, 1);
+    assert_eq!((rgb(&pixels, 192, 96), rgb(&pixels, 64, 32)), ([0, 0, 0], [255, 255, 0]), "after a partial update");
+}
+
+/// F8: three slots at once (groups 1..=3), each its own texture and size: `(tex(0).r, tex(1).g,
+/// tex(2).b)` on the left half, `tex_size` of the three (2x2, 4x4, 3x1) times 32 on the right.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn three_texture_slots_at_once() {
+    let (ctx, state, green, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let checker = ctx.load_texture("checker", checker(), TextureOptions::NEAREST);
+    let blue = ctx.load_texture("blue 3x1", ColorImage::new([3, 1], vec![Color32::from_rgb(0, 0, 100); 3]), TextureOptions::LINEAR);
+    let ids = [checker.id(), green.id(), blue.id()];
+    let channels = pass_of("channels", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(tex(0u, vec2<f32>(0.25)).r, tex(1u, uv).g, tex(2u, uv).b, 1.0); }");
+    let sizes = pass_of("sizes", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(vec3<f32>(tex_size(0u).x, tex_size(1u).y, tex_size(2u).x) * 32.0 / 255.0, 1.0); }");
+    let mut paint = |ui: &mut egui::Ui| {
+        halves(ui.painter());
+        let attach = |layer: FilterLayer| ids.iter().enumerate().fold(layer, |layer, (slot, id)| layer.texture(slot, *id));
+        attach(FilterLayer::new(Rect::from_min_max(pos2(0.0, 0.0), pos2(128.0, 128.0)), channels.clone())).paint(ui.painter());
+        attach(FilterLayer::new(Rect::from_min_max(pos2(128.0, 0.0), pos2(256.0, 128.0)), sizes.clone())).paint(ui.painter());
+    };
+    render_frame(&ctx, &state, &target, &mut paint);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert_near(&pixels, 64, 64, [255, 255, 100], "one channel from each slot");
+    assert_near(&pixels, 192, 64, [64, 128, 96], "each slot's own size");
+}
+
+/// F8: a layer attaching an id egui-wgpu does not know draws nothing extra and the id is
+/// reported (`failed_textures`) without disabling the backend or any effect; a texture freed by
+/// egui is reported the same way once the free was applied; a layer whose effect reads a slot
+/// with nothing attached is refused before the backend (not a backend failure).
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn unknown_freed_and_missing_textures_skip_their_layer_only() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let unknown = egui::TextureId::User(424_242);
+    let temporary = ctx.load_texture("temporary", ColorImage::new([1, 1], vec![Color32::WHITE]), TextureOptions::NEAREST);
+    let freed = temporary.id();
+    let mut temporary = Some(temporary);
+    let sampled = pass_of("sampled", TEX_SAMPLED);
+    let mut paint = |ui: &mut egui::Ui| {
+        let painter = ui.painter();
+        halves(painter);
+        FilterLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(56.0, 120.0)), sampled.clone()).texture(0, unknown).paint(painter);
+        FilterLayer::new(Rect::from_min_max(pos2(72.0, 8.0), pos2(120.0, 120.0)), sampled.clone()).texture(0, freed).paint(painter);
+        // Nothing attached although the effect reads slot 0.
+        FilterLayer::new(Rect::from_min_max(pos2(136.0, 8.0), pos2(184.0, 120.0)), sampled.clone()).paint(painter);
+        FilterLayer::new(Rect::from_min_max(pos2(200.0, 8.0), pos2(248.0, 120.0)), presets::invert(1.0)).paint(painter);
+    };
+    render_frame(&ctx, &state, &target, &mut paint);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+    assert_near(&pixels, 96, 60, [255, 255, 255], "the live texture is drawn");
+    // Dropping the handle frees the texture with the next frame's delta (after its rendering).
+    temporary.take();
+    render_frame(&ctx, &state, &target, &mut paint);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+    assert_near(&pixels, 30, 60, [255, 0, 0], "unknown id: the backdrop stays");
+    assert_near(&pixels, 96, 60, [255, 0, 0], "freed id: the backdrop stays");
+    assert_near(&pixels, 160, 60, [0, 0, 255], "missing attachment: the backdrop stays");
+    assert_near(&pixels, 220, 60, [255, 255, 0], "a healthy layer still filters");
+    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(egui_filter_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&ctx));
+    let mut failed: Vec<egui::TextureId> = egui_filter_layers::failed_textures(&ctx).into_iter().map(|failure| failure.id).collect();
+    failed.sort_by_key(|id| format!("{id:?}"));
+    let mut expected = vec![unknown, freed];
+    expected.sort_by_key(|id| format!("{id:?}"));
+    assert_eq!(failed, expected);
 }

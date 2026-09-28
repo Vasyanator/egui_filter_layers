@@ -7,7 +7,7 @@ shows its effects.
 
 Key structures:
 - `OfflineOptions` (public): pixels per point, time, per-frame input (`delta_time`, `frame`,
-  pointer), background, corner radius, output alpha, tile size limit.
+  pointer), background, corner radius, output alpha, tile size limit, user textures (F8).
 - `PointerState` (public): pointer position in frame uv + pressed.
 
 Key functions:
@@ -22,7 +22,9 @@ its own frame times / index, and an explicit value wins.
 
 use egui::{Color32, CornerRadius, pos2};
 
-use super::{AlphaMode, DEFAULT_MAX_TILE_SIZE, OfflineError};
+use super::{AlphaMode, DEFAULT_MAX_TILE_SIZE, OfflineError, OfflineTexture};
+use crate::backend::TextureError;
+use crate::effect::TEXTURE_SLOTS;
 use crate::geometry::{LayerGeometry, pointer_uniform, px_f32};
 use crate::pass::InputUniforms;
 
@@ -47,6 +49,10 @@ pub struct OfflineOptions {
     frame: Option<u32>,
     /// `fl.pointer`; `None` = no pointer (`fl.pointer.w = 0`).
     pointer: Option<PointerState>,
+    /// The user texture attached at each slot (`tex(i, uv)`).
+    textures: [Option<OfflineTexture>; TEXTURE_SLOTS],
+    /// The first out-of-range slot given to `with_texture`, reported by `validate`.
+    invalid_texture_slot: Option<usize>,
 }
 
 /// The pointer an offline run shows its effects (`fl.pointer`), in the frame's uv: `0..1` across
@@ -72,6 +78,8 @@ impl Default for OfflineOptions {
             delta_time: None,
             frame: None,
             pointer: None,
+            textures: [const { None }; TEXTURE_SLOTS],
+            invalid_texture_slot: None,
         }
     }
 }
@@ -123,6 +131,34 @@ impl OfflineOptions {
     pub fn with_pointer(mut self, pointer: Option<PointerState>) -> Self {
         self.pointer = pointer;
         self
+    }
+
+    /// Attaches `texture` at user texture `slot` (`0..TEXTURE_SLOTS`), which effects read with
+    /// `tex(slot, uv)`, `tex_size(slot)` and `tex_load(slot, px)` — the offline counterpart of
+    /// [`FilterLayer::texture`](crate::FilterLayer::texture). The renderer uploads it once and
+    /// reuses the upload while the same texture (a clone) stays attached, so a video passes the
+    /// same one with every frame at no cost. A `slot` out of range makes the run fail with
+    /// [`OfflineError::Texture`].
+    #[must_use]
+    pub fn with_texture(mut self, slot: usize, texture: OfflineTexture) -> Self {
+        match self.textures.get_mut(slot) {
+            Some(entry) => *entry = Some(texture),
+            None => {
+                self.invalid_texture_slot.get_or_insert(slot);
+            }
+        }
+        self
+    }
+
+    /// The texture attached at `slot`, if any.
+    #[must_use]
+    pub fn texture(&self, slot: usize) -> Option<&OfflineTexture> {
+        self.textures.get(slot).and_then(Option::as_ref)
+    }
+
+    /// Which user texture slots have a texture.
+    pub(super) fn attached_textures(&self) -> [bool; TEXTURE_SLOTS] {
+        self.textures.each_ref().map(Option::is_some)
     }
 
     /// Draws the frame over `color` before filtering (default: transparent). Match the UI's
@@ -216,8 +252,11 @@ impl OfflineOptions {
         self.background
     }
 
-    /// Checks the numeric options.
+    /// Checks the numeric options and the texture slots.
     pub(super) fn validate(&self) -> Result<(), OfflineError> {
+        if let Some(slot) = self.invalid_texture_slot {
+            return Err(OfflineError::Texture(TextureError::InvalidSlot { slot }));
+        }
         if !(self.pixels_per_point.is_finite() && self.pixels_per_point > 0.0) {
             return Err(OfflineError::InvalidOption { option: "pixels_per_point", reason: format!("must be finite and positive, got {}", self.pixels_per_point) });
         }

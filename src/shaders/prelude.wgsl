@@ -4,7 +4,8 @@
 //   fl.rect_uv, fl.texel, fl.size_px, fl.time, fl.pixels_per_point,
 //   fl.delta_time, fl.frame, fl.pointer, fl.pass_scale,
 //   src(), src_px(), src_texel(), out_texel(), original(), params(), to_linear(), to_gamma(),
-//   premultiply(), unpremultiply(), luma(), and `p` (the snippet's own `struct Params`, see below).
+//   premultiply(), unpremultiply(), luma(), tex(), tex_size(), tex_load(), and `p` (the
+//   snippet's own `struct Params`, see below).
 // Every other `fl_*` / `internal_*` name, and every `fl` member not listed in the crate docs
 // (`pass_index` holds a neutral value until it is documented there), is private to the crate and
 // may change.
@@ -64,7 +65,20 @@ struct FlUniforms {
 @group(0) @binding(3) var fl_original_texture: texture_2d<f32>;
 @group(0) @binding(5) var fl_state_texture: texture_2d<f32>;
 @group(0) @binding(6) var fl_coverage_texture: texture_2d<f32>;
-@group(0) @binding(7) var fl_nearest_sampler: sampler;
+
+// User textures (F8): slot `i` is `@group(1 + i)`, laid out like egui-wgpu's texture bind group
+// (texture at 0, its sampler at 1), so wgpu binds egui's own bind group of the texture there and
+// glow binds the texture on unit `4 + i`. Every texture is read through exactly ONE sampler, its
+// own (the egui `TextureOptions` it was uploaded with): naga's GLSL writer rejects a texture read
+// through two samplers. Exact texel reads use `textureLoad`, which needs no sampler. A slot the
+// layer leaves empty is a 1x1 dummy, but an effect that may read it is refused before drawing
+// (`Effect::reads_texture`), so a dummy is never what an effect sees.
+@group(1) @binding(0) var fl_user0: texture_2d<f32>;
+@group(1) @binding(1) var fl_user0_sampler: sampler;
+@group(2) @binding(0) var fl_user1: texture_2d<f32>;
+@group(2) @binding(1) var fl_user1_sampler: sampler;
+@group(3) @binding(0) var fl_user2: texture_2d<f32>;
+@group(3) @binding(1) var fl_user2_sampler: sampler;
 
 var<private> fl_frag_uv: vec2<f32>;
 
@@ -109,6 +123,45 @@ fn original(uv: vec2<f32>) -> vec4<f32> {
 
 fn params(i: u32) -> vec4<f32> {
     return fl.params[min(i, 15u)];
+}
+
+// User texture `i` (0..3) at `uv` in ITS OWN coordinates ((0, 0) top-left, (1, 1) bottom-right
+// of the texture, y down), through the texture's own sampler (filter and wrap mode from its egui
+// `TextureOptions`; mip level 0). Premultiplied gamma-space RGBA, like `src()`. Slot >= 3: zero.
+fn tex(i: u32, uv: vec2<f32>) -> vec4<f32> {
+    var color = vec4<f32>(0.0);
+    switch i {
+        case 0u: { color = textureSampleLevel(fl_user0, fl_user0_sampler, uv, 0.0); }
+        case 1u: { color = textureSampleLevel(fl_user1, fl_user1_sampler, uv, 0.0); }
+        case 2u: { color = textureSampleLevel(fl_user2, fl_user2_sampler, uv, 0.0); }
+        default: {}
+    }
+    return color;
+}
+
+// Size of user texture `i` in texels. Slot >= 3: zero.
+fn tex_size(i: u32) -> vec2<f32> {
+    var size = vec2<u32>(0u);
+    switch i {
+        case 0u: { size = textureDimensions(fl_user0); }
+        case 1u: { size = textureDimensions(fl_user1); }
+        case 2u: { size = textureDimensions(fl_user2); }
+        default: {}
+    }
+    return vec2<f32>(size);
+}
+
+// The exact texel `px` (integer texel coordinates, (0, 0) top-left) of user texture `i`, no
+// filtering; clamped to the texture. Slot >= 3: zero.
+fn tex_load(i: u32, px: vec2<i32>) -> vec4<f32> {
+    var color = vec4<f32>(0.0);
+    switch i {
+        case 0u: { color = textureLoad(fl_user0, clamp(px, vec2<i32>(0), vec2<i32>(textureDimensions(fl_user0)) - vec2<i32>(1)), 0); }
+        case 1u: { color = textureLoad(fl_user1, clamp(px, vec2<i32>(0), vec2<i32>(textureDimensions(fl_user1)) - vec2<i32>(1)), 0); }
+        case 2u: { color = textureLoad(fl_user2, clamp(px, vec2<i32>(0), vec2<i32>(textureDimensions(fl_user2)) - vec2<i32>(1)), 0); }
+        default: {}
+    }
+    return color;
 }
 
 fn to_linear(c: vec4<f32>) -> vec4<f32> {
