@@ -47,7 +47,7 @@ use crate::effect::{
     composite_erase_module, composite_linear_module, composite_module,
 };
 use crate::geometry::{LayerGeometry, PxRect, px_f32};
-use crate::pass::{FrameUniforms, Pass, UNIFORM_BLOCK_SIZE};
+use crate::pass::{FrameUniforms, InputUniforms, Pass, UNIFORM_BLOCK_SIZE};
 use crate::plan::{Bindings, ChainPlan, Slot, SlotMappings, TextureMapping, composite_uniforms, plan, step_uniforms};
 
 /// Size of the zero buffer bound at `BINDING_PARAMS` (the smallest valid uniform binding).
@@ -105,7 +105,7 @@ pub(crate) struct ChainResources {
     layout: wgpu::BindGroupLayout,
     /// Pipeline layout of every effect and composite pipeline.
     pipeline_layout: wgpu::PipelineLayout,
-    /// Bound where a draw has no texture: 1x1 transparent (original, state).
+    /// Bound where a draw has no texture: 1x1 transparent (state; an original the plan leaves empty).
     transparent: wgpu::TextureView,
     /// Bound where a draw has no mask coverage texture: 1x1 opaque white.
     white: wgpu::TextureView,
@@ -268,7 +268,7 @@ impl ChainResources {
         let maps = SlotMappings { source: TextureMapping::of(capture, job.source.allocated, origin), ping_pong: [TextureMapping::of(capture, first.size, origin), TextureMapping::of(capture, second.size, origin)] };
         let stride = self.uniform_stride;
         let slot_bytes = usize::try_from(stride).unwrap_or(UNIFORM_BLOCK_SIZE);
-        let uniforms = chain_uniforms(&frame_uniforms(&job.geometry, job.time), &plan, job.passes, &job.geometry, &maps, slot_bytes);
+        let uniforms = chain_uniforms(&frame_uniforms(&job.geometry, job.time).with_input(&job.input), &plan, job.passes, &job.geometry, &maps, slot_bytes);
         let uniform_buffer = targets.uniforms.write(rec.device, rec.queue, &uniforms).clone();
         let view_of = |slot: Slot| match slot {
             Slot::Source => job.source.view,
@@ -339,7 +339,8 @@ impl ChainTargets {
 }
 
 /// The chain's input: a texture whose top-left region holds the run's window of the capture.
-/// It is the first pass's `src()` and the composite's original (shown outside the mask).
+/// It is the first pass's `src()` and every draw's original (`original()`; the composite shows it
+/// outside the mask). No draw of the run renders into it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ChainSource<'a> {
     /// A filterable float view of the texture (single-sampled, 2D).
@@ -391,6 +392,8 @@ pub(crate) struct ChainJob<'a> {
     pub window: ChainWindow,
     /// `fl.time`, seconds. (`fl.pixels_per_point` is `geometry.pixels_per_layer_point`.)
     pub time: f32,
+    /// `fl.delta_time`, `fl.frame`, `fl.pointer`, resolved for `geometry`'s capture.
+    pub input: InputUniforms,
     /// The passes (their parameters).
     pub passes: &'a [Pass],
     /// `passes[i]`'s pipeline from `ChainResources::effect_pipeline`, same order and length.

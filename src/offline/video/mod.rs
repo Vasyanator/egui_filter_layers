@@ -19,7 +19,8 @@ Key functions:
 Notes:
 Every frame goes through `OfflineRenderer::run` (and so through `wgpu_backend/chain.rs`); this
 module adds no GPU work. `fl.time` of a frame is the source's time for it (seconds from the first
-frame), converted to `f32`.
+frame), converted to `f32`; `fl.delta_time` / `fl.frame` come from the processor's `FrameClock`
+(time since the previous frame, frame index) unless the options set them explicitly.
 */
 
 //! Video: filter frame streams with the same chains as the UI.
@@ -70,6 +71,12 @@ frame), converted to `f32`.
 //! dropped by ffmpeg, as `-fps_mode cfr` does) and a video stream that starts after the file's
 //! first audio is padded with its first frame, which keeps the passed-through audio in sync.
 //! Frame `i` then has `fl.time = i / frame_rate`.
+//!
+//! **Frame counters.** [`VideoProcessor`] also sets `fl.frame` to the index of the frame it
+//! processes (0 for the first; [`process_video`] restarts at 0 per stream, a custom loop calls
+//! [`VideoProcessor::reset_frame_clock`]) and `fl.delta_time` to its time minus the previous
+//! frame's (0 for the first, never negative). A value set explicitly through
+//! [`OfflineOptions::with_frame`] / [`OfflineOptions::with_delta_time`] wins over these.
 
 mod error;
 #[cfg(not(target_arch = "wasm32"))]
@@ -92,8 +99,9 @@ use crate::pass::FilterChain;
 /// can be reused between frames: the renderer (device, pipelines, textures, readback buffer, the
 /// prepared-input buffer) and the output buffer.
 ///
-/// The frame's time replaces [`OfflineOptions::time`] for every frame. Like the renderer, it
-/// blocks or awaits the GPU: never use it on a GUI thread.
+/// The frame's time replaces [`OfflineOptions::time`] for every frame, and the processor's frame
+/// clock fills `fl.frame` / `fl.delta_time` unless the options set them (see the module docs).
+/// Like the renderer, it blocks or awaits the GPU: never use it on a GUI thread.
 #[derive(Debug)]
 pub struct VideoProcessor {
     /// The renderer, reused for every frame.
@@ -104,13 +112,43 @@ pub struct VideoProcessor {
     options: OfflineOptions,
     /// The last frame's result.
     output: Vec<u8>,
+    /// `fl.frame` / `fl.delta_time` of the next frame.
+    clock: FrameClock,
+}
+
+/// The processor's frame counters: the next frame's index and the previous frame's time.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct FrameClock {
+    /// Time of the last successfully processed frame, seconds; `None` before the first.
+    previous_time: Option<f64>,
+    /// Index of the next frame (`fl.frame`, wrapping at `u32::MAX`).
+    next_frame: u32,
+}
+
+impl FrameClock {
+    /// `(fl.delta_time, fl.frame)` of a frame at `time` (finite): the time since the previous
+    /// frame, `0` for the first and never negative (a source going back in time), saturated at
+    /// `f32::MAX`.
+    fn counters(&self, time: f64) -> (f32, u32) {
+        let delta = self.previous_time.map_or(0.0, |previous| (time - previous).clamp(0.0, f64::from(f32::MAX)));
+        // In `0..=f32::MAX` (clamped above), so the conversion only rounds.
+        #[allow(clippy::cast_possible_truncation)]
+        let delta = delta as f32;
+        (delta, self.next_frame)
+    }
+
+    /// Records a processed frame at `time`.
+    fn advance(&mut self, time: f64) {
+        self.previous_time = Some(time);
+        self.next_frame = self.next_frame.wrapping_add(1);
+    }
 }
 
 impl VideoProcessor {
     /// A processor applying `chain` with `options` on `renderer`.
     #[must_use]
     pub fn new(renderer: OfflineRenderer, chain: FilterChain, options: OfflineOptions) -> Self {
-        Self { renderer, chain, options, output: Vec::new() }
+        Self { renderer, chain, options, output: Vec::new(), clock: FrameClock::default() }
     }
 
     /// The renderer.
@@ -148,6 +186,12 @@ impl VideoProcessor {
         self.options = options;
     }
 
+    /// Restarts the frame clock: the next frame gets `fl.frame = 0` and `fl.delta_time = 0`
+    /// (a new stream or a seek in a custom decode loop; [`process_video`] does it itself).
+    pub fn reset_frame_clock(&mut self) {
+        self.clock = FrameClock::default();
+    }
+
     /// Filters `frame`, shown at `time` seconds (`fl.time`), and returns a view of the result,
     /// valid until the next call. Blocks until the GPU is done (native only).
     ///
@@ -164,8 +208,10 @@ impl VideoProcessor {
     /// As [`VideoProcessor::process_frame`].
     #[cfg(not(target_arch = "wasm32"))]
     pub fn process_frame_into(&mut self, frame: &FrameRef<'_>, time: f64, output: &mut Vec<u8>) -> Result<(), OfflineError> {
-        let options = frame_options(&self.options, time, None)?;
-        super::readback::block_on(self.renderer.run(frame, &self.chain, &options, output, true))
+        let options = frame_options(&self.options, time, None, self.clock)?;
+        super::readback::block_on(self.renderer.run(frame, &self.chain, &options, output, true))?;
+        self.clock.advance(time);
+        Ok(())
     }
 
     /// Async [`VideoProcessor::process_frame`] (on the web, or where the device is polled by
@@ -179,17 +225,19 @@ impl VideoProcessor {
 
     /// The shared per-frame implementation: `alpha` overrides the options' output alpha.
     async fn run_frame(&mut self, frame: &FrameRef<'_>, time: f64, alpha: Option<AlphaMode>, block: bool) -> Result<FrameRef<'_>, OfflineError> {
-        let options = frame_options(&self.options, time, alpha)?;
+        let options = frame_options(&self.options, time, alpha, self.clock)?;
         self.renderer.run(frame, &self.chain, &options, &mut self.output, block).await?;
+        self.clock.advance(time);
         Ok(FrameRef::new(&self.output, frame.width(), frame.height(), options.output_alpha))
     }
 }
 
-/// `options` with `fl.time = time` (and the output alpha overridden when given).
+/// `options` with `fl.time = time`, `fl.delta_time` / `fl.frame` from `clock` where the options
+/// do not set them, and the output alpha overridden when given.
 ///
 /// # Errors
 /// [`OfflineError::InvalidOption`] for a non-finite time or one beyond `f32`.
-fn frame_options(options: &OfflineOptions, time: f64, alpha: Option<AlphaMode>) -> Result<OfflineOptions, OfflineError> {
+fn frame_options(options: &OfflineOptions, time: f64, alpha: Option<AlphaMode>, clock: FrameClock) -> Result<OfflineOptions, OfflineError> {
     if !time.is_finite() || time.abs() > f64::from(f32::MAX) {
         return Err(OfflineError::InvalidOption { option: "time", reason: format!("a frame time must be finite, got {time}") });
     }
@@ -198,6 +246,14 @@ fn frame_options(options: &OfflineOptions, time: f64, alpha: Option<AlphaMode>) 
     #[allow(clippy::cast_possible_truncation)]
     let seconds = time as f32;
     let mut options = options.clone().with_time(seconds);
+    let (explicit_delta, explicit_frame) = options.explicit_counters();
+    let (delta_time, frame) = clock.counters(time);
+    if !explicit_delta {
+        options = options.with_delta_time(delta_time);
+    }
+    if !explicit_frame {
+        options = options.with_frame(frame);
+    }
     if let Some(alpha) = alpha {
         options = options.with_output_alpha(alpha);
     }
@@ -273,6 +329,8 @@ where
     let info = source.info().clone();
     log::info!("egui_filter_layers (video): processing {}x{} at {} fps ({} frames expected)", info.width(), info.height(), info.frame_rate(), info.frame_count().map_or_else(|| "unknown".to_owned(), |count| count.to_string()));
     sink.begin(&info)?;
+    // A stream starts at `fl.frame = 0`, whatever the processor ran before.
+    processor.reset_frame_clock();
     match frame_loop(processor, source, sink, &info, progress, block).await {
         Ok(frames) => {
             sink.finish()?;
@@ -319,14 +377,39 @@ mod tests {
     #[test]
     fn frame_times_become_fl_time() {
         let base = OfflineOptions::default().with_time(9.0).with_output_alpha(AlphaMode::Premultiplied);
-        let Ok(options) = frame_options(&base, 1.25, None) else { panic!("finite time") };
+        let Ok(options) = frame_options(&base, 1.25, None, FrameClock::default()) else { panic!("finite time") };
         assert!((options.time() - 1.25).abs() < f32::EPSILON);
         assert_eq!(options.output_alpha, AlphaMode::Premultiplied);
-        let Ok(options) = frame_options(&base, 0.5, Some(AlphaMode::Straight)) else { panic!("finite time") };
+        let Ok(options) = frame_options(&base, 0.5, Some(AlphaMode::Straight), FrameClock::default()) else { panic!("finite time") };
         assert_eq!(options.output_alpha, AlphaMode::Straight);
         for bad in [f64::NAN, f64::INFINITY, 1e300] {
-            assert!(matches!(frame_options(&base, bad, None), Err(OfflineError::InvalidOption { option: "time", .. })), "{bad}");
+            assert!(matches!(frame_options(&base, bad, None, FrameClock::default()), Err(OfflineError::InvalidOption { option: "time", .. })), "{bad}");
         }
+    }
+
+    /// The clock counts frames and time steps (0 first, never negative); explicit options win.
+    #[test]
+    fn the_frame_clock_fills_unset_counters() {
+        let base = OfflineOptions::default();
+        let mut clock = FrameClock::default();
+        let mut seen = Vec::new();
+        for time in [0.5, 0.5 + 1.0 / 30.0, 0.5 + 3.0 / 30.0, 0.25] {
+            let Ok(options) = frame_options(&base, time, None, clock) else { panic!("finite time") };
+            seen.push((options.delta_time(), options.frame()));
+            clock.advance(time);
+        }
+        let expected = [(0.0, 0), (1.0 / 30.0, 1), (2.0 / 30.0, 2), (0.0, 3)];
+        for ((delta, frame), (want_delta, want_frame)) in seen.iter().zip(expected) {
+            assert!((delta - want_delta).abs() < 1e-6 && *frame == want_frame, "{seen:?}");
+        }
+        let explicit = base.with_delta_time(0.25).with_frame(7);
+        let Ok(options) = frame_options(&explicit, 9.0, None, clock) else { panic!("finite time") };
+        assert!((options.delta_time() - 0.25).abs() < f32::EPSILON && options.frame() == 7, "explicit values win");
+        let (first_delta, last_frame) = FrameClock { previous_time: None, next_frame: u32::MAX }.counters(1.0);
+        assert!(first_delta.abs() < f32::EPSILON && last_frame == u32::MAX);
+        let mut wrapping = FrameClock { previous_time: None, next_frame: u32::MAX };
+        wrapping.advance(1.0);
+        assert_eq!(wrapping.next_frame, 0);
     }
 
     #[test]

@@ -9,9 +9,12 @@ ping-pong. Also owns the byte layout of the `fl` uniform block shared by all bac
 Key structures:
 - `Pass`, `FilterChain`, `ParamIndexError` (public).
 - `FrameUniforms` (crate-internal): the non-parameter half of the uniform block.
+- `InputUniforms` (crate-internal): the per-frame input members (`fl.delta_time`, `fl.frame`,
+  `fl.pointer`) of one run, already resolved for its capture.
 
 Key functions:
-- `FrameUniforms::for_layer()`: the one place the per-layer uniforms are derived from geometry.
+- `FrameUniforms::for_layer()`: the one place the per-layer uniforms are derived from geometry;
+  `FrameUniforms::with_input()` adds the per-frame input members.
 - `pack_uniforms()`: serializes one draw's uniforms into the exact std140 / WGSL-uniform layout
   of `FlUniforms` in `shaders/prelude.wgsl` (offsets pinned by a test against naga's layout).
   Which texture mapping and fragment offset each draw gets is decided by `plan.rs`, not here.
@@ -290,11 +293,12 @@ pub(crate) struct FrameUniforms {
     pub src_offset: [f32; 2],
     /// Same for the auxiliary texture.
     pub aux_offset: [f32; 2],
-    /// Seconds since the previous frame (`fl.delta_time`); no producer yet, so always `0`.
+    /// Seconds since the previous frame (`fl.delta_time`); `0` until `with_input`.
     pub delta_time: f32,
-    /// Frame counter (`fl.frame`); no producer yet, so always `0`.
+    /// Frame counter (`fl.frame`); `0` until `with_input`.
     pub frame: u32,
-    /// Pointer in capture uv, `z` pressed, `w` present (`fl.pointer`); `w = 0`: no pointer.
+    /// Pointer in capture uv, `z` pressed, `w` present (`fl.pointer`); `w = 0`: no pointer
+    /// (the value until `with_input`).
     pub pointer: [f32; 4],
     /// Capture uv -> storage uv of the state texture (`internal_state_*`); identity while no
     /// chain has state.
@@ -314,7 +318,8 @@ impl FrameUniforms {
     /// points follow a layer transform's zoom exactly like the padding does). `src_scale` /
     /// `aux_scale` start at `1` and are set per draw by `plan.rs` (grow-only targets); the
     /// window fields (`frag_*`, `*_offset`) start in the interpolated, whole-capture state. The
-    /// remaining members hold their neutral values (see each field).
+    /// remaining members hold their neutral values (see each field); the per-frame input members
+    /// are set by [`FrameUniforms::with_input`].
     ///
     /// `time` is seconds; `flip_y` whether the backend's texture storage is bottom-up (OpenGL).
     #[must_use]
@@ -341,6 +346,30 @@ impl FrameUniforms {
             pass_scale: 1.0,
             pass_index: 0,
         }
+    }
+}
+
+/// The per-frame input members of one run's uniform block: `fl.delta_time`, `fl.frame` and
+/// `fl.pointer`, already resolved for the run's capture (the pointer through
+/// `geometry::pointer_uniform`). `Default` is the neutral input (0 s, frame 0, no pointer).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct InputUniforms {
+    /// Seconds since the previous frame, finite and `>= 0`.
+    pub delta_time: f32,
+    /// Frame counter (wraps at `u32::MAX`).
+    pub frame: u32,
+    /// Pointer in capture uv (`xy`), pressed (`z`, 0/1), present (`w`, 0/1).
+    pub pointer: [f32; 4],
+}
+
+impl FrameUniforms {
+    /// `self` with the per-frame input members of `input` (the rest unchanged).
+    #[must_use]
+    pub(crate) fn with_input(mut self, input: &InputUniforms) -> Self {
+        self.delta_time = input.delta_time;
+        self.frame = input.frame;
+        self.pointer = input.pointer;
+        self
     }
 }
 
@@ -511,6 +540,26 @@ mod tests {
         assert!((read_f32(&bytes, offsets::FRAG_TEXEL) - read_f32(&bytes, offsets::TEXEL)).abs() < f32::EPSILON, "full resolution: the draw's texel is the capture's");
         assert!((read_f32(&bytes, offsets::STATE_SCALE) - 1.0).abs() < f32::EPSILON && (read_f32(&bytes, offsets::COVER_SCALE + 4) - 1.0).abs() < f32::EPSILON);
         assert!(read_f32(&bytes, offsets::POINTER + 12).abs() < f32::EPSILON, "no pointer present");
+    }
+
+    #[test]
+    fn input_members_are_packed_where_the_prelude_reads_them() {
+        use egui::{CornerRadius, Rect, pos2, vec2};
+        let rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(40.0, 20.0));
+        let Some(geometry) = crate::geometry::layer_geometry(rect, Rect::EVERYTHING, 1.0, [100, 100], 0.0, CornerRadius::ZERO, 1.0) else { panic!("visible") };
+        let input = InputUniforms { delta_time: 0.015_625, frame: u32::MAX, pointer: [0.25, -0.5, 1.0, 1.0] };
+        let frame = FrameUniforms::for_layer(&geometry, 2.0, false).with_input(&input);
+        assert!((frame.time - 2.0).abs() < f32::EPSILON, "with_input keeps the rest");
+        let bytes = pack_uniforms(&frame, &[[0.0; 4]; PARAM_SLOTS]);
+        let read_u32 = |offset: usize| u32::from_ne_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        assert!((read_f32(&bytes, offsets::DELTA_TIME) - 0.015_625).abs() < f32::EPSILON);
+        assert_eq!(read_u32(offsets::FRAME), u32::MAX);
+        for (i, expected) in [0.25, -0.5, 1.0, 1.0].into_iter().enumerate() {
+            assert!((read_f32(&bytes, offsets::POINTER + i * 4) - expected).abs() < f32::EPSILON, "pointer[{i}]");
+        }
+        // The neutral input packs the neutral values.
+        let neutral = pack_uniforms(&FrameUniforms::for_layer(&geometry, 2.0, false).with_input(&InputUniforms::default()), &[[0.0; 4]; PARAM_SLOTS]);
+        assert_eq!(neutral, pack_uniforms(&FrameUniforms::for_layer(&geometry, 2.0, false), &[[0.0; 4]; PARAM_SLOTS]));
     }
 
     #[test]

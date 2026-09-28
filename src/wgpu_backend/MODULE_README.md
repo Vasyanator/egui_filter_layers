@@ -32,7 +32,8 @@ samplers and dummies, effect pipeline cache, composite pipelines for any output 
 there, while the wiring (ping-pong order, which slot each binding gets, storage mappings, uniform
 blocks, viewports) comes from the backend-neutral `src/plan.rs`, shared with glow. It takes
 only `&wgpu::Device`, `&wgpu::Queue`, a `CommandEncoder`, a source texture view (capture at its
-origin), `LayerGeometry`, time and pixels-per-point. It knows nothing of egui (no
+origin), `LayerGeometry`, time, the resolved per-frame input (`InputUniforms`) and
+pixels-per-point. It knows nothing of egui (no
 `CallbackResources`, no egui `Renderer`), so a runner on its own device reuses it unchanged; the UI
 callback adds only the backdrop re-render, the egui-pass composite pipeline and the frame pool;
 the offline renderer (`src/offline/`) adds only uploads, tiles and readback.
@@ -118,6 +119,8 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
 - What counts as "beneath" / clipping: `beneath.rs`. Texture staleness: `textures.rs`.
 - Which texture / mapping a draw gets: `src/plan.rs` (shared with glow). Recording, bind groups,
   uniform stride, intermediate format: `chain.rs` (shared by every wgpu caller). Backdrop re-render, egui-pass pipelines: `render.rs` / `resources.rs`.
-- Per-layer uniform values and composite params: core `FrameUniforms::for_layer` (`pass.rs`) and
-  `LayerGeometry::composite_params` (`geometry.rs`), shared with glow.
+- Per-layer uniform values and composite params: core `FrameUniforms::for_layer` /
+  `with_input` (`pass.rs`) and `LayerGeometry::composite_params` (`geometry.rs`), shared with glow.
+  The UI resolves `LayerJob::frame_input` at `prepare` (`render.rs`, the screen's pixels per
+  point); offline through `OfflineOptions::input_uniforms`.
 - Tests: unit tests in each file; GPU end-to-end in `tests/wgpu_headless.rs` (`--ignored`).

@@ -3,7 +3,7 @@
 // backend sets to the processed region; params[2] = that region inside the
 // capture, in capture UV (x, y, w, h). In frag mode 1 (wgpu) `frag_uv` already is
 // the capture uv, derived from the pixel position (see the prelude). The original capture is
-// the prelude's `fl_original_texture` (binding 3). params[0] = mask rect (min.xy, max.xy) in capture pixels,
+// read with the prelude's `original(uv)` (binding 3). params[0] = mask rect (min.xy, max.xy) in capture pixels,
 // params[1] = corner radii (nw, ne, se, sw) in pixels.
 // `effect.rs` appends one of the `effect` wrappers: the replace composite `fl_composite`
 // (gamma or linear output; glow and offline), or the two draws of the blended composite the
@@ -54,8 +54,8 @@ fn fl_coverage_or_discard(uv: vec2<f32>) -> f32 {
 fn fl_composite(frag_uv: vec2<f32>) -> vec4<f32> {
     let uv = fl_composite_uv(frag_uv);
     let filtered = src(uv);
-    let original = textureSampleLevel(fl_original_texture, fl_sampler, fl_storage_uv(uv, fl.internal_aux_scale, fl.internal_aux_offset), 0.0);
+    let unfiltered = original(uv);
     let coverage = fl_coverage(uv);
     // Exact at full and zero coverage (`mix` may round `o + (f - o) * 1` away from `f`).
-    return select(select(mix(original, filtered, coverage), filtered, coverage >= 1.0), original, coverage <= 0.0);
+    return select(select(mix(unfiltered, filtered, coverage), filtered, coverage >= 1.0), unfiltered, coverage <= 0.0);
 }

@@ -29,7 +29,11 @@ frame stream needs (`video/` builds on exactly that).
 
 ## Files and submodules
 - `mod.rs`: `OfflineRenderer` (constructors, `process` / `process_into` / `process_async`,
-  `run`, per-tile recording), `OfflineOptions`, `frame_geometry`, upload / readback copies.
+  `run`, per-tile recording), `frame_geometry`, upload / readback copies.
+- `options.rs`: `OfflineOptions` (validated before GPU work; `delta_time` / `frame` remember
+  whether they were set, so a video processor fills only unset ones), `PointerState` (frame uv),
+  `input_uniforms` (the run's `fl.delta_time` / `fl.frame` / `fl.pointer`, the pointer through
+  the UI's `geometry::pointer_uniform`).
 - `frame.rs`: `FrameRef`, `RgbaFrame`, `AlphaMode`, colour conversions (unit-tested).
 - `tiles.rs`: pure tile planning (unit-tested).
 - `readback.rs`: row padding, `MapFuture`, native `block_on` (no async runtime dependency).

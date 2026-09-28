@@ -14,6 +14,8 @@ Key functions:
 - `layer_geometry()`: pure function from the callback's rect/clip/screen to `LayerGeometry`.
 - `padding_px()`: the chain padding in whole pixels (the capture's and the offline tiles' overlap).
 - `LayerGeometry::composite_params()`: the composite pass's parameter block (every backend).
+- `pointer_uniform()`: the one screen-points -> capture-uv conversion of the pointer (`fl.pointer`),
+  used by both backends and the offline renderer.
 - `px_f32()`: exact pixel-count -> `f32` conversion shared by the backends.
 
 Notes:
@@ -21,7 +23,7 @@ Rounding mirrors `epaint::ViewportInPixels::from_points` (round each edge, clamp
 so the processed region agrees with the viewport egui's own renderers compute.
 */
 
-use egui::{CornerRadius, Rect};
+use egui::{CornerRadius, Pos2, Rect};
 
 use crate::pass::{PARAM_SLOTS, Params};
 
@@ -123,6 +125,32 @@ pub(crate) fn px_f32(value: i32) -> f32 {
 #[must_use]
 pub(crate) fn padding_px(padding_points: f32, pixels_per_layer_point: f32) -> i32 {
     if padding_points.is_finite() && padding_points > 0.0 { round_px((padding_points * pixels_per_layer_point).ceil()) } else { 0 }
+}
+
+/// `fl.pointer` for a pointer at `pos` (screen points, i.e. egui's global input coordinates,
+/// top-left origin, y down) on a screen of `pixels_per_point`, relative to `capture`: `xy` =
+/// `(pos * pixels_per_point - capture.xy) / capture.wh` (capture uv, the same space as an
+/// effect's `uv`; outside `0..1` when the pointer is off the capture), `z` = `1` while `pressed`,
+/// `w` = `1` (present). `None`, a degenerate capture or a non-finite result gives `[0; 4]`
+/// (`w = 0`: no pointer).
+///
+/// No layer transform is involved: the capture is in screen pixels and egui's pointer input is in
+/// untransformed screen points, so a transformed (scaled / translated) layer maps the pointer
+/// correctly through its capture alone.
+#[must_use]
+pub(crate) fn pointer_uniform(pointer: Option<(Pos2, bool)>, pixels_per_point: f32, capture: PxRect) -> [f32; 4] {
+    let Some((pos, pressed)) = pointer else {
+        return [0.0; 4];
+    };
+    if capture.w <= 0 || capture.h <= 0 {
+        return [0.0; 4];
+    }
+    let u = (pos.x * pixels_per_point - px_f32(capture.x)) / px_f32(capture.w);
+    let v = (pos.y * pixels_per_point - px_f32(capture.y)) / px_f32(capture.h);
+    if !(u.is_finite() && v.is_finite()) {
+        return [0.0; 4];
+    }
+    [u, v, if pressed { 1.0 } else { 0.0 }, 1.0]
 }
 
 /// Computes the geometry of one layer, or `None` when nothing of it is visible.
@@ -292,5 +320,39 @@ mod tests {
         let Some(g) = layer_geometry(rect, Rect::EVERYTHING, 2.0, SCREEN, f32::INFINITY, CornerRadius { nw: 1, ne: 2, sw: 3, se: 4 }, 0.5) else { panic!("visible") };
         assert_eq!(g.capture, g.region);
         assert!(approx4(g.mask_radii_px, [1.0, 2.0, 4.0, 3.0]), "{:?}", g.mask_radii_px);
+    }
+
+    #[test]
+    fn the_pointer_maps_to_capture_uv() {
+        let capture = PxRect { x: 100, y: 50, w: 200, h: 100 };
+        // ppp 2: screen point (100, 50) is pixel (200, 100) = capture uv (0.5, 0.5).
+        assert!(approx4(pointer_uniform(Some((pos2(100.0, 50.0), true)), 2.0, capture), [0.5, 0.5, 1.0, 1.0]));
+        assert!(approx4(pointer_uniform(Some((pos2(50.0, 25.0), false)), 2.0, capture), [0.0, 0.0, 0.0, 1.0]));
+        // Off the capture: outside 0..1 but still present.
+        assert!(approx4(pointer_uniform(Some((pos2(0.0, 0.0), false)), 1.0, capture), [-0.5, -0.5, 0.0, 1.0]));
+        assert!(approx4(pointer_uniform(None, 2.0, capture), [0.0; 4]));
+        assert!(approx4(pointer_uniform(Some((pos2(1.0, 1.0), true)), f32::NAN, capture), [0.0; 4]));
+        assert!(approx4(pointer_uniform(Some((pos2(1.0, 1.0), true)), 1.0, PxRect { x: 0, y: 0, w: 0, h: 5 }), [0.0; 4]));
+    }
+
+    /// A transformed layer: egui reports the callback rect with the layer transform applied and
+    /// the pointer in untransformed screen points, so the pointer over the RENDERED layer's centre
+    /// lands on the centre of `rect_uv`.
+    #[test]
+    fn the_pointer_follows_a_transformed_layer() {
+        let painted = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 50.0));
+        // Scale 2, then translate by (10, 20): rendered (10, 20)..(210, 120).
+        let transform = egui::emath::TSTransform::new(vec2(10.0, 20.0), 2.0);
+        let rendered = transform * painted;
+        let scale = transform_scale(painted, rendered);
+        let ppp = 1.5;
+        let Some(g) = layer_geometry(rendered, Rect::EVERYTHING, ppp, SCREEN, 4.0, CornerRadius::ZERO, scale) else { panic!("visible") };
+        let centre = transform * painted.center();
+        let pointer = pointer_uniform(Some((centre, true)), ppp, g.capture);
+        let expected = [g.rect_uv[0] + g.rect_uv[2] * 0.5, g.rect_uv[1] + g.rect_uv[3] * 0.5];
+        assert!(approx(pointer[0], expected[0]) && approx(pointer[1], expected[1]), "{pointer:?} vs {expected:?}");
+        // The rendered rect's top-left corner is `rect_uv.xy`.
+        let corner = pointer_uniform(Some((rendered.min, false)), ppp, g.capture);
+        assert!(approx(corner[0], g.rect_uv[0]) && approx(corner[1], g.rect_uv[1]), "{corner:?} vs {:?}", g.rect_uv);
     }
 }

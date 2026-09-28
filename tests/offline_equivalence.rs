@@ -85,6 +85,8 @@ fn cases() -> Vec<Case> {
     .unwrap_or_else(|error| panic!("{error}"))
     .with_sample_radius(4.0);
     let custom = Pass::new(&custom).with_param(0, [3.0, 0.0, 0.0, 0.0]).unwrap_or_else(|error| panic!("{error}"));
+    // F1: `original()` after a pass that changed the image gives the backdrop back.
+    let original = Pass::new(&Effect::new("original", "fn effect(uv: vec2<f32>) -> vec4<f32> { return original(uv); }").unwrap_or_else(|error| panic!("{error}")));
     let case = |name, chain, radius, gain, continuous| Case { name, chain, radius, gain, continuous };
     vec![
         case("brightness_contrast", presets::brightness_contrast(0.1, 1.3).into(), 0, 1.3, false),
@@ -105,6 +107,7 @@ fn cases() -> Vec<Case> {
         case("frosted_glass", presets::frosted_glass(2.0, Color32::from_rgb(230, 240, 255), 0.2), 0, 1.0, false),
         case("custom", custom.into(), 0, 1.0, true),
         case("blur+invert, rounded", presets::gaussian_blur(2.0).then(presets::invert(1.0)), 12, 1.0, false),
+        case("original_passthrough", FilterChain::from(presets::invert(1.0)).then(original), 0, 1.0, false),
     ]
 }
 
@@ -479,4 +482,85 @@ fn a_cancelled_readback_does_not_brick_the_renderer() {
     }
     let again = offline.process(&frame, &chain, &options).unwrap_or_else(|error| panic!("after a cancelled run: {error}"));
     assert_eq!(again.pixels(), expected.pixels());
+}
+
+/// F1 offline: `original(uv)` after passes that changed the image returns the input exactly, whole
+/// and in small tiles (every window's capture mapping has a non-zero offset), and a pass reading
+/// both `src` (inverted) and `original` sees exactly their per-pixel pair.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn original_returns_the_input_in_every_pass_and_tile() {
+    let (_instance, adapter, device, queue) = gpu();
+    let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
+    let (width, height) = (300, 200);
+    let image = test_image(width, height, |_, _| 255);
+    let frame = FrameRef::new(&image, width, height, AlphaMode::Straight);
+    let pass = |label: &str, source: &str| Pass::new(&Effect::new(label, source).unwrap_or_else(|error| panic!("{label}: {error}")));
+    let original = pass("original", "fn effect(uv: vec2<f32>) -> vec4<f32> { return original(uv); }");
+    // `1 - src` undoes the invert: equal to `original` only if both read the same pixel.
+    let pair = pass("pair", "fn effect(uv: vec2<f32>) -> vec4<f32> { let s = src(uv); let o = original(uv); return select(vec4<f32>(1.0, 0.0, 1.0, 1.0), o, all(abs(vec3<f32>(1.0) - s.rgb - o.rgb) < vec3<f32>(0.5 / 255.0))); }");
+    let chains = [("invert, original", FilterChain::from(presets::invert(1.0)).then(original.clone())), ("blur, invert, original", presets::gaussian_blur(3.0).then(presets::invert(1.0)).then(original)), ("invert, pair", FilterChain::from(presets::invert(1.0)).then(pair))];
+    for (name, chain) in chains {
+        for tile in [None, Some(64)] {
+            let options = OfflineOptions::default().with_max_tile_size(tile);
+            let result = offline.process(&frame, &chain, &options).unwrap_or_else(|error| panic!("{name}, tile {tile:?}: {error}"));
+            let (count, max, first) = compare(&image, result.pixels(), width, false);
+            assert_eq!(count, 0, "{name}, tile {tile:?}: max diff {max}, first at {first:?}");
+        }
+    }
+}
+
+/// F2 offline: `fl.delta_time` / `fl.frame` follow a video processor's frame times and index
+/// (0 for the first frame), explicit options win, and `fl.pointer` is the option's frame uv with
+/// its flags (`w = 0` without a pointer), also when tiled.
+#[cfg(feature = "video")]
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn offline_frame_input_follows_the_options_and_the_video_clock() {
+    use egui_filter_layers::PointerState;
+    use egui_filter_layers::offline::video::VideoProcessor;
+
+    let (_instance, adapter, device, queue) = gpu();
+    let (width, height) = (96, 64);
+    let image = test_image(width, height, |_, _| 255);
+    let frame = FrameRef::new(&image, width, height, AlphaMode::Straight);
+    let pass = |label: &str, source: &str| Pass::new(&Effect::new(label, source).unwrap_or_else(|error| panic!("{label}: {error}")));
+    let pixel = |pixels: &[u8], x: u32, y: u32| {
+        let at = usize::try_from((y * width + x) * 4).unwrap_or(0);
+        [pixels[at], pixels[at + 1], pixels[at + 2]]
+    };
+    let near = |actual: [u8; 3], expected: [u8; 3], what: &str| assert!(actual.iter().zip(expected).all(|(a, e)| a.abs_diff(e) <= 1), "{what}: {actual:?}, expected {expected:?}");
+
+    // Frame times 0, 0.2, 0.6 s: steps of 51 / 255 and 102 / 255.
+    let counters = pass("counters", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(fl.delta_time, f32(fl.frame) / 255.0, 0.0, 1.0); }");
+    let renderer = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
+    let mut processor = VideoProcessor::new(renderer, counters.into(), OfflineOptions::default());
+    for (index, (time, delta_byte)) in [(0.0, 0), (0.2, 51), (0.6, 102)].into_iter().enumerate() {
+        let result = processor.process_frame(&frame, time).unwrap_or_else(|error| panic!("{error}"));
+        let frame_byte = u8::try_from(index).unwrap_or(0);
+        near(pixel(result.pixels(), 10, 10), [delta_byte, frame_byte, 0], &format!("video frame {index} at {time} s"));
+    }
+    processor.set_options(OfflineOptions::default().with_delta_time(0.4).with_frame(9));
+    let result = processor.process_frame(&frame, 5.0).unwrap_or_else(|error| panic!("{error}"));
+    near(pixel(result.pixels(), 10, 10), [102, 9, 0], "explicit delta_time / frame win");
+    processor.set_options(OfflineOptions::default());
+    processor.reset_frame_clock();
+    let result = processor.process_frame(&frame, 7.0).unwrap_or_else(|error| panic!("{error}"));
+    near(pixel(result.pixels(), 10, 10), [0, 0, 0], "a reset clock starts at frame 0, delta 0");
+
+    let pointer = pass("pointer", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(fl.pointer.x, fl.pointer.y, fl.pointer.z, 1.0) * fl.pointer.w + vec4<f32>(0.0, 0.0, 0.0, 1.0 - fl.pointer.w); }");
+    let chain = FilterChain::from(pointer);
+    let mut offline = processor.into_renderer();
+    for tile in [None, Some(32)] {
+        let base = OfflineOptions::default().with_max_tile_size(tile);
+        let none = offline.process(&frame, &chain, &base).unwrap_or_else(|error| panic!("{error}"));
+        near(pixel(none.pixels(), 50, 40), [0, 0, 0], &format!("tile {tile:?}: no pointer"));
+        let options = base.with_pointer(Some(PointerState { uv: [0.25, 0.75], pressed: true }));
+        let pressed = offline.process(&frame, &chain, &options).unwrap_or_else(|error| panic!("{error}"));
+        for (x, y) in [(1, 1), (50, 40), (95, 63)] {
+            near(pixel(pressed.pixels(), x, y), [64, 191, 255], &format!("tile {tile:?}: pointer at ({x}, {y})"));
+        }
+    }
+    let invalid = OfflineOptions::default().with_delta_time(-1.0);
+    assert!(offline.process(&frame, &chain, &invalid).is_err(), "a negative delta_time is rejected");
 }

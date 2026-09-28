@@ -482,3 +482,15 @@ UI. The demo requires both backend features as today.
 ## 17. Progress
 Each phase is marked done here in the same commit that lands it.
 - Phase 1 (plan.rs single owner, full `@group(0)` layout with dummies, 416-byte `FlUniforms`, prelude-name interface check, `ModuleKind` removed): done.
+- Phase 2a (F1 `original(uv)` in every pass: prelude helper, the plan binds the capture as every draw's original with its own `aux` mapping; GPU tests UI + offline incl. tiles): done.
+- Phase 2b (F2: `LayerJob::frame_input` read in `FilterLayer::paint`; `geometry::pointer_uniform` the one pointer -> capture-uv conversion, resolved per paint callback on both backends; `pass::InputUniforms` + `FrameUniforms::with_input`; `OfflineOptions::with_delta_time` / `with_frame` / `with_pointer` + `PointerState` in `offline/options.rs`; `VideoProcessor` frame clock, explicit options win; not animation triggers): done.
+
+## 18. Findings during execution
+- Phase 1: naga's GLSL writer rejects one texture read through two samplers in one module
+  ("A image was used with multiple samplers"; pinned by a test in `glow_backend/glsl.rs`). So
+  `state(uv)` + `state_linear(uv)` on the same texture, and `tex_linear` + `tex_nearest` on the
+  same user texture, cannot both be used in one effect on glow. Resolve in phases 3c / 4 before
+  writing the API: prefer exact reads via `textureLoad` (texelFetch, no sampler) for
+  pixel-exact / state access, so each texture keeps exactly ONE sampler; drop binding 7
+  (`fl_nearest_sampler`) if nothing needs it any more. Verify the translation with a glsl.rs test.
+- glow has no headless runtime test; a harness is phase 1b.

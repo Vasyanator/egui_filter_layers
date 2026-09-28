@@ -72,11 +72,15 @@ module names a backend type.
 //! |---|---|
 //! | `src(uv)` | the pass input (bilinear, clamped to the captured region) |
 //! | `src_px(offset)` | the input at `offset` physical pixels from the current pixel |
+//! | `original(uv)` | the untouched captured backdrop (before any pass), in every pass of the chain |
 //! | `params(i)` | parameter slot `i` (`0..16`) of the [`Pass`], a `vec4<f32>` |
 //! | `fl.texel` | size of one physical pixel in `uv` units |
 //! | `fl.size_px` | captured region size in physical pixels |
 //! | `fl.rect_uv` | the layer rect inside the capture (`xy` = min, `zw` = size), in `uv` units |
 //! | `fl.time` | seconds (egui input time); reading it makes the effect animated (see below) |
+//! | `fl.delta_time` | seconds since the previous frame: egui's `stable_dt` clamped to `0..=0.1` (offline: `OfflineOptions::with_delta_time`, or the video frame step) |
+//! | `fl.frame` | frame counter, `u32` (egui's `cumulative_frame_nr`, wrapping; offline: the video frame index) |
+//! | `fl.pointer` | the pointer: `xy` in `uv` units (outside `0..1` off the capture), `z` = 1 while the primary button is down, `w` = 1 when a pointer exists (`w = 0`: none, all zero) |
 //! | `fl.pixels_per_point` | physical pixels per layer point (egui's scale factor × the layer transform's zoom), to convert point distances to pixels |
 //! | `to_linear(c)`, `to_gamma(c)` | sRGB transfer functions on `rgb` (alpha untouched) |
 //! | `premultiply(c)`, `unpremultiply(c)`, `luma(rgb)` | colour helpers |
@@ -84,7 +88,10 @@ module names a backend type.
 //! An effect whose code reads `fl.time` is **animated**: painting a layer that uses it requests
 //! an egui repaint every frame, so it keeps moving in an otherwise idle app. The detection walks
 //! naga's IR (a real `fl.time` access, not a text match); override it with
-//! [`Effect::with_animated`].
+//! [`Effect::with_animated`]. Reading `fl.delta_time`, `fl.frame` or `fl.pointer` does **not**:
+//! pointer changes arrive with input, which repaints anyway, and an effect that must advance
+//! every frame on its own reads `fl.time` or is marked with [`Effect::with_animated`]. The three
+//! are per frame, not per layer: every layer painted in one frame sees the same values.
 //!
 //! Colours are **premultiplied-alpha, gamma-space** RGBA in and out. Names starting with `fl_`
 //! and the prelude names above are reserved. An effect cannot declare its own bindings or entry
@@ -166,4 +173,4 @@ pub use glow_backend::{destroy_glow, install_glow};
 #[cfg(feature = "wgpu")]
 pub use wgpu_backend::{WgpuOptions, install_wgpu};
 #[cfg(any(feature = "image", feature = "video"))]
-pub use offline::{AlphaMode, FrameRef, OfflineError, OfflineOptions, OfflineRenderer, RgbaFrame};
+pub use offline::{AlphaMode, FrameRef, OfflineError, OfflineOptions, OfflineRenderer, PointerState, RgbaFrame};

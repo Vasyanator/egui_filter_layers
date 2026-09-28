@@ -50,7 +50,7 @@ use super::resources::{GlError, ReadFormat, ReadFormatError, RenderTarget, Resol
 use crate::backend::LayerJob;
 use crate::effect::{BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_SOURCE_TEXTURE};
 use crate::geometry::{LayerGeometry, PxRect, layer_geometry, transform_scale};
-use crate::pass::{FrameUniforms, UNIFORM_BLOCK_SIZE};
+use crate::pass::{FrameUniforms, InputUniforms, UNIFORM_BLOCK_SIZE};
 use crate::plan::{Bindings, ChainPlan, Slot, SlotMappings, TextureMapping, composite_uniforms, plan, step_uniforms};
 
 /// Stand-in key for rejections that have no known format (no colour buffer, or a driver that
@@ -103,6 +103,8 @@ struct LayerRun<'a> {
     geometry: LayerGeometry,
     /// The job being painted.
     job: &'a LayerJob,
+    /// The job's per-frame input resolved for `geometry`'s capture (`fl.pointer` in capture uv).
+    input: InputUniforms,
     /// Screen size in physical pixels.
     screen: [i32; 2],
     /// The caller's bindings (the capture source and composite destination is `caller.draw`).
@@ -221,7 +223,8 @@ unsafe fn paint_saved(gl: &glow::Context, state: &mut GlowState, target: GlslTar
             return;
         };
         let screen = [i32::try_from(info.screen_size_px[0]).unwrap_or(i32::MAX), i32::try_from(info.screen_size_px[1]).unwrap_or(i32::MAX)];
-        let run = LayerRun { geometry, job, screen, caller, embedded: target != GlslTarget::Desktop330 };
+        let input = job.frame_input.resolve(info.pixels_per_point, geometry.capture);
+        let run = LayerRun { geometry, job, input, screen, caller, embedded: target != GlslTarget::Desktop330 };
 
         drain_errors(gl);
         let outcome = run_layer(gl, &mut resources, &run, &programs, diagnose);
@@ -513,7 +516,7 @@ unsafe fn bind_textures(gl: &glow::Context, resources: &Resources, bindings: Bin
 /// `gl` must be current on this thread; targets must be at least the capture size; `programs`
 /// matches `run.job.passes`; no GL error may be pending on entry.
 unsafe fn run_passes(gl: &glow::Context, resources: &Resources, run: &LayerRun<'_>, plan: &ChainPlan, maps: &SlotMappings, programs: &[glow::Program], diagnose: bool) -> Option<(usize, u32)> {
-    let frame = frame_uniforms(&run.geometry, run.job.time);
+    let frame = frame_uniforms(&run.geometry, run.job.time).with_input(&run.input);
     // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); targets are at least the capture size and `programs` matches `run.job.passes` (caller contract); all objects are alive on this context.
     unsafe {
         gl.bind_vertex_array(Some(resources.vertex_array));
@@ -546,7 +549,7 @@ unsafe fn run_passes(gl: &glow::Context, resources: &Resources, run: &LayerRun<'
 /// `gl` must be current on this thread; the passes of `plan` have run.
 unsafe fn composite(gl: &glow::Context, resources: &Resources, run: &LayerRun<'_>, plan: &ChainPlan, maps: &SlotMappings) {
     let geometry = &run.geometry;
-    let bytes = composite_uniforms(&frame_uniforms(geometry, run.job.time), plan, maps, geometry);
+    let bytes = composite_uniforms(&frame_uniforms(geometry, run.job.time).with_input(&run.input), plan, maps, geometry);
     let region = gl_rect(geometry.region, run.screen[1]);
     // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); the passes ran (caller contract), so the plan's composite source holds their output; all objects are alive on this context.
     unsafe {

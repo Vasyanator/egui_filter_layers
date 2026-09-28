@@ -5,12 +5,12 @@ WGSL sources compiled into the crate with `include_str!` (by `effect.rs`).
 
 ## Files
 - `prelude.wgsl`: prepended to every effect. Declares `FlUniforms` / `fl`, the WHOLE `@group(0)`
-  resource layout (bindings 0-3 and 5-7; 4 is left to a crate-appended block), the public helpers (`src`, `src_px`, `params`, colour helpers), and both entry points
+  resource layout (bindings 0-3 and 5-7; 4 is left to a crate-appended block), the public helpers (`src`, `src_px`, `original`, `params`, colour helpers), and both entry points
   (`fl_vertex`: attribute-less full-viewport triangle; `fl_fragment`: computes the fragment's
   capture uv with `fl_capture_uv` and calls the user's `effect`).
   It must stay BEFORE user code so snippet line numbers are a plain offset.
 - `composite.wgsl`: body of the internal write-back pass, `fl_composite(frag_uv)` (reads the
-  prelude's `fl_original_texture`, binding 3; params 0..2 = mask rect px, corner radii px, processed region in capture UV).
+  original capture through the prelude's `original()`, binding 3; params 0..2 = mask rect px, corner radii px, processed region in capture UV).
   In frag mode 0 the viewport is that region and the local uv maps through params[2]; in frag
   mode 1 `frag_uv` already is the capture uv. Helpers: `fl_composite_uv`, `fl_coverage` (snaps
   within 1/1024 of 0 / 1 to exactly 0 / 1), `fl_coverage_or_discard`. `effect.rs` appends one

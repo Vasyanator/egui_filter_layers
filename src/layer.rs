@@ -11,6 +11,8 @@ Key structures:
 
 Key functions:
 - `FilterLayer::paint()`.
+- `frame_input()`: the per-frame input (`fl.delta_time`, `fl.frame`, `fl.pointer`) read from the
+  context on the GUI thread.
 
 Notes:
 Never panics and never draws a fake: with no backend installed it logs one warning per
@@ -21,7 +23,7 @@ neither case requests repaints for animated chains.
 
 use egui::{Context, CornerRadius, Id, Painter, Rect};
 
-use crate::backend::{LayerJob, installed};
+use crate::backend::{FrameInput, LayerJob, PointerInput, installed};
 use crate::pass::FilterChain;
 
 /// Sets `ctx`'s "no backend installed" latch; returns whether it was unset (i.e. whether to warn).
@@ -44,6 +46,22 @@ fn warn_not_installed_once(ctx: &Context) {
              call egui_filter_layers::install_glow (or the wgpu installer) at startup. Layers draw nothing until then."
         );
     }
+}
+
+/// The per-frame input of `ctx`'s current pass: `stable_dt` clamped to
+/// `0..=FrameInput::MAX_DELTA_TIME` (non-finite reads as 0), `cumulative_frame_nr` truncated to
+/// its low 32 bits (wrapping, documented for `fl.frame`), and the latest pointer position (screen
+/// points) with the primary button state.
+fn frame_input(ctx: &Context) -> FrameInput {
+    // Read outside `ctx.input`: both take the context lock, which must not be re-entered.
+    let frame_nr = ctx.cumulative_frame_nr();
+    let frame = u32::try_from(frame_nr & u64::from(u32::MAX)).unwrap_or(0);
+    ctx.input(|input| {
+        let dt = input.stable_dt;
+        let delta_time = if dt.is_finite() { dt.clamp(0.0, FrameInput::MAX_DELTA_TIME) } else { 0.0 };
+        let pointer = input.pointer.latest_pos().map(|pos| PointerInput { pos, pressed: input.pointer.primary_down() });
+        FrameInput { delta_time, frame, pointer }
+    })
 }
 
 /// A filter applied to everything painted beneath `rect`.
@@ -124,8 +142,9 @@ impl FilterLayer {
         // precision for ~2.3 hours of uptime, which animated effects tolerate.
         #[allow(clippy::cast_possible_truncation)] // Intentional precision reduction, see above.
         let time = ctx.input(|input| input.time) as f32;
+        let frame_input = frame_input(ctx);
         let padding_points = self.chain.padding_points();
-        let job = LayerJob { rect: self.rect, corner_radius: self.corner_radius, passes: self.chain.into_passes(), padding_points, time };
+        let job = LayerJob { rect: self.rect, corner_radius: self.corner_radius, passes: self.chain.into_passes(), padding_points, time, frame_input };
         backend.paint_layer(painter, job);
     }
 }
@@ -196,6 +215,63 @@ mod tests {
         let (painted, repaint) = paint_animated_with(BackendStatus::Installed { backend: BackendKind::Glow });
         assert_eq!(painted, 1);
         assert!(repaint);
+    }
+
+    /// A backend that keeps the frame input of every job.
+    struct Recording {
+        inputs: std::sync::Mutex<Vec<FrameInput>>,
+    }
+
+    impl Backend for Recording {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Glow
+        }
+        fn status(&self) -> BackendStatus {
+            BackendStatus::Installed { backend: BackendKind::Glow }
+        }
+        fn failed_effects(&self) -> Vec<EffectFailure> {
+            Vec::new()
+        }
+        fn paint_layer(&self, _painter: &Painter, job: LayerJob) {
+            self.inputs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(job.frame_input);
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Headless runs: `delta_time` stays within `0..=0.1` whatever egui reports, `frame` counts
+    /// completed frames, and the pointer is the latest position (screen points) with the primary
+    /// button state.
+    #[test]
+    fn paint_captures_the_frame_input() {
+        let ctx = Context::default();
+        let backend = Arc::new(Recording { inputs: std::sync::Mutex::new(Vec::new()) });
+        register(&ctx, Arc::clone(&backend) as Arc<dyn Backend>);
+        let frames: [(f64, Vec<egui::Event>); 3] = [
+            (0.0, Vec::new()),
+            // A 5 s gap: egui's dt is large, the uniform is clamped.
+            (5.0, vec![egui::Event::PointerMoved(pos2(12.0, 7.0))]),
+            (5.016, vec![egui::Event::PointerButton { pos: pos2(12.0, 7.0), button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]),
+        ];
+        for (time, events) in frames {
+            let raw = egui::RawInput { time: Some(time), events, ..Default::default() };
+            let mut output = ctx.run_ui(raw, |ui| {
+                let painter = Painter::new(ui.ctx().clone(), LayerId::background(), Rect::EVERYTHING);
+                FilterLayer::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)), presets::gaussian_blur(1.0)).paint(&painter);
+            });
+            output.textures_delta.clear();
+        }
+        let inputs = backend.inputs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        // egui may run extra passes per frame; each pass paints once.
+        assert!(inputs.len() >= 3, "{inputs:?}");
+        assert!(inputs.iter().all(|input| (0.0..=FrameInput::MAX_DELTA_TIME).contains(&input.delta_time)), "{inputs:?}");
+        let (first, last) = (inputs[0], inputs[inputs.len() - 1]);
+        assert_eq!(first.frame, 0);
+        assert_eq!(first.pointer, None);
+        assert_eq!(last.frame, 2, "two frames completed before the third");
+        assert_eq!(last.pointer, Some(PointerInput { pos: pos2(12.0, 7.0), pressed: true }));
+        assert!(inputs.iter().any(|input| input.pointer == Some(PointerInput { pos: pos2(12.0, 7.0), pressed: false })), "the move frame: present, not pressed");
     }
 
     /// The "no backend installed" latch is per `Context`: set once per context, independent between contexts.

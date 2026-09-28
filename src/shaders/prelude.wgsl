@@ -2,11 +2,17 @@
 //
 // Public surface for effect authors (see the crate docs, "Writing an effect"):
 //   fl.rect_uv, fl.texel, fl.size_px, fl.time, fl.pixels_per_point,
-//   src(), src_px(), params(), to_linear(), to_gamma(), premultiply(),
+//   fl.delta_time, fl.frame, fl.pointer,
+//   src(), src_px(), original(), params(), to_linear(), to_gamma(), premultiply(),
 //   unpremultiply(), luma().
 // Every other `fl_*` / `internal_*` name, and every `fl` member not listed in the crate docs
-// (`delta_time`, `frame`, `pointer`, `pass_scale`, `pass_index` hold neutral values until they
-// are documented there), is private to the crate and may change.
+// (`pass_scale`, `pass_index` hold neutral values until they are documented there), is private
+// to the crate and may change.
+// Per-frame input (the same for every layer of a frame): `fl.delta_time` = seconds since the
+// previous frame (UI: egui's stable_dt clamped to 0..=0.1; offline: options / video frame times),
+// `fl.frame` = frame counter (u32, wrapping), `fl.pointer` = pointer in capture uv (`xy`, the
+// space of `uv`), primary button down (`z`, 0/1), present (`w`, 0/1; 0 = no pointer, xyz = 0).
+// Reading them does not make an effect animated (only `fl.time` does).
 // Coordinates: `uv` is (0, 0) at the top-left of the captured region, y down.
 // `fl.pixels_per_point`: physical pixels per LAYER point = egui's pixels_per_point times the
 // layer transform's scale (Scene zoom), so point distances follow the zoom like the padding does.
@@ -73,6 +79,12 @@ fn src(uv: vec2<f32>) -> vec4<f32> {
 
 fn src_px(offset_px: vec2<f32>) -> vec4<f32> {
     return src(fl_frag_uv + offset_px * fl.texel);
+}
+
+// The untouched capture (the backdrop before any pass), in every pass and the composite: the
+// plan binds the capture at `fl_original_texture` for every draw, mapped by `internal_aux_*`.
+fn original(uv: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(fl_original_texture, fl_sampler, fl_storage_uv(uv, fl.internal_aux_scale, fl.internal_aux_offset), 0.0);
 }
 
 fn params(i: u32) -> vec4<f32> {

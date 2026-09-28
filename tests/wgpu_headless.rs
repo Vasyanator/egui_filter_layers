@@ -10,6 +10,7 @@
 //! texture view formats, the documented GL / WebGL2 gap). The composite's alpha channel and its
 //! partly covered edge are checked over a transparent frame against CPU references, and the
 //! rounded-corner scene runs in MSAA / depth / stencil passes (pipeline-pass compatibility).
+//! `original(uv)` after passes that changed the image must give the backdrop back in every pass.
 //!
 //! Needs a GPU adapter (Vulkan, Metal, DX12 or GL), so it is ignored by default:
 //! `cargo test --all-features -- --ignored`.
@@ -20,7 +21,7 @@ use std::sync::Arc;
 
 use egui::{Align2, Color32, ColorImage, FontId, Pos2, Rect, TextureOptions, pos2, vec2};
 use egui::emath::TSTransform;
-use egui_filter_layers::{BackendStatus, Effect, FilterLayer, Pass, WgpuOptions, install_wgpu, presets};
+use egui_filter_layers::{BackendStatus, Effect, FilterChain, FilterLayer, Pass, WgpuOptions, install_wgpu, presets};
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 128;
@@ -473,4 +474,103 @@ fn the_composite_blends_alpha_like_colour() {
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn the_composite_blends_alpha_like_colour_on_an_srgb_target() {
     run_alpha(wgpu::TextureFormat::Rgba8UnormSrgb);
+}
+
+/// A pass built from `source` (panics on invalid WGSL: test effects are fixed).
+fn pass_of(label: &str, source: &str) -> Pass {
+    match Effect::new(label, source) {
+        Ok(effect) => Pass::new(&effect),
+        Err(error) => panic!("{label}: {error}"),
+    }
+}
+
+/// F1: `original(uv)` reads the unfiltered backdrop in EVERY pass, whatever earlier passes did to
+/// the image: `invert -> original` and `invert -> invert -> original` give the backdrop back, and
+/// a pass reading both `src` (inverted) and `original` sees `src + original = 1`. A large layer
+/// runs first, so the smaller one after it runs in grown (larger than its capture) textures,
+/// where the capture's storage mapping differs from 1.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn original_reads_the_backdrop_in_every_pass() {
+    let (ctx, state, texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let original = pass_of("original", "fn effect(uv: vec2<f32>) -> vec4<f32> { return original(uv); }");
+    let sum = pass_of("sum", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(abs(src(uv).rgb + original(uv).rgb - vec3<f32>(1.0)), 1.0); }");
+    let invert = || FilterChain::from(presets::invert(1.0));
+    let chains = [("invert, original", invert().then(original.clone()), false), ("invert, invert, original", invert().then(invert()).then(original.clone()), false), ("invert, sum", invert().then(sum), true)];
+    let large = Rect::from_min_max(pos2(2.0, 2.0), pos2(254.0, 126.0));
+    let small = Rect::from_min_max(pos2(20.0, 20.0), pos2(150.0, 100.0));
+    for (name, chain, black) in &chains {
+        for rect in [large, small] {
+            let mut paint = |ui: &mut egui::Ui| {
+                let painter = ui.painter();
+                painter.rect_filled(Rect::from_min_max(pos2(0.0, 0.0), pos2(128.0, 128.0)), 0.0, Color32::RED);
+                painter.rect_filled(Rect::from_min_max(pos2(128.0, 0.0), pos2(256.0, 128.0)), 0.0, Color32::BLUE);
+                painter.rect_filled(Rect::from_min_max(pos2(60.0, 60.0), pos2(80.0, 80.0)), 0.0, Color32::from_rgb(128, 64, 32));
+                painter.image(texture.id(), Rect::from_min_max(pos2(24.0, 24.0), pos2(40.0, 40.0)), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+                FilterLayer::new(rect, chain.clone()).paint(painter);
+            };
+            render_frame(&ctx, &state, &target, &mut paint);
+            let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+            assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+            let what = |point: &str| format!("{name}, layer {rect:?}: {point}");
+            let expect = |colour: [u8; 3]| if *black { [0, 0, 0] } else { colour };
+            assert_near(&pixels, 100, 50, expect([255, 0, 0]), &what("red"));
+            assert_near(&pixels, 140, 50, expect([0, 0, 255]), &what("blue"));
+            assert_near(&pixels, 70, 70, expect([128, 64, 32]), &what("mid-tone"));
+            assert_near(&pixels, 30, 30, expect([0, 255, 0]), &what("user texture"));
+            assert_near(&pixels, 21, 21, expect([255, 0, 0]), &what("top-left corner (orientation)"));
+            assert_near(&pixels, 148, 98, expect([0, 0, 255]), &what("bottom-right corner (orientation)"));
+        }
+    }
+}
+
+/// Runs one egui frame with `events` and nothing painted, only to change egui's input state
+/// (the pointer persists into later frames); any texture upload goes to the renderer so later
+/// frames stay consistent.
+fn feed_input(ctx: &egui::Context, state: &egui_wgpu::RenderState, events: Vec<egui::Event>) {
+    let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(256.0, 128.0))), events, ..Default::default() };
+    let mut output = ctx.run_ui(input, |_| {});
+    {
+        let mut renderer = state.renderer.write();
+        for (id, deltas) in &output.textures_delta.set {
+            for delta in deltas {
+                renderer.update_texture(&state.device, &state.queue, *id, delta);
+            }
+        }
+    }
+    output.textures_delta.clear();
+}
+
+/// F2 in the UI: an effect writing `fl.pointer` sees the pointer in capture uv with the pressed /
+/// present flags, and one writing `fl.delta_time` / `fl.frame` sees egui's `stable_dt` (1/60 s
+/// for frames without a time, clamped to 0.1) and a counter that advances per frame.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn effects_see_the_pointer_and_the_frame_counters() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let pointer = pass_of("pointer", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(fl.pointer.x, fl.pointer.y, fl.pointer.z, 1.0) * fl.pointer.w + vec4<f32>(0.0, 0.0, 0.0, 1.0 - fl.pointer.w); }");
+    // Capture = region = (32, 16) .. (160, 80) pixels at 1 pixel per point (no padding).
+    let rect = Rect::from_min_max(pos2(32.0, 16.0), pos2(160.0, 80.0));
+    let mut paint_pointer = |ui: &mut egui::Ui| FilterLayer::new(rect, pointer.clone()).paint(ui.painter());
+    render_frame(&ctx, &state, &target, &mut paint_pointer);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint_pointer);
+    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert_near(&pixels, 64, 40, [0, 0, 0], "no pointer yet: w = 0");
+
+    // Screen point (64, 32) = capture uv ((64 - 32) / 128, (32 - 16) / 64) = (0.25, 0.25).
+    feed_input(&ctx, &state, vec![egui::Event::PointerMoved(pos2(64.0, 32.0))]);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint_pointer);
+    assert_near(&pixels, 64, 40, [64, 64, 0], "hovering pointer at uv (0.25, 0.25)");
+    feed_input(&ctx, &state, vec![egui::Event::PointerButton { pos: pos2(64.0, 32.0), button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint_pointer);
+    assert_near(&pixels, 100, 70, [64, 64, 255], "pressed pointer: z = 1");
+
+    // `fl.delta_time * 60` = 1 for egui's default 1/60 s step; `fl.frame` mod 2 alternates.
+    let counters = pass_of("counters", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(fl.delta_time * 60.0, f32(fl.frame % 2u), 0.0, 1.0); }");
+    let mut paint_counters = |ui: &mut egui::Ui| FilterLayer::new(rect, counters.clone()).paint(ui.painter());
+    let (first, _) = render_frame(&ctx, &state, &target, &mut paint_counters);
+    let (second, _) = render_frame(&ctx, &state, &target, &mut paint_counters);
+    let [first, second] = [rgb(&first, 64, 40), rgb(&second, 64, 40)];
+    assert!(first[0] >= 252 && second[0] >= 252, "delta_time = 1/60 s: {first:?} {second:?}");
+    assert!(first[1].abs_diff(second[1]) >= 252, "fl.frame advances by one per frame: {first:?} {second:?}");
 }

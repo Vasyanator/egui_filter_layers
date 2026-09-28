@@ -306,6 +306,8 @@ impl FilterCallback {
             // The whole capture; its pixel (0, 0) is at the capture's screen position.
             window: ChainWindow::whole(&rec.geometry, [capture.x, capture.y]),
             time: self.job.time,
+            // The pointer relative to this capture, at the callback's pixels per point.
+            input: self.job.frame_input.resolve(rec.pixels_per_point, rec.geometry.capture),
             passes: &self.job.passes,
             pipelines,
         };

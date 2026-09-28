@@ -11,8 +11,7 @@ here: every GPU pass is recorded by `wgpu_backend::chain` (`ChainResources::reco
 Key structures:
 - `OfflineRenderer` (public): device, queue, chain objects, frame textures and readback buffer,
   reused across calls (a video processes every frame through one renderer).
-- `OfflineOptions` (public): pixels per point, time, background, corner radius, output alpha,
-  tile size limit (default `DEFAULT_MAX_TILE_SIZE`).
+- `OfflineOptions`, `PointerState` (public, `options.rs`): the settings of a run.
 
 Key functions:
 - `OfflineRenderer::new()` / `from_render_state()` / `headless_async()` / `headless()` (native).
@@ -78,6 +77,7 @@ mapped.
 
 mod error;
 mod frame;
+mod options;
 #[cfg(feature = "image")]
 mod image;
 mod readback;
@@ -85,13 +85,14 @@ mod tiles;
 #[cfg(feature = "video")]
 pub mod video;
 
-use egui::{Color32, CornerRadius, Rect, pos2};
+use egui::{Rect, pos2};
 
 pub use error::OfflineError;
 pub use frame::{AlphaMode, FrameRef, RgbaFrame};
+pub use options::{OfflineOptions, PointerState};
 
 use crate::geometry::{LayerGeometry, PxRect, layer_geometry, padding_px};
-use crate::pass::FilterChain;
+use crate::pass::{FilterChain, InputUniforms};
 use crate::wgpu_backend::chain::{ChainJob, ChainRecording, ChainResources, ChainSource, ChainTargets, ChainWindow, draw_composite};
 use crate::wgpu_backend::gpu::{ErrorScopes, begin_pass};
 use frame::{MAX_SIDE, convert_output, frame_bytes};
@@ -110,123 +111,6 @@ const TILE_OVERLAP_MARGIN_PX: u32 = 1;
 /// GPU memory of one run to about 450 MiB (RGBA8 source and output, two RGBA16F intermediates, the
 /// readback buffer) instead of scaling with the device limit (about 7 GiB at 16384 pixels).
 pub const DEFAULT_MAX_TILE_SIZE: u32 = 4096;
-
-/// Settings of one offline run. Build with [`OfflineOptions::default`] and the `with_*` methods.
-#[derive(Clone, Debug, PartialEq)]
-pub struct OfflineOptions {
-    /// Image pixels per layer point (see [`OfflineOptions::with_pixels_per_point`]).
-    pixels_per_point: f32,
-    /// `fl.time`, seconds.
-    time: f32,
-    /// Colour the frame is drawn over before filtering; `None` = transparent.
-    background: Option<Color32>,
-    /// Rounded mask of the layer (the frame's corners), in layer points.
-    corner_radius: CornerRadius,
-    /// Alpha convention of the result.
-    output_alpha: AlphaMode,
-    /// Largest texture side used; `None` = the device limit (see [`DEFAULT_MAX_TILE_SIZE`]).
-    max_tile_size: Option<u32>,
-}
-
-impl Default for OfflineOptions {
-    fn default() -> Self {
-        Self { pixels_per_point: 1.0, time: 0.0, background: None, corner_radius: CornerRadius::ZERO, output_alpha: AlphaMode::Straight, max_tile_size: Some(DEFAULT_MAX_TILE_SIZE) }
-    }
-}
-
-impl OfflineOptions {
-    /// Image pixels per layer point (default 1): how many frame pixels one layer point spans, which
-    /// converts effect distances, sample radii and corner radii (all in points) to pixels. The
-    /// value that makes the export look like the editor depends on how the editor zooms:
-    ///
-    /// * The image is painted into a larger or smaller rect (the layer covers that rect, no layer
-    ///   transform): one image pixel spans `N` screen pixels at egui scale factor `ppp`, and a
-    ///   point spans `ppp` screen pixels, so the match is `ppp / N` (bit-exact only for `N = 1`).
-    /// * The zoom is a layer transform (e.g. `egui::Scene`), with the image painted 1:1 in layer
-    ///   points: distances scale with the transform together with the image, so the match is the
-    ///   UI's `ppp` itself, whatever the zoom.
-    #[must_use]
-    pub fn with_pixels_per_point(mut self, pixels_per_point: f32) -> Self {
-        self.pixels_per_point = pixels_per_point;
-        self
-    }
-
-    /// `fl.time` in seconds (default 0): the frame's presentation time for a video.
-    #[must_use]
-    pub fn with_time(mut self, seconds: f32) -> Self {
-        self.time = seconds;
-        self
-    }
-
-    /// Draws the frame over `color` before filtering (default: transparent). Match the UI's
-    /// backdrop (canvas colour) for translucent images, or give an opaque colour to get an
-    /// opaque result for formats without alpha.
-    #[must_use]
-    pub fn with_background(mut self, color: Option<Color32>) -> Self {
-        self.background = color;
-        self
-    }
-
-    /// Rounds the layer's corners (layer points), like [`FilterLayer::corner_radius`](crate::FilterLayer::corner_radius):
-    /// outside the mask the unfiltered frame is kept.
-    #[must_use]
-    pub fn with_corner_radius(mut self, radius: impl Into<CornerRadius>) -> Self {
-        self.corner_radius = radius.into();
-        self
-    }
-
-    /// Alpha convention of the result (default [`AlphaMode::Straight`], what image and video
-    /// encoders expect; the chain itself produces premultiplied colour).
-    #[must_use]
-    pub fn with_output_alpha(mut self, alpha: AlphaMode) -> Self {
-        self.output_alpha = alpha;
-        self
-    }
-
-    /// Caps the texture side of a run (default [`DEFAULT_MAX_TILE_SIZE`]; `None` = the device's
-    /// `max_texture_dimension_2d`). The side is further limited by the device (texture limit, and
-    /// `max_buffer_size` for the readback). Larger frames are processed in overlapping tiles:
-    /// identical to one whole-frame run for effects sampling at texel centres (every preset
-    /// except `ripple`, `lens` and `gaussian_blur` above `sigma * pixels_per_point = 32 / 3`);
-    /// effects sampling between texel centres may differ by at most two 8-bit steps on a few
-    /// values, because hardware bilinear weights depend on the texture size. Pass `None` for a
-    /// frame the UI shows untiled (up to the UI device's texture limit) when that matters more
-    /// than bounded GPU memory.
-    #[must_use]
-    pub fn with_max_tile_size(mut self, pixels: Option<u32>) -> Self {
-        self.max_tile_size = pixels;
-        self
-    }
-
-    /// Image pixels per layer point.
-    #[must_use]
-    pub fn pixels_per_point(&self) -> f32 {
-        self.pixels_per_point
-    }
-
-    /// `fl.time` in seconds.
-    #[must_use]
-    pub fn time(&self) -> f32 {
-        self.time
-    }
-
-    /// Background colour, if any.
-    #[must_use]
-    pub fn background(&self) -> Option<Color32> {
-        self.background
-    }
-
-    /// Checks the numeric options.
-    fn validate(&self) -> Result<(), OfflineError> {
-        if !(self.pixels_per_point.is_finite() && self.pixels_per_point > 0.0) {
-            return Err(OfflineError::InvalidOption { option: "pixels_per_point", reason: format!("must be finite and positive, got {}", self.pixels_per_point) });
-        }
-        if !self.time.is_finite() {
-            return Err(OfflineError::InvalidOption { option: "time", reason: format!("must be finite, got {}", self.time) });
-        }
-        Ok(())
-    }
-}
 
 /// Runs filter chains over frames on a wgpu device and reads the results back.
 ///
@@ -410,7 +294,7 @@ impl OfflineRenderer {
         self.ensure_allocations(&plan).await?;
 
         for tile in &plan.tiles {
-            let run = TileRun { tile: *tile, geometry, image_width: size[0], time: options.time };
+            let run = TileRun { tile: *tile, geometry, image_width: size[0], time: options.time, input: options.input_uniforms(&geometry) };
             let (layout, errors) = self.record_tile(&run, pixels, chain, &pipelines)?;
             if let Some(error) = errors.await {
                 // Textures or the readback buffer may now be invalid objects: recreate them next run.
@@ -527,6 +411,7 @@ impl OfflineRenderer {
                 // The tile's output rect lands at the output texture's origin.
                 window: ChainWindow { rect: window, composite_origin: [-out.x, -out.y], min_target_size: targets.alloc },
                 time: run.time,
+                input: run.input,
                 passes: chain.passes(),
                 pipelines,
             };
@@ -561,6 +446,8 @@ struct TileRun {
     image_width: u32,
     /// `fl.time`.
     time: f32,
+    /// `fl.delta_time`, `fl.frame`, `fl.pointer` (the whole frame's; every tile uses the same).
+    input: InputUniforms,
 }
 
 /// The layer geometry of a whole `size` frame: the layer rect covers the frame (in points at

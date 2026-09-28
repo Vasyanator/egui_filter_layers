@@ -150,6 +150,7 @@ Prelude available to every effect:
 |---|---|
 | `src(uv)` | pass input, bilinear, clamped to the captured region |
 | `src_px(offset)` | input at `offset` physical pixels from the current pixel |
+| `original(uv)` | the untouched captured backdrop (before any pass), readable in every pass |
 | `params(i)` | `vec4<f32>` parameter slot `i` (`0..16`) of the pass |
 | `fl.texel`, `fl.size_px` | one pixel in `uv` units; capture size in pixels |
 | `fl.rect_uv` | the layer rect inside the capture (`xy` min, `zw` size) |

@@ -7,7 +7,7 @@ beneath a rect through a chain of WGSL filter passes, on pluggable GPU backends.
 ## Architecture
 ```text
 user code ──► FilterLayer::paint (layer.rs)
-                 │  resolves FilterChain -> LayerJob (rect, mask, passes, padding, time, layer_id)
+                 │  resolves FilterChain -> LayerJob (rect, mask, passes, padding, time, frame_input)
                  ▼
           backend registry plugin (backend.rs)       ──►  Arc<dyn Backend>
                  │                                         ├─ glow_backend/  (feature "glow")
@@ -48,11 +48,12 @@ user code ──► FilterLayer::paint (layer.rs)
   output, viewport, fragment offset; the composite), `TextureMapping::of` (the one storage-uv
   formula), `step_uniforms` / `composite_uniforms` (every block a backend uploads).
 - `geometry.rs`: `layer_geometry` — region / capture / UV / mask math (pure, unit-tested);
-  `LayerGeometry::composite_params` (the composite pass's parameter block, every backend).
+  `LayerGeometry::composite_params` (the composite pass's parameter block, every backend);
+  `pointer_uniform` (the one screen-points -> capture-uv conversion of `fl.pointer`).
 - `layer.rs`: `FilterLayer` and its `paint` (skips a missing or failed backend; requests a
-  repaint for animated chains only when the backend is usable).
+  repaint for animated chains only when the backend is usable; reads the per-frame input).
 - `backend.rs`: crate-internal `Backend` trait, `LayerJob` (backend-neutral: rect, mask, passes,
-  padding, time), registry (`register`, `installed`, `uninstall`; a hook-less egui plugin, so it
+  padding, time, `FrameInput`), registry (`register`, `installed`, `uninstall`; a hook-less egui plugin, so it
   lives in the `Context` and survives `Memory` resets), public `status`, `failed_effects`,
   `BackendStatus`, `EffectFailure`, `InstallError`.
 - `presets.rs`: built-in effects (compiled once in `OnceLock`s) and their constructors.
@@ -70,11 +71,21 @@ user code ──► FilterLayer::paint (layer.rs)
   built-in WGSL, which tests exclude.
 - `FlUniforms` byte layout: `pass::offsets` must match the WGSL struct (pinned by a naga-layout test).
   Members without a producer yet hold neutral values set in `FrameUniforms::for_layer`.
+- Per-frame input (`fl.delta_time`, `fl.frame`, `fl.pointer`): read on the GUI thread in
+  `FilterLayer::paint` into `LayerJob::frame_input` (per context, not per layer: every layer of a
+  frame sees the same values; `stable_dt` clamped to `0..=0.1`, `cumulative_frame_nr` wrapping to
+  `u32`, pointer in screen points). Backends resolve it at paint time with the callback's pixels
+  per point (`FrameInput::resolve` -> `pass::InputUniforms`, pointer via
+  `geometry::pointer_uniform` into capture uv — no layer transform needed, the capture is in
+  screen pixels) and add it with `FrameUniforms::with_input`. Offline: `OfflineOptions`
+  (`with_delta_time` / `with_frame` / `with_pointer`), the video processor's frame clock fills
+  unset counters. Only `fl.time` makes an effect animated.
 - Bindings in `@group(0)`, all declared by the prelude and bound for EVERY draw (effects and the
   composite share one layout): 0 = `fl`, 1 = pass input, 2 = linear sampler, 3 = original
   capture, 4 = a crate-appended uniform block, 5 = state, 6 = mask coverage, 7 = nearest sampler.
   A binding a draw does not use gets a neutral dummy (transparent / white texture, zero buffer);
-  today only the composite binds a real original. The interface check accepts only these
+  every pass and the composite bind the capture as the original (`original()`, mapped by the
+  capture's own `internal_aux_*`). The interface check accepts only these
   prelude declarations (`effect::PRELUDE_RESOURCES`): a snippet declares no binding at all.
 - Wiring has one owner: backends never decide which slot a draw reads, which mapping or
   fragment offset it uploads; they call `plan.rs` (glow and wgpu blocks are byte-identical but for

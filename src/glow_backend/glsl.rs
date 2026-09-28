@@ -204,6 +204,18 @@ mod tests {
     }
 
     #[test]
+    fn an_effect_reading_the_original_translates_with_two_texture_units() {
+        let snippet = "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) - original(uv); }";
+        let Ok(effect) = Effect::new("original", snippet) else { panic!("must validate") };
+        for target in TARGETS {
+            match translate(effect.module(), target) {
+                Ok(program) => check_program("original", &program, target, &[0, 1]),
+                Err(error) => panic!("original {target:?}: {error}"),
+            }
+        }
+    }
+
+    #[test]
     fn texture_units_follow_the_group0_layout() {
         assert_eq!(texture_unit(BINDING_SOURCE_TEXTURE, Some(BINDING_SAMPLER)), Some(0));
         assert_eq!(texture_unit(BINDING_ORIGINAL_TEXTURE, Some(BINDING_SAMPLER)), Some(1));

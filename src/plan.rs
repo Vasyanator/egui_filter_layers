@@ -23,9 +23,11 @@ Key functions:
 
 Notes:
 Pass `i` reads the capture (i = 0) or pass `i - 1`'s output and writes `Ping` (even i) / `Pong`
-(odd i); the composite reads the last output as `src` and the capture as the original. Only the
-composite binds the original today; every other texture binding of the layout (state, coverage)
-is the backend's dummy. Backend-specific uniform flags (`flip_y`, fragment mode) stay in the
+(odd i); the composite reads the last output as `src`. EVERY draw (each pass and the composite)
+binds the capture as the original (`original(uv)`, prelude), mapped with the capture's own
+storage mapping (`internal_aux_*`), which may differ from the ping-pong `src` mapping (grow-only
+targets of other sizes). Every other texture binding of the layout (state, coverage) is the
+backend's dummy. Backend-specific uniform flags (`flip_y`, fragment mode) stay in the
 `FrameUniforms` each backend passes in.
 */
 
@@ -48,8 +50,9 @@ pub(crate) enum Slot {
 pub(crate) struct Bindings {
     /// Bound at `fl_src_texture` (`src()`).
     pub src: Slot,
-    /// Bound at `fl_original_texture`; `None` = a transparent dummy (its `internal_aux_*` mapping
-    /// then keeps the frame's identity value).
+    /// Bound at `fl_original_texture` (`original()`): the plan binds [`Slot::Source`] for every
+    /// draw. `None` = a transparent dummy (its `internal_aux_*` mapping then keeps the frame's
+    /// identity value); no current plan produces it.
     pub original: Option<Slot>,
 }
 
@@ -102,7 +105,8 @@ pub(crate) fn plan(pass_count: usize, window: PxRect, composite_origin: [i32; 2]
     let steps = (0..pass_count)
         .map(|index| PassStep {
             pass: index,
-            bindings: Bindings { src: if index == 0 { Slot::Source } else { output_of(index - 1) }, original: None },
+            // Every pass may read the untouched capture through `original()` (F1).
+            bindings: Bindings { src: if index == 0 { Slot::Source } else { output_of(index - 1) }, original: Some(Slot::Source) },
             output: output_of(index),
             used_px: window.size(),
             frag_offset: pass_frag_offset,
@@ -231,7 +235,7 @@ mod tests {
         let writes: Vec<Slot> = plan.steps.iter().map(|step| step.output).collect();
         assert_eq!(reads, [Slot::Source, Slot::Ping, Slot::Pong]);
         assert_eq!(writes, [Slot::Ping, Slot::Pong, Slot::Ping]);
-        assert!(plan.steps.iter().enumerate().all(|(index, step)| step.pass == index && step.bindings.original.is_none() && step.used_px == [100, 50]));
+        assert!(plan.steps.iter().enumerate().all(|(index, step)| step.pass == index && step.used_px == [100, 50]));
         assert_eq!(plan.composite.bindings, Bindings { src: Slot::Ping, original: Some(Slot::Source) });
         assert_eq!(plan.composite.frag_offset.map(f32::to_bits), [-4.0_f32, -8.0].map(f32::to_bits));
         assert_eq!(plan.steps[0].frag_offset.map(f32::to_bits), [16.0_f32, 32.0].map(f32::to_bits));
@@ -256,7 +260,10 @@ mod tests {
         assert!(holds(&blocks[0], offsets::SRC_SCALE, [0.5, 0.25]) && holds(&blocks[0], offsets::SRC_OFFSET, [0.125, 0.0]));
         assert!(holds(&blocks[1], offsets::SRC_SCALE, [0.75, 0.75]) && holds(&blocks[1], offsets::SRC_OFFSET, [0.25, 0.5]));
         assert!(holds(&blocks[2], offsets::SRC_SCALE, [1.0, 0.5]) && holds(&blocks[2], offsets::SRC_OFFSET, [0.0, 0.25]));
-        assert!(holds(&blocks[2], offsets::AUX_SCALE, [3.0, 3.0]), "a dummy original keeps the frame's aux mapping");
+        // Every pass maps its original through the SOURCE's mapping, not its `src` slot's.
+        assert!(blocks.iter().all(|block| holds(block, offsets::AUX_SCALE, [0.5, 0.25]) && holds(block, offsets::AUX_OFFSET, [0.125, 0.0])));
+        let dummy = draw_uniforms(&frame, Bindings { src: Slot::Ping, original: None }, [0.0; 2], &maps, passes[0].params());
+        assert!(holds(&dummy, offsets::AUX_SCALE, [3.0, 3.0]), "a dummy original keeps the frame's aux mapping");
         assert!(holds(&blocks[2], offsets::PARAMS, [2.0, 2.0]));
         assert!(holds(&blocks[1], offsets::FRAG_OFFSET, [16.0, 32.0]));
 
@@ -275,6 +282,26 @@ mod tests {
         assert!(holds(&composite, offsets::AUX_SCALE, [0.5, 0.25]) && holds(&composite, offsets::AUX_OFFSET, [0.125, 0.0]));
         assert!(holds(&composite, offsets::PARAMS + 2 * 16, [9.0, 9.0]), "composite params slot 2 = region uv");
         assert!(holds(&composite, offsets::FRAG_OFFSET, [-4.0, -8.0]));
+    }
+
+    /// F1: every draw of every plan binds the untouched capture as its original, so `original()`
+    /// reads the backdrop in any pass, whatever `src` is at that point of the chain.
+    #[test]
+    fn every_step_binds_the_capture_as_its_original() {
+        for pass_count in 1..=5 {
+            for window in [PxRect { x: 0, y: 0, w: 64, h: 32 }, PxRect { x: 16, y: 8, w: 7, h: 9 }] {
+                let Some(plan) = plan(pass_count, window, [3, 5]) else { panic!("{pass_count} passes over a non-empty window") };
+                assert_eq!(plan.steps.len(), pass_count);
+                assert!(plan.steps.iter().all(|step| step.bindings.original == Some(Slot::Source)), "{pass_count} passes: every step maps the original");
+                assert_eq!(plan.composite.bindings.original, Some(Slot::Source));
+            }
+        }
+    }
+
+    #[test]
+    fn original_is_a_prelude_helper() {
+        let snippet = "fn effect(uv: vec2<f32>) -> vec4<f32> { return mix(src(uv), original(uv), 0.5); }";
+        assert!(Effect::new("original", snippet).is_ok(), "the interface check accepts `original()`");
     }
 
     #[test]

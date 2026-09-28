@@ -8,6 +8,8 @@ Key structures:
 - `Backend` (crate-internal trait): what a GPU backend must provide. Each backend module
   (`glow_backend`, and the `wgpu` backend) implements it; core code never names a backend type.
 - `LayerJob` (crate-internal): one `FilterLayer::paint` call, resolved for the backend.
+- `FrameInput` / `PointerInput` (crate-internal): the per-frame input a layer reads on the GUI
+  thread (`fl.delta_time`, `fl.frame`, `fl.pointer`), resolved per capture by `FrameInput::resolve`.
 - `BackendKind`, `BackendStatus`, `EffectFailure`, `InstallError` (public).
 
 Key functions:
@@ -25,9 +27,10 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use egui::{Context, CornerRadius, Painter, Rect};
+use egui::{Context, CornerRadius, Painter, Pos2, Rect};
 
-use crate::pass::Pass;
+use crate::geometry::{PxRect, pointer_uniform};
+use crate::pass::{InputUniforms, Pass};
 
 /// Which GPU backend a status refers to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -134,6 +137,45 @@ pub(crate) struct LayerJob {
     pub padding_points: f32,
     /// egui input time in seconds at paint time, for `fl.time`.
     pub time: f32,
+    /// Per-frame input read at paint time (`fl.delta_time`, `fl.frame`, `fl.pointer`).
+    pub frame_input: FrameInput,
+}
+
+/// The pointer as the GUI thread saw it when the layer was painted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PointerInput {
+    /// Position in screen points (egui's global, untransformed input coordinates).
+    pub pos: Pos2,
+    /// Whether the primary button is down.
+    pub pressed: bool,
+}
+
+/// The per-frame input of one layer, captured on the GUI thread (`FilterLayer::paint`) and
+/// resolved against the capture at paint time (`resolve`). Per context, not per layer: every
+/// layer painted in one frame sees the same values. `Default` = no input (0 s, frame 0, no pointer).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct FrameInput {
+    /// Seconds since the previous frame (`fl.delta_time`): egui's `stable_dt`, clamped to
+    /// `0..=0.1` (a non-finite value reads as 0).
+    pub delta_time: f32,
+    /// `Context::cumulative_frame_nr` truncated to its low 32 bits (`fl.frame`, wrapping).
+    pub frame: u32,
+    /// The pointer, `None` when egui has none (off the window; a released touch).
+    pub pointer: Option<PointerInput>,
+}
+
+impl FrameInput {
+    /// The largest `fl.delta_time` in the UI, seconds: a frame after a long idle sleep would
+    /// otherwise make simulations jump.
+    pub(crate) const MAX_DELTA_TIME: f32 = 0.1;
+
+    /// The input members of the uniform block for a capture `capture` on a screen of
+    /// `pixels_per_point` (the paint callback's), through the one conversion
+    /// `geometry::pointer_uniform`.
+    #[must_use]
+    pub(crate) fn resolve(&self, pixels_per_point: f32, capture: PxRect) -> InputUniforms {
+        InputUniforms { delta_time: self.delta_time, frame: self.frame, pointer: pointer_uniform(self.pointer.map(|pointer| (pointer.pos, pointer.pressed)), pixels_per_point, capture) }
+    }
 }
 
 /// The crate-internal backend boundary.
