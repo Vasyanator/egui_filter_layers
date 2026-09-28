@@ -12,7 +12,7 @@ Key structures:
 - `ReadFormat`: the colour format of the framebuffer being captured, and the renderbuffer format
   a multisample resolve must use to match it (GLES 3 / WebGL2 require identical formats).
 - `ResolveTarget`: renderbuffer + framebuffer for that resolve, reallocated on format change.
-- `Resources`: the shared set (VAO, uniform buffer, capture / resolve / ping-pong targets,
+- `Resources`: the shared set (VAO, `fl` and named-parameter uniform buffers, capture / resolve / ping-pong targets,
   composite program, dummy textures and the nearest sampler object for the texture units a draw
   leaves unused, cached default-framebuffer format).
 
@@ -56,6 +56,8 @@ const UNIFORM_BLOCK_SIZE_I32: i32 = {
 
 /// Uniform-buffer binding point used for the `fl` block. `egui_glow` uses no uniform buffers.
 pub(super) const UNIFORM_BINDING_POINT: u32 = 0;
+/// Uniform-buffer binding point of the named-parameter block (`p: Params`, WGSL binding 4).
+pub(super) const PARAMS_BINDING_POINT: u32 = UNIFORM_BINDING_POINT + 1;
 
 /// A failure of a GL object operation. Resource-level failures latch the whole backend; program
 /// failures latch only the effect that caused them.
@@ -453,6 +455,9 @@ pub(super) struct Resources {
     pub vertex_array: glow::VertexArray,
     /// The `fl` uniform buffer (re-filled per pass).
     pub uniform_buffer: glow::Buffer,
+    /// The named-parameter uniform buffer (re-specified per draw with that draw's block, whose
+    /// size varies by effect).
+    pub params_buffer: glow::Buffer,
     /// 8-bit copy of the backdrop.
     pub capture: RenderTarget,
     /// Screen-sized renderbuffer for resolving a multisampled framebuffer (format matched to it);
@@ -516,6 +521,7 @@ impl Resources {
         unsafe {
             gl.delete_vertex_array(self.vertex_array);
             gl.delete_buffer(self.uniform_buffer);
+            gl.delete_buffer(self.params_buffer);
             self.capture.destroy(gl);
             if let Some(resolve) = self.resolve {
                 resolve.destroy(gl);
@@ -537,6 +543,7 @@ struct Partial {
     composite: Option<glow::Program>,
     vertex_array: Option<glow::VertexArray>,
     uniform_buffer: Option<glow::Buffer>,
+    params_buffer: Option<glow::Buffer>,
     capture: Option<RenderTarget>,
     ping: Option<RenderTarget>,
     pong: Option<RenderTarget>,
@@ -558,6 +565,8 @@ impl Partial {
             self.uniform_buffer = Some(buffer);
             gl.bind_buffer(glow::UNIFORM_BUFFER, Some(buffer));
             gl.buffer_data_size(glow::UNIFORM_BUFFER, UNIFORM_BLOCK_SIZE_I32, glow::DYNAMIC_DRAW);
+            // Sized per draw by `glBufferData` (`render.rs`); only the name is created here.
+            self.params_buffer = Some(gl.create_buffer().map_err(|detail| GlError::CreateResource { resource: "uniform buffer", detail })?);
             gl.bind_buffer(glow::UNIFORM_BUFFER, None);
 
             let mut capture = RenderTarget::create(gl, TargetFormat::Rgba8)?;
@@ -585,12 +594,13 @@ impl Partial {
                 gl.sampler_parameter_i32(sampler, name, gl_i32(value));
             }
 
-            match (self.composite.take(), self.vertex_array.take(), self.uniform_buffer.take(), self.capture.take(), self.ping.take(), self.pong.take(), self.transparent.take(), self.white.take(), self.nearest_sampler.take()) {
-                (Some(composite), Some(vertex_array), Some(uniform_buffer), Some(capture), Some(first), Some(second), Some(transparent), Some(white), Some(nearest_sampler)) => {
+            match (self.composite.take(), self.vertex_array.take(), self.uniform_buffer.take(), self.params_buffer.take(), self.capture.take(), self.ping.take(), self.pong.take(), self.transparent.take(), self.white.take(), self.nearest_sampler.take()) {
+                (Some(composite), Some(vertex_array), Some(uniform_buffer), Some(params_buffer), Some(capture), Some(first), Some(second), Some(transparent), Some(white), Some(nearest_sampler)) => {
                     let max_size = [glow::MAX_TEXTURE_SIZE, glow::MAX_RENDERBUFFER_SIZE].into_iter().map(|limit| gl.get_parameter_i32(limit)).filter(|limit| *limit > 0).min().unwrap_or(i32::MAX);
                     Ok(Resources {
                         vertex_array,
                         uniform_buffer,
+                        params_buffer,
                         capture,
                         resolve: None,
                         max_size,
@@ -648,7 +658,7 @@ impl Partial {
             if let Some(vertex_array) = self.vertex_array.take() {
                 gl.delete_vertex_array(vertex_array);
             }
-            if let Some(buffer) = self.uniform_buffer.take() {
+            for buffer in [self.uniform_buffer.take(), self.params_buffer.take()].into_iter().flatten() {
                 gl.delete_buffer(buffer);
             }
             for target in [self.capture.take(), self.ping.take(), self.pong.take()].into_iter().flatten() {
@@ -664,8 +674,9 @@ impl Partial {
     }
 }
 
-/// Compiles and links a translated program, binds its `fl` block to [`UNIFORM_BINDING_POINT`]
-/// and its samplers to their texture units.
+/// Compiles and links a translated program, binds its `fl` block to [`UNIFORM_BINDING_POINT`],
+/// its named-parameter block (if any) to [`PARAMS_BINDING_POINT`] and its samplers to their
+/// texture units.
 ///
 /// Leaves no program bound.
 ///
@@ -708,10 +719,12 @@ pub(super) unsafe fn build_program(gl: &glow::Context, glsl: &GlslProgram) -> Re
 
         // GLSL 330 / ES 300 have no `layout(binding = N)`, so block and sampler bindings are
         // program state set once here (they persist for the program's lifetime).
-        if let Some(block) = &glsl.uniform_block
-            && let Some(index) = gl.get_uniform_block_index(program, block)
-        {
-            gl.uniform_block_binding(program, index, UNIFORM_BINDING_POINT);
+        for (block, point) in [(&glsl.uniform_block, UNIFORM_BINDING_POINT), (&glsl.params_block, PARAMS_BINDING_POINT)] {
+            if let Some(block) = block
+                && let Some(index) = gl.get_uniform_block_index(program, block)
+            {
+                gl.uniform_block_binding(program, index, point);
+            }
         }
         gl.use_program(Some(program));
         for (name, unit) in &glsl.samplers {

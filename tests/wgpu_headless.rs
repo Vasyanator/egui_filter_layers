@@ -26,8 +26,17 @@ use egui_filter_layers::{BackendStatus, Effect, FilterChain, FilterLayer, Pass, 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 128;
 
+/// Serializes Vulkan instance / device creation across the parallel tests of this file: the
+/// Vulkan loader with the Khronos validation layer (enabled by wgpu in debug builds) crashed
+/// (SIGSEGV inside `libvulkan` / `libVkLayer_khronos_validation`, in `vkCreateInstance` and
+/// `vkEnumerateInstanceExtensionProperties`) when ~14 tests created instances concurrently on
+/// Mesa radv. Test-only; the rendering itself still runs in parallel.
+static GPU_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Device, queue and adapter of any available GPU, or `None` with the reason printed.
 fn gpu() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    // A panicking test cannot corrupt `()`, so a poisoned lock is still usable.
+    let _serialized = GPU_INIT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) {
         Ok(adapter) => adapter,
@@ -573,4 +582,53 @@ fn effects_see_the_pointer_and_the_frame_counters() {
     let [first, second] = [rgb(&first, 64, 40), rgb(&second, 64, 40)];
     assert!(first[0] >= 252 && second[0] >= 252, "delta_time = 1/60 s: {first:?} {second:?}");
     assert!(first[1].abs_diff(second[1]) >= 252, "fl.frame advances by one per frame: {first:?} {second:?}");
+}
+
+/// A named-parameter effect (F4) exercising every scalar kind, a vector after an array, and an
+/// indexed array: `mix(src, color, amount) * tint * gain + lights[which] * (offset + 1)`.
+const NAMED_PARAMS_WGSL: &str = "struct Params {
+    color: vec4<f32>,
+    amount: f32,
+    which: u32,
+    offset: i32,
+    lights: array<vec4<f32>, 3>,
+    tint: vec3<f32>,
+    gain: f32,
+}
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let base = mix(src(uv), p.color, p.amount);
+    return vec4<f32>(base.rgb * p.tint * p.gain + p.lights[p.which].rgb * f32(p.offset + 1), 1.0);
+}";
+
+/// The chain `a -> invert -> b` of [`NAMED_PARAMS_WGSL`] passes with different values, so each
+/// pass must get its own block (and the invert the empty one). Over red it gives
+/// `(64, 96, 64)`, over blue `(128, 96, 0)`.
+fn named_params_chain() -> FilterChain {
+    let effect = Effect::new("named", NAMED_PARAMS_WGSL).unwrap_or_else(|error| panic!("{error}"));
+    let a = Pass::new(&effect).with("color", [0.0, 1.0, 0.0, 1.0]).and_then(|pass| pass.with("amount", 0.5)).and_then(|pass| pass.with("which", 2_u32)).and_then(|pass| pass.with("offset", 0)).and_then(|pass| pass.with("tint", [1.0, 0.5, 1.0])).and_then(|pass| pass.with("gain", 1.0));
+    let mut a = a.unwrap_or_else(|error| panic!("{error}"));
+    a.set_slice("lights", &[[9.0_f32; 4], [9.0; 4], [0.0, 0.0, 0.5, 0.0]]).unwrap_or_else(|error| panic!("{error}"));
+    let b = Pass::new(&effect).with("tint", [1.0, 1.0, 1.0]).and_then(|pass| pass.with("gain", 0.5)).unwrap_or_else(|error| panic!("{error}"));
+    FilterChain::from(a).then(presets::invert(1.0)).then(b)
+}
+
+/// F4: named parameters reach the shader at naga's layout, per pass, through binding 4.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn named_params_reach_each_pass() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let chain = named_params_chain();
+    let mut paint = |ui: &mut egui::Ui| {
+        let painter = ui.painter();
+        painter.rect_filled(Rect::from_min_max(pos2(0.0, 0.0), pos2(128.0, 128.0)), 0.0, Color32::RED);
+        painter.rect_filled(Rect::from_min_max(pos2(128.0, 0.0), pos2(256.0, 128.0)), 0.0, Color32::BLUE);
+        FilterLayer::new(Rect::from_min_max(pos2(20.0, 20.0), pos2(236.0, 108.0)), chain.clone()).paint(painter);
+    };
+    render_frame(&ctx, &state, &target, &mut paint);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(egui_filter_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&ctx));
+    assert_near(&pixels, 60, 60, [64, 96, 64], "named params over red");
+    assert_near(&pixels, 200, 60, [128, 96, 0], "named params over blue");
+    assert_near(&pixels, 10, 10, [255, 0, 0], "outside the layer");
 }

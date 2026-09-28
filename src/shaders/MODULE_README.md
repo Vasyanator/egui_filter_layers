@@ -5,7 +5,8 @@ WGSL sources compiled into the crate with `include_str!` (by `effect.rs`).
 
 ## Files
 - `prelude.wgsl`: prepended to every effect. Declares `FlUniforms` / `fl`, the WHOLE `@group(0)`
-  resource layout (bindings 0-3 and 5-7; 4 is left to a crate-appended block), the public helpers (`src`, `src_px`, `original`, `params`, colour helpers), and both entry points
+  resource layout (bindings 0-3 and 5-7; 4 is the named-parameter block `p: Params`, which
+  `effect/` appends AFTER a snippet declaring `struct Params`), the public helpers (`src`, `src_px`, `original`, `params`, colour helpers), and both entry points
   (`fl_vertex`: attribute-less full-viewport triangle; `fl_fragment`: computes the fragment's
   capture uv with `fl_capture_uv` and calls the user's `effect`).
   It must stay BEFORE user code so snippet line numbers are a plain offset.

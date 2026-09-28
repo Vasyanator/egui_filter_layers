@@ -87,6 +87,27 @@ fn cases() -> Vec<Case> {
     let custom = Pass::new(&custom).with_param(0, [3.0, 0.0, 0.0, 0.0]).unwrap_or_else(|error| panic!("{error}"));
     // F1: `original()` after a pass that changed the image gives the backdrop back.
     let original = Pass::new(&Effect::new("original", "fn effect(uv: vec2<f32>) -> vec4<f32> { return original(uv); }").unwrap_or_else(|error| panic!("{error}")));
+    // F4: named parameters per pass (binding 4), with a plain pass between two named ones.
+    let named = Effect::new(
+        "named",
+        "struct Params {
+    color: vec4<f32>,
+    amount: f32,
+    which: u32,
+    offset: i32,
+    lights: array<vec4<f32>, 3>,
+    tint: vec3<f32>,
+    gain: f32,
+}
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let base = mix(src(uv), p.color, p.amount);
+    return vec4<f32>(base.rgb * p.tint * p.gain + p.lights[p.which].rgb * f32(p.offset + 1), 1.0);
+}",
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let mut named_a = Pass::new(&named).with("color", [0.0, 1.0, 0.0, 1.0]).and_then(|pass| pass.with("amount", 0.5)).and_then(|pass| pass.with("which", 2_u32)).and_then(|pass| pass.with("tint", [1.0, 0.5, 1.0])).and_then(|pass| pass.with("gain", 1.0)).unwrap_or_else(|error| panic!("{error}"));
+    named_a.set_slice("lights", &[[9.0_f32; 4], [9.0; 4], [0.0, 0.0, 0.5, 0.0]]).unwrap_or_else(|error| panic!("{error}"));
+    let named_b = Pass::new(&named).with("tint", [1.0, 1.0, 1.0]).and_then(|pass| pass.with("gain", 0.5)).unwrap_or_else(|error| panic!("{error}"));
     let case = |name, chain, radius, gain, continuous| Case { name, chain, radius, gain, continuous };
     vec![
         case("brightness_contrast", presets::brightness_contrast(0.1, 1.3).into(), 0, 1.3, false),
@@ -108,6 +129,7 @@ fn cases() -> Vec<Case> {
         case("custom", custom.into(), 0, 1.0, true),
         case("blur+invert, rounded", presets::gaussian_blur(2.0).then(presets::invert(1.0)), 12, 1.0, false),
         case("original_passthrough", FilterChain::from(presets::invert(1.0)).then(original), 0, 1.0, false),
+        case("named_params", FilterChain::from(named_a).then(presets::invert(1.0)).then(named_b), 0, 1.0, false),
     ]
 }
 

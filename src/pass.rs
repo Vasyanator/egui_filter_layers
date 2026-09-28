@@ -2,9 +2,10 @@
 File: pass.rs
 
 Purpose:
-The per-frame description of a filter: a `Pass` is an `Effect` plus its 16 `vec4` parameters
-(and an optional sample-radius override); a `FilterChain` is an ordered list of passes run
-ping-pong. Also owns the byte layout of the `fl` uniform block shared by all backends.
+The per-frame description of a filter: a `Pass` is an `Effect` plus its 16 anonymous `vec4`
+parameters, its named-parameter block (`struct Params`, typed access by member name) and an
+optional sample-radius override; a `FilterChain` is an ordered list of passes run ping-pong. Also
+owns the byte layout of the `fl` uniform block shared by all backends.
 
 Key structures:
 - `Pass`, `FilterChain`, `ParamIndexError` (public).
@@ -13,6 +14,9 @@ Key structures:
   `fl.pointer`) of one run, already resolved for its capture.
 
 Key functions:
+- `Pass::set()` / `set_slice()` / `get()` / `get_slice()`: typed named parameters, checked
+  against the effect's `ParamLayout` (unknown name, type or length -> `ParamError`); the bytes
+  are stored in the effect's layout, ready for binding 4 (`plan::params_block`).
 - `FrameUniforms::for_layer()`: the one place the per-layer uniforms are derived from geometry;
   `FrameUniforms::with_input()` adds the per-frame input members.
 - `pack_uniforms()`: serializes one draw's uniforms into the exact std140 / WGSL-uniform layout
@@ -20,7 +24,7 @@ Key functions:
   Which texture mapping and fragment offset each draw gets is decided by `plan.rs`, not here.
 */
 
-use crate::effect::{Effect, sanitize_radius};
+use crate::effect::{Effect, ParamError, ParamInfo, ParamValue, element_range, sanitize_radius};
 use crate::geometry::{LayerGeometry, px_f32};
 
 /// Number of `vec4<f32>` parameter slots a pass has (`params(0)` .. `params(15)`).
@@ -38,21 +42,110 @@ pub struct ParamIndexError {
 }
 
 /// One filter pass: an [`Effect`] and the parameter values it sees this frame.
+///
+/// Two kinds of parameters, usable side by side: the untyped block of [`PARAM_SLOTS`] `vec4`s
+/// (`params(i)` in WGSL; [`Pass::with_param`]) and — preferred — the typed members of the
+/// effect's `struct Params` (`p.<name>` in WGSL; [`Pass::set`], [`Pass::with`]).
 #[derive(Clone, Debug)]
 pub struct Pass {
     /// The effect run by this pass.
     effect: Effect,
     /// Values returned by `params(i)` in WGSL.
     params: Params,
+    /// The effect's `struct Params` block (`p` in WGSL), laid out by `ParamLayout`; its length is
+    /// the layout's padded `block_size` (empty when the effect declares no named parameters).
+    named: Vec<u8>,
     /// Overrides the effect's default sample radius when set.
     sample_radius_points: Option<f32>,
 }
 
 impl Pass {
-    /// A pass running `effect` with all parameters zero.
+    /// A pass running `effect` with all parameters (anonymous and named) zero.
     #[must_use]
     pub fn new(effect: &Effect) -> Self {
-        Self { effect: effect.clone(), params: [[0.0; 4]; PARAM_SLOTS], sample_radius_points: None }
+        Self { effect: effect.clone(), params: [[0.0; 4]; PARAM_SLOTS], named: vec![0; effect.param_layout().block_size], sample_radius_points: None }
+    }
+
+    /// The named parameter `name` of this pass's effect.
+    fn named_field(&self, name: &str) -> Result<&ParamInfo, ParamError> {
+        self.effect.param(name).ok_or_else(|| ParamError::Unknown { effect: self.effect.label().to_owned(), name: name.to_owned() })
+    }
+
+    /// Sets the named parameter `name` (a member of the effect's `struct Params`, read in WGSL as
+    /// `p.name`). The value's type must be the member's exactly: `1.0` for `f32`, `1` for `i32`,
+    /// `1u32` for `u32`, `[f32; N]` for `vecN<f32>`, `[[f32; 4]; 4]` (columns) for `mat4x4<f32>`.
+    ///
+    /// # Errors
+    /// [`ParamError::Unknown`] (no such member), [`ParamError::Type`] (other type),
+    /// [`ParamError::Array`] (an array member: use [`Pass::set_slice`]). The pass is unchanged.
+    pub fn set(&mut self, name: &str, value: impl Into<ParamValue>) -> Result<(), ParamError> {
+        let value = value.into();
+        let field = self.named_field(name)?;
+        if field.is_array {
+            return Err(ParamError::Array { name: name.to_owned(), count: field.count });
+        }
+        if field.ty != value.ty() {
+            return Err(ParamError::Type { name: name.to_owned(), expected: field.ty, given: value.ty() });
+        }
+        if let Some(range) = element_range(field, 0, self.named.len()) {
+            value.write(&mut self.named[range]);
+        }
+        Ok(())
+    }
+
+    /// [`Pass::set`] by value, for building passes in one expression.
+    ///
+    /// # Errors
+    /// As [`Pass::set`].
+    pub fn with(mut self, name: &str, value: impl Into<ParamValue>) -> Result<Self, ParamError> {
+        self.set(name, value)?;
+        Ok(self)
+    }
+
+    /// Sets the first `values.len()` elements of the named parameter `name` (an array member,
+    /// or a plain member as a one-element array) and ZEROES the remaining elements, so a shorter
+    /// list never leaves stale values behind.
+    ///
+    /// # Errors
+    /// [`ParamError::Unknown`], [`ParamError::Type`] (any value of another type),
+    /// [`ParamError::Length`] (more values than elements). The pass is unchanged.
+    pub fn set_slice<V: Into<ParamValue> + Copy>(&mut self, name: &str, values: &[V]) -> Result<(), ParamError> {
+        let field = self.named_field(name)?;
+        if values.len() > usize::try_from(field.count).unwrap_or(usize::MAX) {
+            return Err(ParamError::Length { name: name.to_owned(), expected: field.count, given: values.len() });
+        }
+        if let Some(wrong) = values.iter().map(|&value| value.into().ty()).find(|&ty| ty != field.ty) {
+            return Err(ParamError::Type { name: name.to_owned(), expected: field.ty, given: wrong });
+        }
+        let field = field.clone();
+        for index in 0..field.count {
+            let value = usize::try_from(index).ok().and_then(|index| values.get(index)).map_or_else(|| ParamValue::zero(field.ty), |&value| value.into());
+            if let Some(range) = element_range(&field, index, self.named.len()) {
+                value.write(&mut self.named[range]);
+            }
+        }
+        Ok(())
+    }
+
+    /// The value of the plain (non-array) named parameter `name`, or `None` when the effect has
+    /// no such member or it is an array (see [`Pass::get_slice`]).
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<ParamValue> {
+        let field = self.effect.param(name).filter(|field| !field.is_array)?;
+        ParamValue::read(field.ty, self.named.get(element_range(field, 0, self.named.len())?)?)
+    }
+
+    /// Every element of the named parameter `name` (one for a plain member), or `None` when the
+    /// effect has no such member.
+    #[must_use]
+    pub fn get_slice(&self, name: &str) -> Option<Vec<ParamValue>> {
+        let field = self.effect.param(name)?;
+        (0..field.count).map(|index| ParamValue::read(field.ty, self.named.get(element_range(field, index, self.named.len())?)?)).collect()
+    }
+
+    /// The named-parameter block as uploaded at binding 4 (empty without `struct Params`).
+    pub(crate) fn named_params(&self) -> &[u8] {
+        &self.named
     }
 
     /// Sets parameter slot `index` (read in WGSL as `params(index)`).
@@ -427,7 +520,7 @@ pub(crate) fn pack_uniforms(frame: &FrameUniforms, params: &Params) -> [u8; UNIF
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::PRELUDE_WGSL;
+    use crate::effect::{PRELUDE_WGSL, ParamType};
 
     fn read_f32(bytes: &[u8], offset: usize) -> f32 {
         let mut raw = [0_u8; 4];
@@ -582,6 +675,73 @@ mod tests {
         assert!(pass.clone().with_param(15, [1.0; 4]).is_ok());
         assert_eq!(pass.clone().with_param(16, [1.0; 4]).err(), Some(ParamIndexError { index: 16 }));
         assert_eq!(pass.param(16), None);
+    }
+
+    fn named_effect() -> Effect {
+        let snippet = "struct Params { gain: f32, count: u32, offset: i32, dir: vec2<f32>, tint: vec3<f32>, color: vec4<f32>, xf: mat4x4<f32>, lights: array<vec4<f32>, 3> }
+fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * p.color * p.gain; }";
+        match Effect::new("named", snippet) {
+            Ok(effect) => effect,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    #[test]
+    fn named_params_are_typed_and_stored_at_their_offsets() {
+        let effect = named_effect();
+        let mut pass = Pass::new(&effect);
+        assert_eq!(pass.named_params().len(), effect.param_layout().block_size);
+        assert!(pass.named_params().iter().all(|&byte| byte == 0), "starts zeroed");
+        let matrix = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0]];
+        let set = pass.set("gain", 1.5).and_then(|()| pass.set("count", 7_u32)).and_then(|()| pass.set("offset", -3)).and_then(|()| pass.set("dir", [0.5, -0.5])).and_then(|()| pass.set("tint", [0.25, 0.5, 0.75]));
+        let set = set.and_then(|()| pass.set("color", [1.0, 0.0, 0.5, 1.0])).and_then(|()| pass.set("xf", matrix));
+        assert_eq!(set, Ok(()));
+        assert_eq!(pass.get("gain"), Some(ParamValue::F32(1.5)));
+        assert_eq!(pass.get("count"), Some(ParamValue::U32(7)));
+        assert_eq!(pass.get("offset"), Some(ParamValue::I32(-3)));
+        assert_eq!(pass.get("tint"), Some(ParamValue::Vec3([0.25, 0.5, 0.75])));
+        assert_eq!(pass.get("xf"), Some(ParamValue::Mat4(matrix)));
+        // The bytes land where the effect's layout (naga's) says.
+        let bytes = pass.named_params();
+        for info in effect.params().iter().filter(|info| !info.is_array) {
+            let Some(value) = pass.get(&info.name) else { panic!("{}", info.name) };
+            let start = usize::try_from(info.offset).unwrap_or(0);
+            assert_eq!(ParamValue::read(info.ty, &bytes[start..]), Some(value), "{}", info.name);
+        }
+        assert!((read_f32(bytes, usize::try_from(effect.param("xf").map_or(0, |info| info.offset)).unwrap_or(0) + 4 * 4) - 5.0).abs() < f32::EPSILON, "matrix columns are consecutive vec4s");
+    }
+
+    #[test]
+    fn named_param_errors_leave_the_pass_unchanged() {
+        let effect = named_effect();
+        let mut pass = Pass::new(&effect).with("gain", 2.0).unwrap_or_else(|error| panic!("{error}"));
+        let before = pass.named_params().to_vec();
+        assert_eq!(pass.set("nope", 1.0), Err(ParamError::Unknown { effect: "named".to_owned(), name: "nope".to_owned() }));
+        assert_eq!(pass.set("gain", 1), Err(ParamError::Type { name: "gain".to_owned(), expected: ParamType::F32, given: ParamType::I32 }));
+        assert_eq!(pass.set("count", 1), Err(ParamError::Type { name: "count".to_owned(), expected: ParamType::U32, given: ParamType::I32 }));
+        assert_eq!(pass.set("lights", [1.0; 4]), Err(ParamError::Array { name: "lights".to_owned(), count: 3 }));
+        assert_eq!(pass.set_slice("lights", &[[1.0_f32; 4]; 4]), Err(ParamError::Length { name: "lights".to_owned(), expected: 3, given: 4 }));
+        assert_eq!(pass.set_slice("lights", &[ParamValue::Vec4([1.0; 4]), ParamValue::F32(1.0)]), Err(ParamError::Type { name: "lights".to_owned(), expected: ParamType::Vec4, given: ParamType::F32 }));
+        assert_eq!(pass.named_params(), &before[..]);
+        let Ok(plain) = Effect::new("plain", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }") else { panic!("identity must compile") };
+        assert!(matches!(Pass::new(&plain).set("gain", 1.0), Err(ParamError::Unknown { .. })), "no struct Params: every name is unknown");
+        assert!(Pass::new(&plain).named_params().is_empty());
+    }
+
+    #[test]
+    fn set_slice_writes_a_prefix_and_zeroes_the_rest() {
+        let effect = named_effect();
+        let mut pass = Pass::new(&effect);
+        assert_eq!(pass.set_slice("lights", &[[1.0_f32; 4], [2.0; 4], [3.0; 4]]), Ok(()));
+        assert_eq!(pass.set_slice("lights", &[[9.0_f32; 4]]), Ok(()));
+        assert_eq!(pass.get_slice("lights"), Some(vec![ParamValue::Vec4([9.0; 4]), ParamValue::Vec4([0.0; 4]), ParamValue::Vec4([0.0; 4])]));
+        assert_eq!(pass.get("lights"), None, "an array is read with get_slice");
+        // A plain member is a one-element array for set_slice / get_slice.
+        assert_eq!(pass.set_slice("gain", &[4.0_f32]), Ok(()));
+        assert_eq!(pass.get_slice("gain"), Some(vec![ParamValue::F32(4.0)]));
+        assert!(matches!(pass.set_slice("gain", &[1.0_f32, 2.0]), Err(ParamError::Length { expected: 1, given: 2, .. })));
+        let stride = effect.param("lights").map_or(0, |info| info.stride);
+        assert_eq!(stride, 16);
     }
 
     #[test]

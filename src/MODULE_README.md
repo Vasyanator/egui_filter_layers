@@ -38,15 +38,18 @@ user code ──► FilterLayer::paint (layer.rs)
 
 ## Files and submodules
 - `lib.rs`: crate docs (semantics, prelude table, backend matrix), re-exports, lints.
-- `effect.rs`: `Effect`, `EffectError` (+ accessors), prelude assembly, naga validation,
+- `effect/`: `Effect`, `EffectError` (+ accessors), prelude assembly, naga validation,
   snippet-relative diagnostics (`codespan-reporting`), interface check (bindings, entry points,
-  `override`), conservative `fl.time` detection (animated effects), internal composite modules
-  (gamma / linear output), binding constants.
-- `pass.rs`: `Pass`, `FilterChain`, `PARAM_SLOTS`, uniform block layout (`offsets`, `pack_uniforms`),
+  `override`), conservative `fl.time` detection (animated effects), named parameters
+  (`struct Params` detection and layout, `ParamType` / `ParamInfo` / `ParamValue` /
+  `ParamError`), internal composite modules, binding constants (see its readme).
+- `pass.rs`: `Pass` (anonymous `params(i)` block and typed named parameters: `set` / `with` /
+  `set_slice` / `get`), `FilterChain`, `PARAM_SLOTS`, uniform block layout (`offsets`, `pack_uniforms`),
   `FrameUniforms::for_layer` (the per-layer uniform values every backend uploads).
 - `plan.rs`: backend-neutral wiring of one chain run — `plan()` (steps: bindings by `Slot`,
   output, viewport, fragment offset; the composite), `TextureMapping::of` (the one storage-uv
-  formula), `step_uniforms` / `composite_uniforms` (every block a backend uploads).
+  formula), `step_uniforms` / `composite_uniforms` / `params_block` / `composite_params_block`
+  (every block a backend uploads, at bindings 0 and 4).
 - `geometry.rs`: `layer_geometry` — region / capture / UV / mask math (pure, unit-tested);
   `LayerGeometry::composite_params` (the composite pass's parameter block, every backend);
   `pointer_uniform` (the one screen-points -> capture-uv conversion of `fl.pointer`).
@@ -82,7 +85,9 @@ user code ──► FilterLayer::paint (layer.rs)
   unset counters. Only `fl.time` makes an effect animated.
 - Bindings in `@group(0)`, all declared by the prelude and bound for EVERY draw (effects and the
   composite share one layout): 0 = `fl`, 1 = pass input, 2 = linear sampler, 3 = original
-  capture, 4 = a crate-appended uniform block, 5 = state, 6 = mask coverage, 7 = nearest sampler.
+  capture, 4 = the named-parameter block `p: Params` (appended by the crate after a snippet that
+  declares `struct Params`; every draw binds `plan::params_block`, 16 zero bytes without one),
+  5 = state, 6 = mask coverage, 7 = nearest sampler.
   A binding a draw does not use gets a neutral dummy (transparent / white texture, zero buffer);
   every pass and the composite bind the capture as the original (`original()`, mapped by the
   capture's own `internal_aux_*`). The interface check accepts only these
@@ -112,6 +117,8 @@ user code ──► FilterLayer::paint (layer.rs)
 ## Editing map
 - New preset: add the WGSL constant + entry in `BUILTIN_EFFECTS` + constructor in `presets.rs`.
 - New prelude helper or uniform: `shaders/prelude.wgsl`, then `pass.rs` offsets/packing and tests.
+- Named parameters (accepted types, layout, errors): `effect/params.rs`; storage and typed
+  setters: `pass.rs`; which bytes each draw binds: `plan.rs`.
 - A new texture a draw reads, a new kind of step, per-step sizes: `plan.rs` first, then each
   backend's slot -> object mapping (wgpu `chain.rs`, glow `render.rs` + `glsl.rs` units).
 - New backend: implement `backend::Backend` in a feature-gated module, add its `install_*` API,

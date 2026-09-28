@@ -17,7 +17,8 @@ Notes:
 Writer flags are EMPTY on purpose: `ADJUST_COORDINATE_SPACE` (naga's default) would flip clip-space
 y, but the crate's coordinate convention is identical on every backend and the GL storage flip is
 handled in the prelude's `src()` (`internal_flip_y`). Uniform-block and sampler names are taken
-from naga's `ReflectionInfo`, never guessed.
+from naga's `ReflectionInfo`, never guessed: the `fl` block (binding 0) and, for effects with
+`struct Params`, the named-parameter block (binding 4) are found by their `@binding`.
 Texture units (`texture_unit`): GLSL combines texture and sampler, so a unit is chosen per
 `(texture binding, sampler binding)` pair of the prelude's `@group(0)` layout — the texture's
 position in `GROUP0_TEXTURE_BINDINGS` through the linear sampler (or with no sampler), that plus
@@ -28,7 +29,7 @@ texture read through two samplers in one module ("A image was used with multiple
 
 use naga::back::glsl;
 
-use crate::effect::{BINDING_COVERAGE_TEXTURE, BINDING_NEAREST_SAMPLER, BINDING_ORIGINAL_TEXTURE, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, CompiledModule, FRAGMENT_ENTRY, VERTEX_ENTRY};
+use crate::effect::{BINDING_COVERAGE_TEXTURE, BINDING_NEAREST_SAMPLER, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, CompiledModule, FRAGMENT_ENTRY, VERTEX_ENTRY};
 
 /// The prelude's `@group(0)` texture bindings; a texture's index here is its texture unit when
 /// read through the linear sampler (`render.rs` binds units in this same order).
@@ -95,6 +96,8 @@ pub(crate) struct GlslProgram {
     pub fragment: String,
     /// Name of the `fl` uniform block in the fragment shader, if the fragment uses it.
     pub uniform_block: Option<String>,
+    /// Name of the named-parameter block (`p: Params`, binding 4), if the fragment uses it.
+    pub params_block: Option<String>,
     /// `(sampler uniform name, texture unit)` pairs to set once after linking.
     pub samplers: Vec<(String, u32)>,
 }
@@ -143,7 +146,9 @@ pub(crate) fn translate(compiled: &CompiledModule, target: GlslTarget) -> Result
 
     let binding_of = |handle: naga::Handle<naga::GlobalVariable>| compiled.module.global_variables[handle].binding.as_ref().map(|b| b.binding);
 
-    let uniform_block = reflection.uniforms.iter().find(|(handle, _)| binding_of(**handle) == Some(BINDING_UNIFORMS)).map(|(_, name)| name.clone());
+    let block_at = |binding: u32| reflection.uniforms.iter().find(|(handle, _)| binding_of(**handle) == Some(binding)).map(|(_, name)| name.clone());
+    let uniform_block = block_at(BINDING_UNIFORMS);
+    let params_block = block_at(BINDING_PARAMS);
 
     let mut samplers = Vec::with_capacity(reflection.texture_mapping.len());
     for (name, mapping) in &reflection.texture_mapping {
@@ -151,7 +156,7 @@ pub(crate) fn translate(compiled: &CompiledModule, target: GlslTarget) -> Result
         samplers.push((name.clone(), unit));
     }
     samplers.sort_by_key(|(_, unit)| *unit);
-    Ok(GlslProgram { vertex, fragment, uniform_block, samplers })
+    Ok(GlslProgram { vertex, fragment, uniform_block, params_block, samplers })
 }
 
 #[cfg(test)]
@@ -213,6 +218,29 @@ mod tests {
                 Err(error) => panic!("original {target:?}: {error}"),
             }
         }
+    }
+
+    /// F4: an effect with `struct Params` translates to a program with TWO uniform blocks, each
+    /// found by its binding; the texture units are unchanged.
+    #[test]
+    fn a_named_params_effect_translates_with_two_blocks() {
+        let snippet = "struct Params { color: vec4<f32>, lights: array<vec4<f32>, 4>, gain: f32, count: u32 }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * p.color * p.gain + p.lights[p.count]; }";
+        let effect = Effect::new("named", snippet);
+        let Ok(effect) = effect else { panic!("{effect:?}") };
+        for target in TARGETS {
+            match translate(effect.module(), target) {
+                Ok(program) => {
+                    check_program("named", &program, target, &[0]);
+                    let Some(block) = &program.params_block else { panic!("{target:?}: the params block must be reflected\n{}", program.fragment) };
+                    assert_ne!(Some(block), program.uniform_block.as_ref(), "two distinct blocks");
+                    assert!(program.fragment.contains(block.as_str()) && program.fragment.contains("std140"), "{target:?}\n{}", program.fragment);
+                }
+                Err(error) => panic!("named {target:?}: {error}"),
+            }
+        }
+        // Without `struct Params` there is no second block.
+        let Ok(plain) = Effect::new("plain", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }") else { panic!("must validate") };
+        assert!(translate(plain.module(), GlslTarget::Es300).is_ok_and(|program| program.params_block.is_none()));
     }
 
     #[test]

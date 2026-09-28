@@ -3,8 +3,9 @@ File: plan.rs
 
 Purpose:
 The single, backend-neutral owner of HOW a chain is wired: which texture every draw of a run
-reads at each binding, which one it writes, its viewport, and the complete uniform block it
-uploads (storage-uv mappings, fragment offsets, parameters). Backends (wgpu `chain.rs`, glow
+reads at each binding, which one it writes, its viewport, and the complete uniform blocks it
+uploads (binding 0: storage-uv mappings, fragment offsets, anonymous parameters; binding 4: the
+named-parameter block). Backends (wgpu `chain.rs`, glow
 `render.rs`) only create objects, bind the texture a `Slot` names, upload the bytes produced here
 and draw; they make no wiring decision of their own.
 
@@ -20,6 +21,8 @@ Key functions:
 - `plan()`: the draws of a run over a window of the capture.
 - `TextureMapping::of()`: the ONE formula for a texture's storage-uv mapping.
 - `step_uniforms()` / `composite_uniforms()`: the full `FlUniforms` block of one draw.
+- `params_block()` / `composite_params_block()`: the bytes bound at binding 4 (`p: Params`) for a
+  step / the composite; `EMPTY_PARAMS_BLOCK` (16 zero bytes) when a module declares none.
 
 Notes:
 Pass `i` reads the capture (i = 0) or pass `i - 1`'s output and writes `Ping` (even i) / `Pong`
@@ -215,6 +218,25 @@ pub(crate) fn composite_uniforms(frame: &FrameUniforms, plan: &ChainPlan, maps: 
     draw_uniforms(frame, plan.composite.bindings, plan.composite.frag_offset, maps, &geometry.composite_params())
 }
 
+/// The binding-4 bytes of a draw whose module declares no `struct Params`: 16 zero bytes, the
+/// smallest valid uniform binding (a GL std140 block and a wgpu binding are 16-byte multiples).
+pub(crate) const EMPTY_PARAMS_BLOCK: [u8; 16] = [0; 16];
+
+/// The named-parameter block (binding 4, `p: Params`) of a step running `pass` (the step's
+/// `pass` index selects it): the pass's block in its effect's layout, or [`EMPTY_PARAMS_BLOCK`]
+/// when the effect declares no `struct Params`. Its length is a multiple of 16.
+#[must_use]
+pub(crate) fn params_block(pass: &Pass) -> &[u8] {
+    let named = pass.named_params();
+    if named.is_empty() { &EMPTY_PARAMS_BLOCK } else { named }
+}
+
+/// The named-parameter block of the composite (whose module declares none).
+#[must_use]
+pub(crate) fn composite_params_block() -> &'static [u8] {
+    &EMPTY_PARAMS_BLOCK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +318,21 @@ mod tests {
                 assert_eq!(plan.composite.bindings.original, Some(Slot::Source));
             }
         }
+    }
+
+    /// F4: a step binds its pass's named block (layout-sized), a module without `struct Params`
+    /// and the composite bind the 16-byte zero block.
+    #[test]
+    fn params_blocks_are_the_pass_block_or_the_empty_one() {
+        let Ok(plain) = Effect::new("plain", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }") else { panic!("identity must compile") };
+        let named = Effect::new("named", "struct Params { tint: vec4<f32>, gain: f32 }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * p.tint * p.gain; }");
+        let Ok(named) = named else { panic!("{named:?}") };
+        assert_eq!(params_block(&Pass::new(&plain)), &EMPTY_PARAMS_BLOCK);
+        let pass = Pass::new(&named).with("gain", 2.0).unwrap_or_else(|error| panic!("{error}"));
+        let block = params_block(&pass);
+        assert_eq!(block.len(), 32, "span 20 padded to 32");
+        assert!(holds(block, 16, [2.0, 0.0]));
+        assert_eq!(composite_params_block(), &EMPTY_PARAMS_BLOCK);
     }
 
     #[test]

@@ -484,6 +484,7 @@ Each phase is marked done here in the same commit that lands it.
 - Phase 1 (plan.rs single owner, full `@group(0)` layout with dummies, 416-byte `FlUniforms`, prelude-name interface check, `ModuleKind` removed): done.
 - Phase 2a (F1 `original(uv)` in every pass: prelude helper, the plan binds the capture as every draw's original with its own `aux` mapping; GPU tests UI + offline incl. tiles): done.
 - Phase 2b (F2: `LayerJob::frame_input` read in `FilterLayer::paint`; `geometry::pointer_uniform` the one pointer -> capture-uv conversion, resolved per paint callback on both backends; `pass::InputUniforms` + `FrameUniforms::with_input`; `OfflineOptions::with_delta_time` / `with_frame` / `with_pointer` + `PointerState` in `offline/options.rs`; `VideoProcessor` frame clock, explicit options win; not animation triggers): done.
+- Phase 2c (F4 named parameters: `struct Params` detected by a pre-parse token scan, crate tail `@group(0) @binding(4) var<uniform> p: Params;`, `ParamLayout` = naga offsets (= std140), unsupported members / arrays with a non-16 stride / > 16 KiB rejected as located `EffectError::Interface`; `Effect::params()` / `param()`, `Pass::set` / `with` / `set_slice` / `get` / `get_slice`, `ParamError`; `plan::params_block` owns binding 4's bytes; wgpu `[fl_i, p_i]` at offset alignment, glow second UBO at binding point 1; `effect.rs` split into `src/effect/`): done.
 
 ## 18. Findings during execution
 - Phase 1: naga's GLSL writer rejects one texture read through two samplers in one module
@@ -494,3 +495,20 @@ Each phase is marked done here in the same commit that lands it.
   pixel-exact / state access, so each texture keeps exactly ONE sampler; drop binding 7
   (`fl_nearest_sampler`) if nothing needs it any more. Verify the translation with a glsl.rs test.
 - glow has no headless runtime test; a harness is phase 1b.
+- Phase 2c (F4): the "detect `struct Params` in `module.types` after the parse, re-assemble,
+  re-parse" plan (§5, risk 4 in §15) is INFEASIBLE: a snippet that reads `p.x` does not parse
+  without the appended `var<uniform> p: Params;` ("no definition in scope for identifier: `p`",
+  prototyped). Detection is therefore a comment-aware token scan of the snippet for
+  `struct Params` BEFORE the single parse, confirmed by naga's IR afterwards; there is no second
+  parse. Consequences: `struct /* c */ Params` counts, a commented-out one does not, an `alias
+  Params = ...` does not (the snippet then fails on `p` with a located parse error). naga
+  validation errors of the tail (layout illegal in a uniform block, a snippet-level `p`) are
+  located at the `struct Params` declaration with a hint; the crate pre-checks member types and
+  array strides itself so most of them are reported by member name. `EffectError::Interface`
+  gained `location`. API additions beyond §5: `ParamError::Array` (single value on an array
+  member), `Pass::get_slice`, `set_slice` zeroes the unset tail, `ParamInfo::{is_array,
+  stride}`, `From<egui::Vec2 | egui::Rgba> for ParamValue`; no default values (WGSL has none).
+- Phase 2c: `tests/wgpu_headless.rs` with 14 parallel tests crashed (SIGSEGV inside `libvulkan`
+  / `libVkLayer_khronos_validation`, concurrent `vkCreateInstance`, Mesa radv, debug build with
+  wgpu's validation layer). The test helper `gpu()` now serializes instance / device creation
+  with a test-only mutex; rendering still runs in parallel.

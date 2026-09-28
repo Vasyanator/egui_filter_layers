@@ -53,7 +53,8 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
 - `textures.rs`: egui-wgpu bind groups; own copies of textures uploaded in full that egui-wgpu
   has not applied yet (kept across the passes of a frame, partial deltas followed).
 - `chain.rs`: the chain executor (`ChainResources`, `ChainTargets`, `ChainWindow`, `record`,
-  `frame_uniforms`, `chain_uniforms` = the plan's blocks at the uniform stride; composites: replace `composite_pipeline` / `draw_composite` for offline,
+  `frame_uniforms`, `chain_uniforms` = every draw's plan blocks (`fl`, then the named-parameter
+  block) at the device's offset alignment (`ChainUniforms` / `DrawUniforms`); composites: replace `composite_pipeline` / `draw_composite` for offline,
   blended `CompositeOver` / `draw_composite_over` for the UI); egui-free; shared with `src/offline/`.
 - `gpu.rs`: egui-free wgpu helpers (`Target` with an optional reinterpreting render view, `GrowBuffer`, layout entries, `pass_pipeline`,
   `begin_pass`, `ErrorScopes` (out-of-memory + validation + internal, awaitable) and the
@@ -68,7 +69,8 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
 ## Contracts and invariants
 - Every effect and composite pipeline uses ONE pipeline layout (`ChainResources::layout`, all
   eight prelude bindings); every draw's bind group fills all eight, dummies where the plan binds
-  nothing. The params binding (4) is unsized so modules may declare any block size there.
+  no texture. The params binding (4) is unsized so modules may declare any block size there;
+  every draw binds its own `plan::params_block` range of the run's uniform buffer.
 - The mesh pipeline's group 1 layout is the SAME descriptor as egui-wgpu's texture layout, so
   egui's per-texture bind groups bind unchanged (wgpu-core dedups layouts; WebGPU group-equivalence).
 - Every layer of a frame gets its own `LayerTargets` (pool index = prepare order, reset in
@@ -118,7 +120,7 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
 ## Editing map
 - What counts as "beneath" / clipping: `beneath.rs`. Texture staleness: `textures.rs`.
 - Which texture / mapping a draw gets: `src/plan.rs` (shared with glow). Recording, bind groups,
-  uniform stride, intermediate format: `chain.rs` (shared by every wgpu caller). Backdrop re-render, egui-pass pipelines: `render.rs` / `resources.rs`.
+  uniform layout, intermediate format: `chain.rs` (shared by every wgpu caller). Backdrop re-render, egui-pass pipelines: `render.rs` / `resources.rs`.
 - Per-layer uniform values and composite params: core `FrameUniforms::for_layer` /
   `with_input` (`pass.rs`) and `LayerGeometry::composite_params` (`geometry.rs`), shared with glow.
   The UI resolves `LayerJob::frame_input` at `prepare` (`render.rs`, the screen's pixels per

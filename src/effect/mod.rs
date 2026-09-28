@@ -1,5 +1,5 @@
 /*
-File: effect.rs
+File: effect/mod.rs
 
 Purpose:
 The shader model of the crate. An `Effect` is one user-authored WGSL function
@@ -13,16 +13,16 @@ Key structures:
 - `CompiledModule` (crate-internal): the validated naga module every backend translates.
 
 Key functions:
-- `Effect::new()`: assemble, parse, validate, check the resource interface.
-- `render_diagnostic()`: renders naga's labels with `codespan-reporting` against the snippet
-  (line numbers match `SnippetLocation`), or the assembled source when naga points at the wrapper.
-- `check_interface()`: every bound global must be one the prelude declares (`PRELUDE_RESOURCES`,
-  the one `@group(0)` layout shared by effects and the composite).
-- `reads_time()`: conservative IR scan deciding `Effect::is_animated`.
+- `Effect::new()` / `compile()`: detect `struct Params`, assemble (prelude + snippet + the named
+  parameter tail), parse, lay out the named parameters, validate, check the resource interface.
+- `Effect::params()` / `Effect::param()`: reflection of the named parameters.
 - `composite_module()` / `composite_linear_module()` (crate-internal): the internal replace pass
   that writes the filtered region back (gamma output / linear output for `*Srgb` targets; glow,
   offline). `composite_erase_module()` / `composite_add_module()` / `composite_add_linear_module()`:
   the two draws of the blended composite the wgpu UI draws over egui's pass.
+
+Submodules: `diagnostics.rs` (snippet-relative errors), `interface.rs` (IR checks: bindings,
+entry points, `fl.time`), `params.rs` (named parameters: detection, layout, typed values).
 
 Notes:
 The prelude is placed BEFORE the user snippet so a naga line number maps to a snippet line by a
@@ -37,11 +37,21 @@ use std::sync::{Arc, OnceLock};
 
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 
+mod diagnostics;
+mod interface;
+mod params;
+
+pub use diagnostics::SnippetLocation;
+use diagnostics::{Assembled, error_chain, error_sources, location_suffix};
+use interface::{check_interface, reads_time};
+pub(crate) use params::{ParamLayout, element_range};
+pub use params::{ParamError, ParamInfo, ParamType, ParamValue};
+
 /// The prelude prepended to every effect. See the crate docs, "Writing an effect".
-pub(crate) const PRELUDE_WGSL: &str = include_str!("shaders/prelude.wgsl");
+pub(crate) const PRELUDE_WGSL: &str = include_str!("../shaders/prelude.wgsl");
 
 /// The body of the internal composite pass (appended after the prelude like a user effect).
-const COMPOSITE_WGSL: &str = include_str!("shaders/composite.wgsl");
+const COMPOSITE_WGSL: &str = include_str!("../shaders/composite.wgsl");
 
 /// Name of the vertex entry point every assembled module exposes.
 pub(crate) const VERTEX_ENTRY: &str = "fl_vertex";
@@ -56,10 +66,9 @@ pub(crate) const BINDING_SOURCE_TEXTURE: u32 = 1;
 pub(crate) const BINDING_SAMPLER: u32 = 2;
 /// `@binding` of the original (unfiltered) capture (`fl_original_texture`).
 pub(crate) const BINDING_ORIGINAL_TEXTURE: u32 = 3;
-/// `@binding` reserved for a uniform block the crate appends to a module itself (never declared
-/// by the prelude or a snippet). wgpu's single layout binds a 16-byte zero buffer there; glow
-/// binds uniform blocks by reflection, so no module declaring none needs it.
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Only wgpu's explicit layout names it.
+/// `@binding` of the named-parameter block `p: Params`, which the crate appends to a module whose
+/// snippet declares `struct Params` (never declared by the prelude or a snippet). Every draw binds
+/// the bytes `plan.rs` gives it there (16 zero bytes for a module without named parameters).
 pub(crate) const BINDING_PARAMS: u32 = 4;
 /// `@binding` of the state texture (`fl_state_texture`; a transparent dummy without state).
 pub(crate) const BINDING_STATE_TEXTURE: u32 = 5;
@@ -67,19 +76,6 @@ pub(crate) const BINDING_STATE_TEXTURE: u32 = 5;
 pub(crate) const BINDING_COVERAGE_TEXTURE: u32 = 6;
 /// `@binding` of the shared nearest clamp-to-edge sampler (`fl_nearest_sampler`).
 pub(crate) const BINDING_NEAREST_SAMPLER: u32 = 7;
-
-/// Every resource the prelude declares, as `(name, @binding)` in `@group(0)`. The interface check
-/// accepts exactly these: a snippet cannot redeclare a prelude name (naga rejects the
-/// redefinition), so a bound global with one of these names IS the prelude's.
-const PRELUDE_RESOURCES: [(&str, u32); 7] = [
-    ("fl", BINDING_UNIFORMS),
-    ("fl_src_texture", BINDING_SOURCE_TEXTURE),
-    ("fl_sampler", BINDING_SAMPLER),
-    ("fl_original_texture", BINDING_ORIGINAL_TEXTURE),
-    ("fl_state_texture", BINDING_STATE_TEXTURE),
-    ("fl_coverage_texture", BINDING_COVERAGE_TEXTURE),
-    ("fl_nearest_sampler", BINDING_NEAREST_SAMPLER),
-];
 
 /// Monotonic source of `CompiledModule::id`. Ids are never reused within a process, so a backend
 /// cache keyed by id can never confuse a dropped module with a new one.
@@ -106,34 +102,13 @@ pub(crate) struct CompiledModule {
     /// Validation info for `module` (needed by every naga back end).
     #[cfg_attr(not(feature = "glow"), allow(dead_code))] // Read by naga's GLSL back end only; wgpu takes the WGSL source.
     pub(crate) info: naga::valid::ModuleInfo,
+    /// The named-parameter block (`struct Params`); empty with `block_size` 0 when undeclared.
+    pub(crate) params: ParamLayout,
 }
 
 impl fmt::Debug for CompiledModule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompiledModule").field("id", &self.id).field("label", &self.label).finish_non_exhaustive()
-    }
-}
-
-/// A location inside the user's WGSL snippet (not the assembled module).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SnippetLocation {
-    /// 1-based line number within the snippet passed to [`Effect::new`].
-    pub line: u32,
-    /// 1-based column (in bytes) within that line.
-    pub column: u32,
-}
-
-impl fmt::Display for SnippetLocation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.line, self.column)
-    }
-}
-
-/// Formats an optional snippet location for the `EffectError` messages.
-fn location_suffix(location: Option<&SnippetLocation>) -> String {
-    match location {
-        Some(location) => format!(" at snippet line {location}"),
-        None => String::new(),
     }
 }
 
@@ -172,14 +147,18 @@ pub enum EffectError {
         /// `location`) when naga points into it, else against the assembled source.
         diagnostic: String,
     },
-    /// The snippet declared something the crate cannot bind: extra resources, entry points, or
-    /// pipeline-overridable constants (`override`).
-    #[error("effect `{label}`: {reason}")]
+    /// The snippet declared something the crate cannot bind: extra resources, entry points,
+    /// pipeline-overridable constants (`override`), or a `struct Params` the crate cannot upload
+    /// (unsupported member type, too large).
+    #[error("effect `{label}`{}: {reason}", location_suffix(.location.as_ref()))]
     Interface {
         /// The effect's label.
         label: String,
         /// What was declared and why it is rejected.
         reason: String,
+        /// Where in the snippet (the `struct Params` declaration for named-parameter errors),
+        /// `None` when the declaration is not located.
+        location: Option<SnippetLocation>,
     },
 }
 
@@ -192,13 +171,12 @@ impl EffectError {
         }
     }
 
-    /// Where in the snippet the error is, when naga located it inside the snippet.
-    /// Always `None` for [`EffectError::Interface`].
+    /// Where in the snippet the error is, when it was located inside the snippet (errors naga
+    /// reports at the crate-appended named-parameter declaration point at `struct Params`).
     #[must_use]
     pub fn location(&self) -> Option<SnippetLocation> {
         match self {
-            Self::Parse { location, .. } | Self::Validation { location, .. } => *location,
-            Self::Interface { .. } => None,
+            Self::Parse { location, .. } | Self::Validation { location, .. } | Self::Interface { location, .. } => *location,
         }
     }
 
@@ -320,37 +298,29 @@ impl Effect {
         &self.module.source
     }
 
+    /// The named parameters the snippet declared in `struct Params`, in declaration order (empty
+    /// when it declares none). A UI can build one control per entry; values are set per pass with
+    /// [`crate::Pass::set`].
+    #[must_use]
+    pub fn params(&self) -> &[ParamInfo] {
+        &self.module.params.fields
+    }
+
+    /// The named parameter `name`, if `struct Params` has such a member.
+    #[must_use]
+    pub fn param(&self, name: &str) -> Option<&ParamInfo> {
+        self.module.params.field(name)
+    }
+
     /// The shared compiled module (crate-internal: backends key their caches on it).
     pub(crate) fn module(&self) -> &Arc<CompiledModule> {
         &self.module
     }
-}
 
-/// Whether any function of `module` may read the `time` member of the `fl` uniform block.
-///
-/// Walks naga's IR: an `AccessIndex` of `time` on the `fl` global counts, and so does any `Load`
-/// of the WHOLE `fl` global (`let u = fl; ... u.time`), because the copy may be read anywhere —
-/// erring towards "animated" only costs repaints, erring the other way freezes the effect.
-/// The prelude does neither (pinned by a preset test), so a hit always comes from the snippet.
-fn reads_time(module: &naga::Module) -> bool {
-    let Some((fl, global)) = module.global_variables.iter().find(|(_, global)| global.name.as_deref() == Some("fl")) else {
-        return false;
-    };
-    let Ok(naga::Type { inner: naga::TypeInner::Struct { members, .. }, .. }) = module.types.get_handle(global.ty) else {
-        return false;
-    };
-    let Some(time_index) = members.iter().position(|member| member.name.as_deref() == Some("time")).and_then(|index| u32::try_from(index).ok()) else {
-        return false;
-    };
-    let is_fl = |function: &naga::Function, handle: naga::Handle<naga::Expression>| matches!(function.expressions.try_get(handle), Ok(naga::Expression::GlobalVariable(global)) if *global == fl);
-    let touches = |function: &naga::Function| {
-        function.expressions.iter().any(|(_, expression)| match expression {
-            naga::Expression::AccessIndex { base, index } if *index == time_index => is_fl(function, *base),
-            naga::Expression::Load { pointer } => is_fl(function, *pointer),
-            _ => false,
-        })
-    };
-    module.functions.iter().any(|(_, function)| touches(function)) || module.entry_points.iter().any(|entry| touches(&entry.function))
+    /// The named-parameter layout (crate-internal: `Pass` sizes and fills its block from it).
+    pub(crate) fn param_layout(&self) -> &ParamLayout {
+        &self.module.params
+    }
 }
 
 /// Clamps a user radius to a finite, non-negative value.
@@ -358,147 +328,44 @@ pub(crate) fn sanitize_radius(points: f32) -> f32 {
     if points.is_finite() && points > 0.0 { points } else { 0.0 }
 }
 
-/// Number of lines the prelude occupies; a naga line `n > PRELUDE_LINES` is snippet line
-/// `n - PRELUDE_LINES`.
-fn prelude_line_count() -> u32 {
-    let lines = PRELUDE_WGSL.bytes().filter(|&b| b == b'\n').count();
-    // The prelude is a compile-time constant of a few dozen lines; it cannot exceed u32.
-    u32::try_from(lines).unwrap_or(u32::MAX)
-}
-
-/// Maps a naga location in the assembled source to the snippet, or `None` for the wrapper.
-fn snippet_location(location: Option<naga::SourceLocation>) -> Option<SnippetLocation> {
-    let location = location?;
-    let prelude = prelude_line_count();
-    (location.line_number > prelude).then(|| SnippetLocation { line: location.line_number - prelude, column: location.line_position })
-}
-
-/// Hint appended when naga reports an error outside the user's snippet — almost always a missing
-/// or mistyped `effect` function, or a name clashing with the prelude.
-const WRAPPER_HINT: &str = " (reported inside the generated wrapper: the snippet must define \
-    `fn effect(uv: vec2<f32>) -> vec4<f32>` and must not redefine prelude names such as `src`, \
-    `params`, `fl` or anything starting with `fl_`)";
-
 /// Assembles, parses, validates and interface-checks one module.
+///
+/// A snippet declaring `struct Params` (found by a token scan BEFORE the parse: a snippet reading
+/// `p.x` only parses with the declaration of `p` present) gets [`params::PARAMS_TAIL`] appended,
+/// and the struct's layout is checked after the parse, before validation, so an unsupported member
+/// is reported by name instead of as naga's generic "global variable is invalid".
 fn compile(label: &str, snippet: &str) -> Result<CompiledModule, EffectError> {
-    let mut source = String::with_capacity(PRELUDE_WGSL.len() + snippet.len() + 1);
-    source.push_str(PRELUDE_WGSL);
-    source.push_str(snippet);
-    if !snippet.ends_with('\n') {
-        source.push('\n');
-    }
+    let declaration = params::find_params_struct(snippet).map(|offset| params::location_of(snippet, offset));
+    let assembled = Assembled::new(snippet, if declaration.is_some() { params::PARAMS_TAIL } else { "" }, declaration);
+    let source = &assembled.source;
 
-    let module = naga::front::wgsl::parse_str(&source).map_err(|error| {
-        let location = snippet_location(error.location(&source));
-        let mut message = error.message().to_owned();
-        if location.is_none() {
-            message.push_str(WRAPPER_HINT);
-        }
+    let module = naga::front::wgsl::parse_str(source).map_err(|error| {
+        let (location, hint) = assembled.locate(error.location(source));
+        let message = format!("{}{hint}", error.message());
         let labels: Vec<(Range<usize>, String)> = error.labels().filter_map(|(span, text)| span.to_range().map(|range| (range, text.to_owned()))).collect();
         let notes = error.notes().map(str::to_owned).collect();
-        let diagnostic = render_diagnostic(label, error.message(), &labels, notes, &source);
+        let diagnostic = assembled.render(label, error.message(), &labels, notes);
         EffectError::Parse { label: label.to_owned(), message, location, diagnostic }
     })?;
 
+    let params = match declaration {
+        Some(location) => ParamLayout::from_module(&module, label, location)?,
+        None => ParamLayout::default(),
+    };
+
     let info = Validator::new(ValidationFlags::all(), Capabilities::empty()).validate(&module).map_err(|error| {
-        let location = snippet_location(error.location(&source));
-        let mut message = error_chain(error.as_inner());
-        if location.is_none() {
-            message.push_str(WRAPPER_HINT);
-        }
+        let (location, hint) = assembled.locate(error.location(source));
+        let message = format!("{}{hint}", error_chain(error.as_inner()));
         let labels: Vec<(Range<usize>, String)> = error.spans().filter_map(|(span, text)| span.to_range().map(|range| (range, text.clone()))).collect();
-        let diagnostic = render_diagnostic(label, &error.as_inner().to_string(), &labels, error_sources(error.as_inner()), &source);
+        let diagnostic = assembled.render(label, &error.as_inner().to_string(), &labels, error_sources(error.as_inner()));
         EffectError::Validation { label: label.to_owned(), message, location, diagnostic }
     })?;
 
-    check_interface(label, &module)?;
+    check_interface(label, &module, declaration.is_some())?;
 
     let id = NEXT_MODULE_ID.fetch_add(1, Ordering::Relaxed);
     log::debug!("egui_filter_layers: compiled effect `{label}` (module id {id})");
-    Ok(CompiledModule { id, label: Arc::from(label), source, module, info })
-}
-
-/// The `source()` chain of `error` (without `error` itself), one entry per cause.
-fn error_sources(error: &dyn std::error::Error) -> Vec<String> {
-    std::iter::successors(error.source(), |cause| cause.source()).map(ToString::to_string).collect()
-}
-
-/// Renders a naga error as a multi-line `codespan-reporting` diagnostic.
-///
-/// `labels` are byte ranges into the assembled `source`. When the first (primary) label lies in
-/// the user's snippet, the snippet alone is rendered — named after the effect `label`, with only
-/// the labels inside it, shifted — so its line numbers equal [`SnippetLocation::line`]. Otherwise
-/// (naga pointed into the prelude, e.g. a missing `effect` function) the assembled source is
-/// rendered under the name `<label> (assembled)`. Never fails: a rendering error degrades to
-/// `message` plus the notes.
-fn render_diagnostic(label: &str, message: &str, labels: &[(Range<usize>, String)], notes: Vec<String>, source: &str) -> String {
-    use codespan_reporting::diagnostic::{Diagnostic, Label};
-    use codespan_reporting::files::SimpleFile;
-    use codespan_reporting::term::{Config, emit_into_string};
-
-    let prelude = PRELUDE_WGSL.len();
-    let in_snippet = labels.first().is_some_and(|(range, _)| range.start >= prelude) && source.len() >= prelude;
-    let (name, text, shown): (String, &str, Vec<Label<()>>) = if in_snippet {
-        // Only labels fully inside the snippet can be drawn on it; a prelude label (e.g. the
-        // wrapper's call site) is dropped rather than shown on the wrong line.
-        let shifted = labels.iter().filter(|(range, _)| range.start >= prelude).map(|(range, text)| Label::primary((), (range.start - prelude)..(range.end - prelude)).with_message(text.clone())).collect();
-        (label.to_owned(), &source[prelude..], shifted)
-    } else {
-        (format!("{label} (assembled)"), source, labels.iter().map(|(range, text)| Label::primary((), range.clone()).with_message(text.clone())).collect())
-    };
-    let file = SimpleFile::new(name, text);
-    let diagnostic = Diagnostic::error().with_message(message).with_labels(shown).with_notes(notes.clone());
-    emit_into_string(&Config::default(), &file, &diagnostic).unwrap_or_else(|error| {
-        log::debug!("egui_filter_layers: could not render a WGSL diagnostic ({error}); using the plain message");
-        std::iter::once(message.to_owned()).chain(notes).collect::<Vec<_>>().join("\n")
-    })
-}
-
-/// Joins an error and its `source()` chain into one line.
-fn error_chain(error: &dyn std::error::Error) -> String {
-    let mut message = error.to_string();
-    let mut next = error.source();
-    while let Some(cause) = next {
-        message.push_str(": ");
-        message.push_str(&cause.to_string());
-        next = cause.source();
-    }
-    message
-}
-
-/// Rejects entry points, `override`s, and every resource binding that is not one of the
-/// prelude's ([`PRELUDE_RESOURCES`]); the same rule holds for user effects and the composite.
-fn check_interface(label: &str, module: &naga::Module) -> Result<(), EffectError> {
-    let interface_error = |reason: String| EffectError::Interface { label: label.to_owned(), reason };
-
-    for entry in &module.entry_points {
-        let expected = matches!((entry.stage, entry.name.as_str()), (naga::ShaderStage::Vertex, VERTEX_ENTRY) | (naga::ShaderStage::Fragment, FRAGMENT_ENTRY));
-        if !expected {
-            return Err(interface_error(format!("declares its own entry point `{}`; an effect is a plain `fn effect(uv: vec2<f32>) -> vec4<f32>`", entry.name)));
-        }
-    }
-
-    // Pipeline-overridable constants would need per-backend specialization (naga's GLSL writer
-    // refuses them outright), so they are rejected here for every backend alike.
-    if let Some((_, constant)) = module.overrides.iter().next() {
-        let name = constant.name.as_deref().unwrap_or("<unnamed>");
-        return Err(interface_error(format!("declares the pipeline-overridable constant `{name}`; effects cannot use `override` — use `const` or `params(i)`")));
-    }
-
-    for (_, global) in module.global_variables.iter() {
-        let Some(binding) = &global.binding else {
-            continue;
-        };
-        let name = global.name.as_deref().unwrap_or("<unnamed>");
-        let declared_by_prelude = binding.group == 0 && PRELUDE_RESOURCES.iter().any(|&(prelude_name, prelude_binding)| prelude_name == name && prelude_binding == binding.binding);
-        if !declared_by_prelude {
-            return Err(interface_error(format!(
-                "declares resource `{name}` at @group({}) @binding({}); effects cannot bind their own resources — use `src()` for the input and `params(i)` for values",
-                binding.group, binding.binding
-            )));
-        }
-    }
-    Ok(())
+    Ok(CompiledModule { id, label: Arc::from(label), source: assembled.source, module, info, params })
 }
 
 /// `effect` wrapper appended to the composite body for targets that store gamma values as-is.
@@ -756,6 +623,133 @@ mod tests {
         assert!(sanitize_radius(-1.0).abs() < f32::EPSILON);
         assert!(sanitize_radius(f32::NAN).abs() < f32::EPSILON);
         assert!(sanitize_radius(f32::INFINITY).abs() < f32::EPSILON);
+    }
+
+    /// A `struct Params` with every accepted type: the reflected table equals naga's layout, which
+    /// is the GLSL std140 layout the glow backend's block uses (hand-computed below).
+    #[test]
+    fn named_params_are_reflected_in_the_std140_layout() {
+        let snippet = "struct Params {
+    a: f32,
+    b: vec3<f32>,
+    c: f32,
+    d: vec2<f32>,
+    e: i32,
+    f: u32,
+    g: mat4x4<f32>,
+    h: array<vec4<f32>, 3>,
+    k: vec3<f32>,
+    m: array<mat4x4<f32>, 2>,
+    n: array<vec3<f32>, 2>,
+}
+fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * p.a; }";
+        let effect = Effect::new("all types", snippet);
+        let Ok(effect) = effect else { panic!("{effect:?}") };
+        let table: Vec<(&str, ParamType, u32, u32, bool, u32)> = effect.params().iter().map(|info| (info.name.as_str(), info.ty, info.offset, info.count, info.is_array, info.stride)).collect();
+        assert_eq!(
+            table,
+            [
+                ("a", ParamType::F32, 0, 1, false, 4),
+                ("b", ParamType::Vec3, 16, 1, false, 12),
+                ("c", ParamType::F32, 28, 1, false, 4),
+                ("d", ParamType::Vec2, 32, 1, false, 8),
+                ("e", ParamType::I32, 40, 1, false, 4),
+                ("f", ParamType::U32, 44, 1, false, 4),
+                ("g", ParamType::Mat4, 48, 1, false, 64),
+                ("h", ParamType::Vec4, 112, 3, true, 16),
+                ("k", ParamType::Vec3, 160, 1, false, 12),
+                ("m", ParamType::Mat4, 176, 2, true, 64),
+                ("n", ParamType::Vec3, 304, 2, true, 16),
+            ]
+        );
+        assert_eq!(effect.param_layout().block_size, 336);
+        // The table IS naga's computed layout.
+        let module = &effect.module().module;
+        let Some(naga::TypeInner::Struct { members, span }) = module.types.iter().find(|(_, ty)| ty.name.as_deref() == Some("Params")).map(|(_, ty)| &ty.inner) else { panic!("Params in the IR") };
+        assert!(members.iter().zip(effect.params()).all(|(member, info)| member.offset == info.offset && member.name.as_deref() == Some(info.name.as_str())));
+        assert_eq!(*span, 336);
+        assert_eq!(effect.param("h").map(|info| info.count), Some(3));
+        assert!(effect.param("missing").is_none());
+        assert!(effect.assembled_source().ends_with("var<uniform> p: Params;\n"), "the tail is appended after the snippet");
+    }
+
+    #[test]
+    fn a_small_params_block_is_padded_to_16_bytes() {
+        let Ok(effect) = Effect::new("one", "struct Params { gain: f32 }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * p.gain; }") else { panic!("must compile") };
+        assert_eq!(effect.param_layout().block_size, 16);
+        let Ok(plain) = Effect::new("plain", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }") else { panic!("must compile") };
+        assert!(plain.params().is_empty());
+        assert_eq!(plain.param_layout().block_size, 0);
+        assert!(!plain.assembled_source().ends_with("var<uniform> p: Params;\n"), "no tail without struct Params");
+    }
+
+    #[test]
+    fn unsupported_param_members_are_rejected_by_name_at_the_struct() {
+        let cases = [
+            ("flag: bool", "flag"),
+            ("inner: Inner", "inner"),
+            ("list: array<f32, 4>", "list"),
+            ("pairs: array<vec2<f32>, 4>", "pairs"),
+            ("grid: array<array<vec4<f32>, 2>, 2>", "grid"),
+            ("ints: vec2<i32>", "ints"),
+            ("rot: mat3x3<f32>", "rot"),
+        ];
+        for (member, name) in cases {
+            let snippet = format!("struct Inner {{ x: vec4<f32> }}\n// the struct\nstruct Params {{ ok: f32, {member} }}\nfn effect(uv: vec2<f32>) -> vec4<f32> {{ return src(uv) * p.ok; }}");
+            match Effect::new("bad", &snippet) {
+                Err(error @ EffectError::Interface { .. }) => {
+                    assert!(error.to_string().contains(&format!("Params.{name}")), "{member}: {error}");
+                    assert_eq!(error.location(), Some(SnippetLocation { line: 3, column: 1 }), "{member}");
+                }
+                other => panic!("{member}: expected an interface error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn params_blocks_are_capped_at_the_webgl2_limit() {
+        let fits = Effect::new("fits", "struct Params { v: array<vec4<f32>, 1024> }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return p.v[0]; }");
+        assert!(fits.is_ok_and(|effect| effect.param_layout().block_size == 16 * 1024));
+        match Effect::new("big", "struct Params { v: array<vec4<f32>, 1024>, w: f32 }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return p.v[0]; }") {
+            Err(error @ EffectError::Interface { .. }) => assert!(error.to_string().contains("16384"), "{error}"),
+            other => panic!("expected an interface error, got {other:?}"),
+        }
+    }
+
+    /// Errors naga reports at the crate-appended declaration point at `struct Params` with a hint;
+    /// errors inside the snippet keep their own line numbers (the tail follows the snippet).
+    #[test]
+    fn tail_errors_point_at_the_struct_and_snippet_lines_are_kept() {
+        let clash = "fn p() {}\nstruct Params { a: f32 }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }";
+        match Effect::new("clash", clash) {
+            Err(error @ (EffectError::Parse { .. } | EffectError::Validation { .. })) => {
+                assert_eq!(error.location(), Some(SnippetLocation { line: 2, column: 1 }), "{error}");
+                assert!(error.to_string().contains("crate-appended"), "{error}");
+            }
+            other => panic!("expected a located error, got {other:?}"),
+        }
+        let broken = "struct Params { a: f32 }\n\nfn effect(uv: vec2<f32>) -> vec4<f32> {\n    let x = ;\n    return src(uv) * p.a;\n}";
+        match Effect::new("broken", broken) {
+            Err(error @ EffectError::Parse { .. }) => {
+                assert_eq!(error.location().map(|l| l.line), Some(4));
+                let Some(diagnostic) = error.diagnostic() else { panic!("a parse error has a diagnostic") };
+                assert!(diagnostic.contains("broken:4:") && !diagnostic.contains("var<uniform> p"), "{diagnostic}");
+            }
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_commented_declaration_is_not_named_params() {
+        // Without a real `struct Params`, `p` is undefined and reported in the snippet.
+        let snippet = "// struct Params { a: f32 }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * p.a; }";
+        match Effect::new("commented", snippet) {
+            Err(error @ EffectError::Parse { .. }) => assert_eq!(error.location().map(|l| l.line), Some(2), "{error}"),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+        // A snippet may not bind `p` itself either.
+        let own = "@group(0) @binding(4) var<uniform> p: vec4<f32>;\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * p; }";
+        assert!(matches!(Effect::new("own", own), Err(EffectError::Interface { .. })));
     }
 
     #[test]

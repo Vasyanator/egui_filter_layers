@@ -508,3 +508,45 @@ fn a_failing_effect_is_disabled_alone() {
         assert!(failed[0].error.contains("multiple samplers"), "{}", failed[0].error);
     }
 }
+
+/// A named-parameter effect (F4); identical to the one in `wgpu_headless.rs`:
+/// `mix(src, color, amount) * tint * gain + lights[which] * (offset + 1)`.
+const NAMED_PARAMS_WGSL: &str = "struct Params {
+    color: vec4<f32>,
+    amount: f32,
+    which: u32,
+    offset: i32,
+    lights: array<vec4<f32>, 3>,
+    tint: vec3<f32>,
+    gain: f32,
+}
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let base = mix(src(uv), p.color, p.amount);
+    return vec4<f32>(base.rgb * p.tint * p.gain + p.lights[p.which].rgb * f32(p.offset + 1), 1.0);
+}";
+
+/// F4 on glow: the second uniform block (binding point 1) carries each pass's own values; the
+/// chain `a -> invert -> b` gives `(64, 96, 64)` over red and `(128, 96, 0)` over blue.
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn named_params_reach_each_pass() {
+    let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let effect = Effect::new("named", NAMED_PARAMS_WGSL).unwrap_or_else(|error| panic!("{error}"));
+    let a = Pass::new(&effect).with("color", [0.0, 1.0, 0.0, 1.0]).and_then(|pass| pass.with("amount", 0.5)).and_then(|pass| pass.with("which", 2_u32)).and_then(|pass| pass.with("offset", 0)).and_then(|pass| pass.with("tint", [1.0, 0.5, 1.0])).and_then(|pass| pass.with("gain", 1.0));
+    let mut a = a.unwrap_or_else(|error| panic!("{error}"));
+    a.set_slice("lights", &[[9.0_f32; 4], [9.0; 4], [0.0, 0.0, 0.5, 0.0]]).unwrap_or_else(|error| panic!("{error}"));
+    let b = Pass::new(&effect).with("tint", [1.0, 1.0, 1.0]).and_then(|pass| pass.with("gain", 0.5)).unwrap_or_else(|error| panic!("{error}"));
+    let chain = FilterChain::from(a).then(presets::invert(1.0)).then(b);
+    let mut paint = |ui: &mut egui::Ui| {
+        let painter = ui.painter();
+        halves(painter);
+        FilterLayer::new(Rect::from_min_max(pos2(20.0, 20.0), pos2(236.0, 108.0)), chain.clone()).paint(painter);
+    };
+    harness.frame(&mut paint);
+    let pixels = harness.frame(&mut paint);
+    assert_active(&harness.ctx);
+    assert!(egui_filter_layers::failed_effects(&harness.ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&harness.ctx));
+    assert_near(&pixels, 60, 60, [64, 96, 64], "named params over red");
+    assert_near(&pixels, 200, 60, [128, 96, 0], "named params over blue");
+    assert_near(&pixels, 10, 10, [255, 0, 0], "outside the layer");
+}

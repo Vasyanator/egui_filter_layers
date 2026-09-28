@@ -8,6 +8,8 @@ blur, colour adjustments, refraction, or your own WGSL shader.
   pixelate, ripple (animated), lens, vignette, frosted glass.
 - Custom effects: write one WGSL function; it is validated by [naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga)
   when you build it, with errors pointing at your snippet.
+- Named, typed effect parameters: declare `struct Params { ... }` in WGSL, set values by name
+  from Rust (`pass.set("amount", 0.5)`), and reflect the members to build a UI.
 - Rounded-rect masks with anti-aliased edges.
 - View-only: never touches egui textures or your data.
 - One shader language on every backend (WGSL, translated to GLSL for OpenGL).
@@ -151,7 +153,8 @@ Prelude available to every effect:
 | `src(uv)` | pass input, bilinear, clamped to the captured region |
 | `src_px(offset)` | input at `offset` physical pixels from the current pixel |
 | `original(uv)` | the untouched captured backdrop (before any pass), readable in every pass |
-| `params(i)` | `vec4<f32>` parameter slot `i` (`0..16`) of the pass |
+| `p.<name>` | named parameter: member of the snippet's `struct Params` (below) |
+| `params(i)` | `vec4<f32>` anonymous parameter slot `i` (`0..16`) of the pass (untyped; prefer named) |
 | `fl.texel`, `fl.size_px` | one pixel in `uv` units; capture size in pixels |
 | `fl.rect_uv` | the layer rect inside the capture (`xy` min, `zw` size) |
 | `fl.time`, `fl.pixels_per_point` | egui time in seconds; physical pixels per layer point (egui scale factor × layer zoom) |
@@ -172,6 +175,35 @@ blur covers 8 pixels at zoom 2 — and the capture padding follows.
 numbers match `EffectError::location()`.
 
 Chains run pass by pass (ping-pong): `presets::gaussian_blur(6.0).then(Pass::new(&wave))`.
+
+### Named parameters
+
+Declare `struct Params` in the snippet and read it as `p`; set values per pass by name. Types are
+checked (`ParamError`, no panics), and `Effect::params()` lists every member (`ParamInfo`: name,
+`ParamType`, offset, array length) so a UI can build its controls from the effect alone.
+
+```rust
+use egui_filter_layers::{Effect, Pass};
+
+let tint = Effect::new("tint", r#"
+struct Params {
+    color: vec4<f32>,
+    amount: f32,
+}
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    return mix(src(uv), p.color, p.amount);
+}
+"#)?;
+for info in tint.params() {
+    println!("{}: {} at byte {}", info.name, info.ty, info.offset);
+}
+let pass = Pass::new(&tint).with("color", [1.0, 0.5, 0.0, 1.0])?.with("amount", 0.25)?;
+```
+
+Members may be `f32`, `i32`, `u32`, `vec2/3/4<f32>`, `mat4x4<f32>` or fixed-size arrays of
+`vec3<f32>` / `vec4<f32>` / `mat4x4<f32>` (set with `Pass::set_slice`); the struct may be up to
+16 KiB (the WebGL2 uniform block limit). Values start at zero. `params(i)` keeps working next
+to named parameters.
 
 ## Semantics and limitations
 

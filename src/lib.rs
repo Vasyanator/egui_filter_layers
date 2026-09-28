@@ -73,7 +73,8 @@ module names a backend type.
 //! | `src(uv)` | the pass input (bilinear, clamped to the captured region) |
 //! | `src_px(offset)` | the input at `offset` physical pixels from the current pixel |
 //! | `original(uv)` | the untouched captured backdrop (before any pass), in every pass of the chain |
-//! | `params(i)` | parameter slot `i` (`0..16`) of the [`Pass`], a `vec4<f32>` |
+//! | `p.<name>` | a named parameter: member `<name>` of the snippet's own `struct Params` (see below) |
+//! | `params(i)` | anonymous parameter slot `i` (`0..16`) of the [`Pass`], a `vec4<f32>` (the untyped block; prefer named parameters) |
 //! | `fl.texel` | size of one physical pixel in `uv` units |
 //! | `fl.size_px` | captured region size in physical pixels |
 //! | `fl.rect_uv` | the layer rect inside the capture (`xy` = min, `zw` = size), in `uv` units |
@@ -92,6 +93,43 @@ module names a backend type.
 //! pointer changes arrive with input, which repaints anyway, and an effect that must advance
 //! every frame on its own reads `fl.time` or is marked with [`Effect::with_animated`]. The three
 //! are per frame, not per layer: every layer painted in one frame sees the same values.
+//!
+//! ## Named parameters
+//!
+//! A snippet may declare `struct Params { ... }`; the crate then binds it as `p` and the effect
+//! reads `p.<member>`. Each [`Pass`] stores its own values, set by name and type-checked against
+//! the struct ([`Pass::set`], [`Pass::with`], [`Pass::set_slice`] for arrays); a mismatch is a
+//! [`ParamError`], never a panic. [`Effect::params`] reflects the members ([`ParamInfo`]: name,
+//! [`ParamType`], offset, array length) so a UI can build its controls from the effect alone.
+//! Members start at zero (WGSL has no default values).
+//!
+//! ```
+//! use egui_filter_layers::{Effect, ParamError, ParamType, Pass};
+//!
+//! let effect = Effect::new("tint", "
+//! struct Params {
+//!     color: vec4<f32>,
+//!     amount: f32,
+//!     stops: array<vec4<f32>, 4>,
+//! }
+//! fn effect(uv: vec2<f32>) -> vec4<f32> {
+//!     return mix(src(uv), p.color, p.amount) + p.stops[0] * 0.0;
+//! }")?;
+//! assert_eq!(effect.params().len(), 3);
+//! assert_eq!(effect.param("amount").map(|info| info.ty), Some(ParamType::F32));
+//!
+//! let mut pass = Pass::new(&effect).with("color", [1.0, 0.5, 0.0, 1.0])?.with("amount", 0.25)?;
+//! pass.set_slice("stops", &[[0.0_f32, 0.0, 0.0, 1.0]])?; // the remaining elements become zero
+//! assert!(matches!(pass.set("amount", 1), Err(ParamError::Type { .. }))); // `1` is an i32
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! Accepted member types: `f32`, `i32`, `u32`, `vec2<f32>`, `vec3<f32>`, `vec4<f32>`,
+//! `mat4x4<f32>` and fixed-size arrays of `vec3<f32>` / `vec4<f32>` / `mat4x4<f32>` (uniform
+//! arrays need a 16-byte stride). Anything else (`bool`, nested structs, `array<f32, N>`) and a
+//! struct over 16 KiB (the WebGL2 uniform block limit) is an [`EffectError::Interface`] pointing
+//! at the declaration. The snippet must not declare its own module-scope `p`. Named and
+//! anonymous (`params(i)`) parameters can be used together.
 //!
 //! Colours are **premultiplied-alpha, gamma-space** RGBA in and out. Names starting with `fl_`
 //! and the prelude names above are reserved. An effect cannot declare its own bindings or entry
@@ -164,7 +202,7 @@ mod wgpu_backend;
 pub mod offline;
 
 pub use backend::{BackendKind, BackendStatus, EffectFailure, InstallError, failed_effects, status};
-pub use effect::{Effect, EffectError, SnippetLocation};
+pub use effect::{Effect, EffectError, ParamError, ParamInfo, ParamType, ParamValue, SnippetLocation};
 pub use layer::FilterLayer;
 pub use pass::{FilterChain, PARAM_SLOTS, ParamIndexError, Params, Pass};
 

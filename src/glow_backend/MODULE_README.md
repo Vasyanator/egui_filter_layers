@@ -17,7 +17,8 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
    capture texture;
 5. plan the run (`plan::plan`, whole capture) and run its pass steps into the ping-pong targets
    at `(0, 0, w, h)`, binding every `@group(0)` texture unit per draw (the plan's slots, dummies
-   elsewhere) and uploading `plan::step_uniforms`;
+   elsewhere) and uploading `plan::step_uniforms` (binding point 0) and `plan::params_block`
+   (binding point 1, `glBufferData` per draw: the size varies by effect);
 6. composite back into the original framebuffer over the visible region, scissor re-enabled
    (`plan::composite_uniforms`);
 7. `apply_outcome`: latch / per-effect failure / suspects / once-per-format rejection log.
@@ -25,7 +26,7 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
 ## Files
 - `mod.rs`: `install_glow`, `destroy_glow`, `GlowBackend` (`Backend` impl), `GlowState`, latches.
 - `glsl.rs`: pure WGSL->GLSL translation (naga `glsl-out`, empty writer flags), dialect choice,
-  and the texture-unit table of the prelude's layout (`GROUP0_TEXTURE_BINDINGS`,
+  the reflected `fl` and named-parameter block names (by `@binding` 0 / 4), and the texture-unit table of the prelude's layout (`GROUP0_TEXTURE_BINDINGS`,
   `NEAREST_UNIT_BASE`).
 - `resources.rs`: `GlError`, `RenderTarget`, `Resources` (incl. dummy textures and the nearest
   sampler object), `build_program` (all GL object code).
@@ -35,7 +36,7 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
 - All GL calls happen with the context current (inside the callback or in `on_exit`).
 - egui_glow re-runs `prepare_painting` after each callback; this module restores only what that
   does not: framebuffer bindings, textures and sampler objects on units 0-3 / 7-10,
-  uniform-buffer bindings, own VAO/program.
+  uniform-buffer bindings (points 0 and 1), own VAO/program.
 - Texture units: `GROUP0_TEXTURE_BINDINGS[i]` is unit `i` through the linear sampler (the
   texture's own `LINEAR` parameters) and unit `NEAREST_UNIT_BASE + i` (7-10) through the nearest
   sampler object; 4-6 are free for user textures. Max unit 10 < the 16 GLES 3 / WebGL2 guarantee.
@@ -50,8 +51,8 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
 - Targets grow in `GROW_STEP` (64 px) steps, clamped to `MAX_TEXTURE_SIZE`/`MAX_RENDERBUFFER_SIZE`.
 - `install_glow` on a context that already has a glow backend destroys the old one's objects when
   given the same `glow::Context` object (pointer identity), otherwise leaves them and warns.
-- Uniform locations are never stored (`!Send` on wasm32); sampler units and the block binding
-  are set once after linking.
+- Uniform locations are never stored (`!Send` on wasm32); sampler units and the block bindings
+  (`fl` -> `UNIFORM_BINDING_POINT`, `p` -> `PARAMS_BINDING_POINT`) are set once after linking.
 - WebGL1 / GLES2 / GL < 3.3 are rejected at install (`glsl_target`), before any GL object exists.
 
 ## Tests
@@ -59,7 +60,8 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
 - Runtime: `tests/glow_headless.rs` (Linux, `#[ignore]`d; `cargo test --all-features --test
   glow_headless -- --ignored`) paints real egui frames through `egui_glow::Painter` on a
   windowless EGL device context into a plain / 4x MSAA FBO and checks read-back pixels
-  (invert, lossless identity, rounded mask, multi-pass chains, zoom, alpha, per-effect failure).
+  (invert, lossless identity, rounded mask, multi-pass chains, zoom, alpha, per-effect failure,
+  named parameters per pass).
   Extend it with every change to this backend; the demo example needs a display and is no test.
 
 ## Editing map

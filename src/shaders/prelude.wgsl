@@ -4,7 +4,7 @@
 //   fl.rect_uv, fl.texel, fl.size_px, fl.time, fl.pixels_per_point,
 //   fl.delta_time, fl.frame, fl.pointer,
 //   src(), src_px(), original(), params(), to_linear(), to_gamma(), premultiply(),
-//   unpremultiply(), luma().
+//   unpremultiply(), luma(), and `p` (the snippet's own `struct Params`, see below).
 // Every other `fl_*` / `internal_*` name, and every `fl` member not listed in the crate docs
 // (`pass_scale`, `pass_index` hold neutral values until they are documented there), is private
 // to the crate and may change.
@@ -49,8 +49,10 @@ struct FlUniforms {
 }
 
 // The complete `@group(0)` layout: every pass and the composite are bound with ALL of these
-// (unused ones get a neutral dummy), so one layout serves every module. Binding 4 is reserved
-// for a uniform block the crate appends itself; a snippet may declare no binding at all.
+// (unused ones get a neutral dummy), so one layout serves every module. Binding 4 is the
+// named-parameter block: when the snippet declares `struct Params`, the crate appends
+// `@group(0) @binding(4) var<uniform> p: Params;` AFTER the snippet (so snippet line numbers are
+// unaffected); a snippet may declare no binding at all.
 @group(0) @binding(0) var<uniform> fl: FlUniforms;
 @group(0) @binding(1) var fl_src_texture: texture_2d<f32>;
 @group(0) @binding(2) var fl_sampler: sampler;

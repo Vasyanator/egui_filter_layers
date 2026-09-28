@@ -5,8 +5,9 @@ Purpose:
 One filter layer, executed inside an `egui_glow` paint callback: capture the backdrop from the
 bound framebuffer, run the draws of the backend-neutral `plan::ChainPlan` (passes ping-pong in
 offscreen targets, then the composite back into the caller's framebuffer). Which slot a draw reads
-and writes, its viewport and its uniform block come from `plan.rs` (shared with wgpu); this file
-maps slots to GL objects, binds them on the texture units of `glsl.rs` and draws.
+and writes, its viewport and its uniform blocks (`fl` at binding point 0, the named-parameter
+block at binding point 1) come from `plan.rs` (shared with wgpu); this file maps slots to GL
+objects, binds them on the texture units of `glsl.rs`, uploads the blocks and draws.
 
 Key structures:
 - `CallerState`: the framebuffer bindings (and sample count) egui left bound, saved first.
@@ -46,12 +47,12 @@ use glow::HasContext as _;
 
 use super::GlowState;
 use super::glsl::{GROUP0_TEXTURE_BINDINGS, GlslTarget, NEAREST_UNIT_BASE};
-use super::resources::{GlError, ReadFormat, ReadFormatError, RenderTarget, ResolveTarget, Resources, UNIFORM_BINDING_POINT};
+use super::resources::{GlError, PARAMS_BINDING_POINT, ReadFormat, ReadFormatError, RenderTarget, ResolveTarget, Resources, UNIFORM_BINDING_POINT};
 use crate::backend::LayerJob;
 use crate::effect::{BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_SOURCE_TEXTURE};
 use crate::geometry::{LayerGeometry, PxRect, layer_geometry, transform_scale};
 use crate::pass::{FrameUniforms, InputUniforms, UNIFORM_BLOCK_SIZE};
-use crate::plan::{Bindings, ChainPlan, Slot, SlotMappings, TextureMapping, composite_uniforms, plan, step_uniforms};
+use crate::plan::{Bindings, ChainPlan, Slot, SlotMappings, TextureMapping, composite_params_block, composite_uniforms, params_block, plan, step_uniforms};
 
 /// Stand-in key for rejections that have no known format (no colour buffer, or a driver that
 /// cannot report it), so they are still logged only once.
@@ -456,6 +457,21 @@ unsafe fn upload_uniforms(gl: &glow::Context, buffer: glow::Buffer, bytes: &[u8;
     }
 }
 
+/// Uploads one draw's named-parameter block (`plan::params_block`, a multiple of 16 bytes and at
+/// least the program's block size) and binds it to [`PARAMS_BINDING_POINT`]. The buffer is
+/// re-specified with `glBufferData` (orphaning) because the size varies by effect.
+///
+/// # Safety
+/// `gl` must be current on this thread.
+unsafe fn upload_params(gl: &glow::Context, buffer: glow::Buffer, bytes: &[u8]) {
+    // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); `buffer` is our live params buffer, (re)allocated here with exactly `bytes`.
+    unsafe {
+        gl.bind_buffer(glow::UNIFORM_BUFFER, Some(buffer));
+        gl.buffer_data_u8_slice(glow::UNIFORM_BUFFER, bytes, glow::DYNAMIC_DRAW);
+        gl.bind_buffer_base(glow::UNIFORM_BUFFER, PARAMS_BINDING_POINT, Some(buffer));
+    }
+}
+
 /// The layer's `FrameUniforms` with the GL flags: texture storage is bottom-up (the prelude flips
 /// so `uv` stays top-down) and fragments interpolate their uv over the viewport (mode 0).
 fn frame_uniforms(geometry: &LayerGeometry, time: f32) -> FrameUniforms {
@@ -530,6 +546,7 @@ unsafe fn run_passes(gl: &glow::Context, resources: &Resources, run: &LayerRun<'
             gl.use_program(Some(*program));
             bind_textures(gl, resources, step.bindings);
             upload_uniforms(gl, resources.uniform_buffer, &step_uniforms(&frame, step, maps, pass));
+            upload_params(gl, resources.params_buffer, params_block(pass));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             if diagnose {
                 let error = gl.get_error();
@@ -559,6 +576,7 @@ unsafe fn composite(gl: &glow::Context, resources: &Resources, run: &LayerRun<'_
         gl.use_program(Some(resources.composite));
         bind_textures(gl, resources, plan.composite.bindings);
         upload_uniforms(gl, resources.uniform_buffer, &bytes);
+        upload_params(gl, resources.params_buffer, composite_params_block());
         gl.draw_arrays(glow::TRIANGLES, 0, 3);
     }
 }
@@ -579,6 +597,7 @@ unsafe fn cleanup(gl: &glow::Context) {
         }
         // The loop ends on unit 0, which egui_glow expects active.
         gl.bind_buffer_base(glow::UNIFORM_BUFFER, UNIFORM_BINDING_POINT, None);
+        gl.bind_buffer_base(glow::UNIFORM_BUFFER, PARAMS_BINDING_POINT, None);
         gl.bind_buffer(glow::UNIFORM_BUFFER, None);
         gl.bind_renderbuffer(glow::RENDERBUFFER, None);
         gl.bind_vertex_array(None);
@@ -602,7 +621,10 @@ mod tests {
         use egui::{CornerRadius, Rect, pos2, vec2};
 
         let Ok(effect) = Effect::new("id", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }") else { panic!("identity must compile") };
-        let passes: Vec<Pass> = (0..3).map(|index| Pass::new(&effect).with_param(1, [f32::from(u8::try_from(index).unwrap_or(0)) + 0.5; 4]).unwrap_or_else(|error| panic!("{error}"))).collect();
+        let mut passes: Vec<Pass> = (0..3).map(|index| Pass::new(&effect).with_param(1, [f32::from(u8::try_from(index).unwrap_or(0)) + 0.5; 4]).unwrap_or_else(|error| panic!("{error}"))).collect();
+        let named = Effect::new("named", "struct Params { tint: vec3<f32>, gain: f32 }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * vec4<f32>(p.tint * p.gain, 1.0); }");
+        let Ok(named) = named else { panic!("{named:?}") };
+        passes[2] = Pass::new(&named).with("tint", [0.25, 0.5, 0.75]).and_then(|pass| pass.with("gain", 2.0)).unwrap_or_else(|error| panic!("{error}"));
         let rect = Rect::from_min_size(pos2(40.0, 30.0), vec2(120.0, 80.0));
         let Some(geometry) = layer_geometry(rect, Rect::EVERYTHING, 1.5, [800, 600], 6.0, CornerRadius::same(8), 1.0) else { panic!("visible") };
         let capture = geometry.capture;
@@ -614,15 +636,21 @@ mod tests {
         let used = capture.size().map(|side| u32::try_from(side).unwrap_or(0));
         let maps = SlotMappings { source: TextureMapping::of(used, [256, 256], [0, 0]), ping_pong: [TextureMapping::of(used, [320, 192], [0, 0]), TextureMapping::of(used, used, [0, 0])] };
         let time = 1.25;
-        let slot = 512;
-        let wgpu_bytes = chain_uniforms(&wgpu_frame_uniforms(&geometry, time), &wgpu_plan, &passes, &geometry, &maps, slot);
+        let wgpu_uniforms = chain_uniforms(&wgpu_frame_uniforms(&geometry, time), &wgpu_plan, &passes, &geometry, &maps, 256);
         let glow_frame = frame_uniforms(&geometry, time);
         let mut glow_blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = glow_plan.steps.iter().map(|step| step_uniforms(&glow_frame, step, &maps, &passes[step.pass])).collect();
         glow_blocks.push(composite_uniforms(&glow_frame, &glow_plan, &maps, &geometry));
         assert_eq!(glow_blocks.len(), 4);
         let flags = [offsets::FLIP_Y, offsets::FRAG_MODE];
-        for (index, glow_block) in glow_blocks.iter().enumerate() {
-            let wgpu_block = &wgpu_bytes[slot * index..slot * index + UNIFORM_BLOCK_SIZE];
+        let bytes_at = |range: &std::ops::Range<u64>| &wgpu_uniforms.bytes[usize::try_from(range.start).unwrap_or(0)..usize::try_from(range.end).unwrap_or(0)];
+        // The named-parameter blocks are byte-identical: both backends upload `plan::params_block`.
+        let mut glow_params: Vec<&[u8]> = glow_plan.steps.iter().map(|step| params_block(&passes[step.pass])).collect();
+        glow_params.push(composite_params_block());
+        for ((index, glow_params), draw) in glow_params.iter().enumerate().zip(&wgpu_uniforms.draws) {
+            assert_eq!(*glow_params, bytes_at(&draw.params), "draw {index}: named parameters");
+        }
+        for ((index, glow_block), draw) in glow_blocks.iter().enumerate().zip(&wgpu_uniforms.draws) {
+            let wgpu_block = bytes_at(&draw.fl);
             let differing: Vec<usize> = (0..UNIFORM_BLOCK_SIZE / 4).map(|word| word * 4).filter(|&at| glow_block[at..at + 4] != wgpu_block[at..at + 4]).collect();
             assert_eq!(differing, flags, "block {index}: only the backend flags may differ");
         }
