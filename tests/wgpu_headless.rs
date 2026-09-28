@@ -21,6 +21,8 @@
 //! frame when the id is painted twice, stretched (not reset) when the layer grows past its
 //! allocation, dropped by a re-install; a stateful layer without an id is refused.
 //!
+//! All tests share one wgpu device (`GPU`, a test-only static; see there) and run in parallel on it.
+//!
 //! Needs a GPU adapter (Vulkan, Metal, DX12 or GL), so it is ignored by default:
 //! `cargo test --all-features -- --ignored`.
 
@@ -35,33 +37,37 @@ use egui_filter_layers::{BackendStatus, Effect, FilterChain, FilterLayer, Pass, 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 128;
 
-/// Serializes Vulkan instance / device creation across the parallel tests of this file: the
-/// Vulkan loader with the Khronos validation layer (enabled by wgpu in debug builds) crashed
-/// (SIGSEGV inside `libvulkan` / `libVkLayer_khronos_validation`, in `vkCreateInstance` and
-/// `vkEnumerateInstanceExtensionProperties`) when ~14 tests created instances concurrently on
-/// Mesa radv. Test-only; the rendering itself still runs in parallel.
-static GPU_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// The one wgpu instance, adapter, device and queue shared by every test of this file, created
+/// on first use (`None` when there is no adapter or device, with the reason printed). Test-only
+/// static: with the Khronos validation layer (enabled by wgpu in debug builds) on Mesa radv, one
+/// device per test crashed about one run in ten (SIGSEGV inside `libvulkan` called from
+/// `libVkLayer_khronos_validation`, e.g. in `vkSetDebugUtilsObjectNameEXT` of `create_bind_group`,
+/// or in `vkCreateInstance`) while other tests created or destroyed their own instances. One
+/// device keeps full validation and lets the tests still render in parallel: wgpu's handles are
+/// `Send + Sync` and its error scopes are per thread.
+static GPU: std::sync::OnceLock<Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)>> = std::sync::OnceLock::new();
 
-/// Device, queue and adapter of any available GPU, or `None` with the reason printed.
+/// Handles to the shared GPU of [`GPU`], or `None` with the reason printed (once).
 fn gpu() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
-    // A panicking test cannot corrupt `()`, so a poisoned lock is still usable.
-    let _serialized = GPU_INIT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-    let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) {
-        Ok(adapter) => adapter,
-        Err(error) => {
-            eprintln!("no wgpu adapter: {error}");
-            return None;
+    GPU.get_or_init(|| {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                eprintln!("no wgpu adapter: {error}");
+                return None;
+            }
+        };
+        eprintln!("adapter: {:?}", adapter.get_info());
+        match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
+            Ok((device, queue)) => Some((instance, adapter, device, queue)),
+            Err(error) => {
+                eprintln!("no wgpu device: {error}");
+                None
+            }
         }
-    };
-    eprintln!("adapter: {:?}", adapter.get_info());
-    match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
-        Ok((device, queue)) => Some((instance, adapter, device, queue)),
-        Err(error) => {
-            eprintln!("no wgpu device: {error}");
-            None
-        }
-    }
+    })
+    .clone()
 }
 
 /// Paints the scene of one frame into `ui`.

@@ -25,7 +25,8 @@
 //!   `reset_state` starts over, a new frame size continues the state, a stateful chain refuses
 //!   tiling (`NotTileable`); the `wave_sim` preset spreads a centred impulse symmetrically and its
 //!   energy stays bounded over many frames.
-//! * The GPU tests of this file run one at a time (`GPU_TESTS`, see there).
+//! * The GPU tests of this file share one device (`GPU`, a test-only static; see there) and run
+//!   in parallel on it.
 //!
 //! Needs a GPU adapter, so the tests are ignored by default:
 //! `cargo test --all-features --test offline_equivalence -- --ignored --nocapture`.
@@ -42,26 +43,46 @@ const HEIGHT: u32 = 128;
 /// `fl.time` of every case (exact in `f32` and `f64`).
 const TIME: f32 = 0.375;
 
-/// Serializes the GPU tests of this file, each for its whole duration. With wgpu's Vulkan
-/// validation layer (debug builds) on Mesa radv, tests running in parallel crashed with SIGSEGV
-/// inside `libVkLayer_khronos_validation` (e.g. in `vkSetDebugUtilsObjectNameEXT` of one test's
-/// buffer creation while others created or destroyed instances) in about half the runs; locking
-/// only instance creation (as `wgpu_headless.rs` does) was not enough here. Test-only.
-static GPU_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Everything the tests of this file render with, created once on first use.
+struct SharedGpu {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    /// A second device of `adapter` with `max_buffer_size` = [`SMALL_BUFFER_LIMIT`], or why it
+    /// could not be created (only the test using it fails then).
+    limited: Result<(wgpu::Device, wgpu::Queue), String>,
+}
 
-/// The lock of [`GPU_TESTS`], held by a test until it ends (a panicking test cannot corrupt
-/// `()`, so a poisoned lock is still usable).
-type Serialized = std::sync::MutexGuard<'static, ()>;
+/// `max_buffer_size` of [`SharedGpu::limited`].
+const SMALL_BUFFER_LIMIT: u64 = 1 << 20;
 
-/// Device, queue and adapter of any available GPU, and the lock serializing this file's GPU
-/// tests (keep it alive for the whole test); panics with the reason otherwise.
-fn gpu() -> (Serialized, wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue) {
-    let serialized = GPU_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap_or_else(|error| panic!("no wgpu adapter: {error}"));
-    eprintln!("adapter: {:?}", adapter.get_info());
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap_or_else(|error| panic!("no wgpu device: {error}"));
-    (serialized, instance, adapter, device, queue)
+/// The one GPU shared by every test of this file (test-only static). With wgpu's Vulkan
+/// validation layer (debug builds) on Mesa radv, tests creating and destroying their own
+/// instances and devices in parallel crashed with SIGSEGV inside `libvulkan` called from
+/// `libVkLayer_khronos_validation` (e.g. in `vkSetDebugUtilsObjectNameEXT` of one test's
+/// resource creation while another created or destroyed a device). All devices are therefore
+/// created here, together and once, and never destroyed; the tests keep full validation and run
+/// in parallel on them (wgpu's handles are `Send + Sync`, its error scopes are per thread).
+static GPU: std::sync::OnceLock<SharedGpu> = std::sync::OnceLock::new();
+
+/// The shared GPU of [`GPU`]; panics with the reason when there is no adapter or device.
+fn shared_gpu() -> &'static SharedGpu {
+    GPU.get_or_init(|| {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap_or_else(|error| panic!("no wgpu adapter: {error}"));
+        eprintln!("adapter: {:?}", adapter.get_info());
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap_or_else(|error| panic!("no wgpu device: {error}"));
+        let limits = wgpu::Limits { max_buffer_size: SMALL_BUFFER_LIMIT, ..wgpu::Limits::default() };
+        let limited = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).map_err(|error| error.to_string());
+        SharedGpu { instance, adapter, device, queue, limited }
+    })
+}
+
+/// Handles to the shared device, queue and adapter of [`GPU`]; panics with the reason otherwise.
+fn gpu() -> (wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue) {
+    let shared = shared_gpu();
+    (shared.instance.clone(), shared.adapter.clone(), shared.device.clone(), shared.queue.clone())
 }
 
 /// A deterministic test image: gradients, hash noise and hard edges; `alpha(x, y)` per pixel.
@@ -170,13 +191,11 @@ struct Ui {
     texture: egui::TextureHandle,
     /// Pixels per point.
     ppp: f32,
-    /// This file's GPU-test lock, held while the `Ui` lives.
-    _serialized: Serialized,
 }
 
 impl Ui {
     fn new(format: wgpu::TextureFormat, dithering: bool, ppp: f32, image: &[u8]) -> Self {
-        let (serialized, instance, adapter, device, queue) = gpu();
+        let (instance, adapter, device, queue) = gpu();
         // One value feeds both, so egui's pass and the filter's pipelines cannot drift apart.
         let renderer_options = egui_wgpu::RendererOptions { dithering, ..Default::default() };
         let renderer = egui_wgpu::Renderer::new(&device, format, renderer_options);
@@ -205,7 +224,7 @@ impl Ui {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        Self { ctx, state, target, texture, ppp, _serialized: serialized }
+        Self { ctx, state, target, texture, ppp }
     }
 
     /// The image (1:1, the whole screen) under a layer covering it, as egui-wgpu draws it;
@@ -433,7 +452,7 @@ fn a_translucent_image_over_a_background_is_within_one_step() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn tiled_frames_equal_whole_frames() {
-    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let (_instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let (width, height) = (300, 200);
     let image = test_image(width, height, |x, y| if (x + y) % 5 == 0 { 128 } else { 255 });
@@ -468,7 +487,7 @@ fn tiled_frames_equal_whole_frames() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn an_empty_chain_and_identity_effects_keep_the_frame() {
-    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let (_instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let image = test_image(70, 33, |_, _| 255);
     let frame = FrameRef::new(&image, 70, 33, AlphaMode::Straight);
@@ -485,7 +504,7 @@ fn an_empty_chain_and_identity_effects_keep_the_frame() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn default_tiling_equals_an_untiled_run() {
-    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let (_instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let (width, height) = (egui_filter_layers::offline::DEFAULT_MAX_TILE_SIZE + 200, 96);
     assert!(device.limits().max_texture_dimension_2d >= width, "the device cannot run the frame untiled");
@@ -504,11 +523,11 @@ fn default_tiling_equals_an_untiled_run() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn a_small_buffer_limit_is_respected_by_tiling() {
-    let (_serialized, _instance, adapter, device, queue) = gpu();
-    let limits = wgpu::Limits { max_buffer_size: 1 << 20, ..wgpu::Limits::default() };
-    let (small_device, small_queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() })).unwrap_or_else(|error| panic!("no limited device: {error}"));
+    let (_instance, adapter, device, queue) = gpu();
+    let (small_device, small_queue) = shared_gpu().limited.as_ref().unwrap_or_else(|error| panic!("no limited device: {error}"));
+    assert_eq!(small_device.limits().max_buffer_size, SMALL_BUFFER_LIMIT);
     let mut reference = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
-    let mut limited = OfflineRenderer::new(&adapter, &small_device, &small_queue).unwrap_or_else(|error| panic!("{error}"));
+    let mut limited = OfflineRenderer::new(&adapter, small_device, small_queue).unwrap_or_else(|error| panic!("{error}"));
     let (width, height) = (1000, 700);
     let image = test_image(width, height, |_, _| 255);
     let frame = FrameRef::new(&image, width, height, AlphaMode::Straight);
@@ -524,7 +543,7 @@ fn a_small_buffer_limit_is_respected_by_tiling() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn a_cancelled_readback_does_not_brick_the_renderer() {
-    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let (_instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let image = test_image(WIDTH, HEIGHT, |_, _| 255);
     let frame = FrameRef::new(&image, WIDTH, HEIGHT, AlphaMode::Straight);
@@ -547,7 +566,7 @@ fn a_cancelled_readback_does_not_brick_the_renderer() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn original_returns_the_input_in_every_pass_and_tile() {
-    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let (_instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let (width, height) = (300, 200);
     let image = test_image(width, height, |_, _| 255);
@@ -577,7 +596,7 @@ fn offline_frame_input_follows_the_options_and_the_video_clock() {
     use egui_filter_layers::PointerState;
     use egui_filter_layers::offline::video::VideoProcessor;
 
-    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let (_instance, adapter, device, queue) = gpu();
     let (width, height) = (96, 64);
     let image = test_image(width, height, |_, _| 255);
     let frame = FrameRef::new(&image, width, height, AlphaMode::Straight);
@@ -665,7 +684,7 @@ fn scaled_chains_offline_equal_the_ui() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn scaled_chains_refuse_tiling_and_run_whole() {
-    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let (_instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let (width, height) = (300, 200);
     let image = test_image(width, height, |_, _| 255);
@@ -746,7 +765,7 @@ fn user_textures_offline_equal_the_ui() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn missing_and_invalid_textures_are_typed_errors() {
-    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let (_instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let image = test_image(16, 8, |_, _| 255);
     let frame = FrameRef::new(&image, 16, 8, AlphaMode::Straight);
@@ -791,7 +810,7 @@ fn accumulated(runs: usize) -> u8 {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn offline_state_accumulates_across_runs_and_refuses_tiling() {
-    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let (_instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     let chain = accumulator();
     let small = test_image(40, 30, |_, _| 255);
@@ -822,7 +841,7 @@ fn offline_state_accumulates_across_runs_and_refuses_tiling() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn wave_sim_spreads_an_impulse_symmetrically_and_stays_bounded() {
-    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let (_instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     const SIDE: u32 = 65;
     const GAIN: f64 = 0.25 * 255.0;
@@ -886,7 +905,7 @@ fn wave_sim_spreads_an_impulse_symmetrically_and_stays_bounded() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn trails_fade_by_their_decay_per_second() {
-    let (_serialized, _instance, adapter, device, queue) = gpu();
+    let (_instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
     const SIDE: u32 = 48;
     let square_at = |left: u32| (0..SIDE).flat_map(|y| (0..SIDE).map(move |x| (x, y))).flat_map(|(x, y)| if (left..left + 8).contains(&x) && (20..28).contains(&y) { [255_u8; 4] } else { [0, 0, 0, 255] }).collect::<Vec<u8>>();

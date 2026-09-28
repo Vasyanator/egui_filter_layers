@@ -14,6 +14,8 @@
 //!   the output is never the input and never left half-written; cover art is skipped, the
 //!   sample aspect ratio is kept, and file names with `:` or a leading `-` work.
 //!
+//! The tests share one wgpu device (`GPU`, a test-only static; see there).
+//!
 //! Needs a GPU adapter (and `ffmpeg` / `ffprobe` on `PATH` for the end-to-end test), so the tests
 //! are ignored by default: `cargo test --all-features --test video -- --ignored --nocapture`.
 
@@ -30,9 +32,27 @@ use egui_filter_layers::{AlphaMode, Effect, FilterChain, FrameRef, OfflineOption
 const WIDTH: u32 = 48;
 const HEIGHT: u32 = 32;
 
-/// A headless renderer; panics with the reason when there is no GPU.
+/// The one adapter, device and queue shared by every test of this file (test-only static).
+/// With wgpu's Vulkan validation layer (debug builds) on Mesa radv, tests creating and destroying
+/// their own instances and devices in parallel can crash with SIGSEGV inside `libvulkan` called
+/// from `libVkLayer_khronos_validation` (seen in `wgpu_headless.rs` and `offline_equivalence.rs`),
+/// so the device is created once and never destroyed; the tests run in parallel on it.
+static GPU: std::sync::OnceLock<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> = std::sync::OnceLock::new();
+
+/// A renderer on the shared device of [`GPU`] (like `OfflineRenderer::headless`: the default
+/// adapter with its full limits); panics with the reason when there is no GPU.
 fn renderer() -> OfflineRenderer {
-    OfflineRenderer::headless().unwrap_or_else(|error| panic!("no GPU for the test: {error}"))
+    let (adapter, device, queue) = GPU.get_or_init(|| {
+        // `OfflineRenderer::headless` is still exercised, once, while every other test of this
+        // file waits for this initializer (so its own instance and device come and go alone).
+        drop(OfflineRenderer::headless().unwrap_or_else(|error| panic!("no GPU for the test: {error}")));
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap_or_else(|error| panic!("no wgpu adapter: {error}"));
+        let descriptor = wgpu::DeviceDescriptor { required_limits: adapter.limits(), ..Default::default() };
+        let (device, queue) = pollster::block_on(adapter.request_device(&descriptor)).unwrap_or_else(|error| panic!("no wgpu device: {error}"));
+        (adapter, device, queue)
+    });
+    OfflineRenderer::new(adapter, device, queue).unwrap_or_else(|error| panic!("no renderer for the test: {error}"))
 }
 
 fn rate(numerator: u32, denominator: u32) -> FrameRate {
