@@ -1,0 +1,82 @@
+[package]
+name = "egui_filter_layers"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "GPU filter layers for egui: redraw everything painted beneath a rect through a chain of WGSL effects (blur, colour adjustments, refraction, custom shaders) on egui_glow and egui-wgpu."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Vasyanator/egui_filter_layers"
+documentation = "https://docs.rs/egui_filter_layers"
+keywords = ["egui", "shader", "blur", "filter", "wgsl"]
+categories = ["gui", "graphics", "rendering"]
+authors = ["Vasyanator"]
+# `assets/` holds the README GIFs; the README links them by absolute URL, so they stay out of the package.
+exclude = ["MODULE_README.md", "**/MODULE_README.md", "assets/"]
+
+[lib]
+name = "egui_filter_layers"
+
+[features]
+default = ["glow", "wgpu"]
+## OpenGL / WebGL2 backend (`egui_glow`). Effects are translated from WGSL to GLSL with naga.
+glow = ["dep:egui_glow", "dep:glow", "naga/glsl-out"]
+## wgpu backend (`egui-wgpu`, native and web).
+wgpu = ["dep:egui-wgpu", "dep:wgpu", "dep:bytemuck", "egui/bytemuck"]
+## Offline processing of still images (`OfflineRenderer`, `offline` module) on wgpu, with PNG /
+## JPEG adapters through the `image` crate. Enable more formats through `image`'s own features.
+image = ["wgpu", "dep:image"]
+## Offline processing of video (`offline::video`): a frame-stream processor, `VideoSource` /
+## `VideoSink` traits with `process_video`, and (native) ffmpeg / ffprobe command-line adapters.
+## No extra Rust dependencies; the ffmpeg adapters need the `ffmpeg` and `ffprobe` programs.
+## Image-sequence adapters when `image` is enabled too.
+video = ["wgpu"]
+
+[dependencies]
+egui = { version = "0.36", default-features = false }
+# WGSL front end: every effect is parsed and validated here, whatever the backend.
+naga = { version = "30", features = ["wgsl-in"] }
+# Renders naga's error labels against the user's snippet (already in the tree through naga).
+codespan-reporting = { version = "0.13", default-features = false }
+thiserror = "2.0.18"
+log = "0.4.33"
+
+egui_glow = { version = "0.36", default-features = false, optional = true }
+# Must stay on the same glow line as egui_glow: `&glow::Context` crosses the public API.
+glow = { version = "0.17", optional = true }
+
+# Default features on purpose, matching eframe's own `wgpu` feature: without them wgpu has no
+# backend on wasm32 (egui-wgpu then fails to compile) and no default native backends.
+egui-wgpu = { version = "0.36", optional = true }
+wgpu = { version = "30", default-features = false, features = ["wgsl"], optional = true }
+# Zero-copy upload of egui vertices / indices (egui's `bytemuck` feature makes `Vertex: Pod`).
+bytemuck = { version = "1.25", optional = true }
+# Decoding / encoding for the `image` feature; `default-features = false` keeps rayon and the
+# heavy codecs (AVIF, EXR, TIFF, ...) out. Users add formats with `image`'s own features.
+image = { version = "0.25.6", default-features = false, features = ["png", "jpeg"], optional = true }
+
+[dev-dependencies]
+# Blocks on wgpu's adapter / device futures in the headless GPU integration test.
+pollster = "0.4"
+eframe = { version = "0.36", default-features = false, features = ["glow", "wgpu", "default_fonts", "wayland", "x11"] }
+
+[[example]]
+name = "demo"
+required-features = ["glow", "wgpu"]
+
+[[example]]
+name = "process_image"
+required-features = ["image"]
+
+[[example]]
+name = "process_video"
+required-features = ["video"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Standalone crate: it may be checked out inside another project's cargo
+# workspace, and must not be swallowed by it. An empty table opts this package
+# out of any parent workspace.
+[workspace]

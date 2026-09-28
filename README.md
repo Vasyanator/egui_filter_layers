@@ -1,0 +1,371 @@
+# egui_filter_layers
+
+GPU **filter layers** for [egui](https://github.com/emilk/egui): a shape that takes everything
+already painted beneath a rect and redraws that region through a chain of filter passes —
+blur, colour adjustments, refraction, or your own WGSL shader.
+
+- Presets: Gaussian blur, brightness/contrast, saturation, grayscale, invert, tint, sharpen,
+  pixelate, ripple (animated), lens, vignette, frosted glass.
+- Custom effects: write one WGSL function; it is validated by [naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga)
+  when you build it, with errors pointing at your snippet.
+- Rounded-rect masks with anti-aliased edges.
+- View-only: never touches egui textures or your data.
+- One shader language on every backend (WGSL, translated to GLSL for OpenGL).
+
+| Brightness / contrast | Invert | Ripple (animated) |
+|---|---|---|
+| ![brightness_contrast(0.15, 1.8)](https://raw.githubusercontent.com/Vasyanator/egui_filter_layers/master/assets/contrast.gif) | ![invert(1.0)](https://raw.githubusercontent.com/Vasyanator/egui_filter_layers/master/assets/invert.gif) | ![ripple(6.0, 40.0, 0.5)](https://raw.githubusercontent.com/Vasyanator/egui_filter_layers/master/assets/waves.gif) |
+
+> [!WARNING]
+> **wgpu: the content under a filter is rendered twice per frame.** egui-wgpu renders into a
+> surface that cannot be read back mid-frame, so the wgpu backend re-renders everything painted
+> beneath each filter layer (clipped to the layer's padded rect) into an offscreen texture, then
+> filters it. Budget for that extra tessellation and fill. Paint callbacks beneath a filter
+> (your own 3D views, other filter layers) cannot be re-rendered and are left out of its backdrop.
+
+## Backends
+
+| Renderer | How the backdrop is obtained | Status |
+|---|---|---|
+| `egui_glow`, OpenGL 3.3+ / OpenGL ES 3.0+ | copied from the framebuffer inside the paint callback (MSAA resolved) | supported (feature `glow`) |
+| `egui_glow`, WebGL2 | same | supported (feature `glow`) |
+| `egui_glow`, WebGL1 / OpenGL < 3.3 / OpenGL ES 2 | — | **unsupported**: `install_glow` returns `InstallError::Unsupported`, layers draw nothing |
+| `egui-wgpu` (Vulkan, Metal, DX12, GL, WebGPU, WebGL2) | the content beneath is **rendered a second time** offscreen | supported (feature `wgpu`) |
+
+Both features are on by default. Disable the one you do not use:
+
+```toml
+egui_filter_layers = { version = "0.1", default-features = false, features = ["glow"] }
+```
+
+## Compatibility
+
+| egui_filter_layers | egui / eframe | wgpu (via egui-wgpu) | glow (via egui_glow) | MSRV |
+|---|---|---|---|---|
+| 0.1 | 0.36 | 30 (egui-wgpu 0.36) | 0.17 (egui_glow 0.36) | Rust 1.95 |
+
+These crates appear in the public API, so moving to a new egui / wgpu / glow line is a breaking
+release of this crate.
+
+## Quick start (eframe + glow)
+
+```rust
+use eframe::egui;
+use egui_filter_layers::{FilterLayer, presets};
+
+struct App {
+    ctx: egui::Context,
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        if let Some(gl) = &cc.gl {
+            // Logs and returns an error on unsupported contexts (e.g. WebGL1); never panics.
+            if let Err(error) = egui_filter_layers::install_glow(&cc.egui_ctx, gl) {
+                eprintln!("filters disabled: {error}");
+            }
+        }
+        Self { ctx: cc.egui_ctx.clone() }
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default_margins().show(ui, |ui| {
+            ui.heading("Everything painted before the layer gets filtered");
+            // ... your content ...
+            let rect = egui::Rect::from_min_size(egui::pos2(60.0, 60.0), egui::vec2(300.0, 200.0));
+            FilterLayer::new(rect, presets::gaussian_blur(8.0).then(presets::saturation(1.4)))
+                .corner_radius(16)
+                .paint(ui.painter());
+        });
+    }
+
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        // OpenGL objects need explicit teardown while the context is current.
+        if let Some(gl) = gl {
+            egui_filter_layers::destroy_glow(&self.ctx, gl);
+        }
+    }
+}
+```
+
+## Quick start (eframe + wgpu)
+
+```rust
+fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    if let Some(render_state) = &cc.wgpu_render_state {
+        // MUST describe egui's render pass: mirror your eframe::NativeOptions
+        // (multisampling, depth_buffer, stencil_buffer, dithering). The default IS eframe's
+        // default; e.g. `.with_multisampling(4)` if you set `multisampling: 4`.
+        let options = egui_filter_layers::WgpuOptions::default();
+        if let Err(error) = egui_filter_layers::install_wgpu(&cc.egui_ctx, render_state, options) {
+            eprintln!("filters disabled: {error}");
+        }
+    }
+    Self {}
+}
+```
+
+No teardown is needed on wgpu: the GPU objects live in egui-wgpu's callback resources. If your
+`App::clear_color` is not eframe's default, pass it with `WgpuOptions::with_clear_color` (it is the
+backdrop wherever nothing opaque was painted). A custom integration that builds its own
+`egui_wgpu::RendererOptions` can use `WgpuOptions::from(&renderer_options)`.
+
+**`WgpuOptions` must match egui's render pass.** egui-wgpu does not expose its MSAA / depth
+configuration, so the crate cannot check it: a mismatch is a wgpu validation error on egui's own
+command encoder — a **panic** natively and on WebGL2 (wgpu's default error handler; eframe
+installs none), a console error and a lost frame on browser WebGPU.
+
+Show `egui_filter_layers::status(ctx)` somewhere during development: apart from a mismatched
+`WgpuOptions`, a missing or failed backend never panics, it just leaves the backdrop unfiltered,
+and `status` tells you why.
+
+## Custom effects
+
+An `Effect` is one WGSL function. `uv` is the position of the pixel being written inside the
+captured region (`(0, 0)` top-left, y down); colours are premultiplied-alpha, gamma-space RGBA —
+exactly what egui drew.
+
+```rust
+use egui_filter_layers::{Effect, FilterLayer, Pass};
+
+let wave = Effect::new("wave", r#"
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let amplitude = params(0u).x * fl.pixels_per_point;
+    let offset = sin(uv.y * 40.0 + fl.time * 3.0) * amplitude;
+    return src_px(vec2<f32>(offset, 0.0));
+}
+"#)?                       // EffectError carries naga's diagnostic and the line in your snippet
+.with_sample_radius(6.0); // reads up to 6 points away: pad the capture
+
+// Build the Effect once and keep it; per frame, only the Pass parameters change.
+let pass = Pass::new(&wave).with_param(0, [6.0, 0.0, 0.0, 0.0])?;
+FilterLayer::new(rect, pass).paint(ui.painter());
+```
+
+Prelude available to every effect:
+
+| Name | Meaning |
+|---|---|
+| `src(uv)` | pass input, bilinear, clamped to the captured region |
+| `src_px(offset)` | input at `offset` physical pixels from the current pixel |
+| `params(i)` | `vec4<f32>` parameter slot `i` (`0..16`) of the pass |
+| `fl.texel`, `fl.size_px` | one pixel in `uv` units; capture size in pixels |
+| `fl.rect_uv` | the layer rect inside the capture (`xy` min, `zw` size) |
+| `fl.time`, `fl.pixels_per_point` | egui time in seconds; physical pixels per layer point (egui scale factor × layer zoom) |
+| `to_linear`, `to_gamma`, `premultiply`, `unpremultiply`, `luma` | colour helpers |
+
+An effect whose code reads `fl.time` is detected as **animated** (from naga's IR, not a text
+search): painting a layer with it requests an egui repaint every frame, so it keeps moving in an
+otherwise idle app (copying the whole block, `let u = fl;`, also counts). Override with
+`Effect::with_animated(false / true)`. Effects cannot declare their own bindings, entry points or
+`override` constants.
+
+Distances are in **layer points**: sample radii, corner radii and effect distances converted
+with `fl.pixels_per_point` scale with the zoom of the layer the filter is painted in (an
+`egui::Scene` or `Context::set_transform_layer`), just like the content around them — a 4-point
+blur covers 8 pixels at zoom 2 — and the capture padding follows.
+
+`EffectError::diagnostic()` returns naga's full report rendered against your snippet, so its line
+numbers match `EffectError::location()`.
+
+Chains run pass by pass (ping-pong): `presets::gaussian_blur(6.0).then(Pass::new(&wave))`.
+
+## Semantics and limitations
+
+- **"Beneath" means earlier in egui's paint order**: lower layers and shapes painted earlier into
+  the same layer. Later shapes, higher `egui::Order` areas, popups and tooltips are drawn on top
+  and are not filtered. Paint the filter layer right after the content it should affect.
+- **Padding**: neighbourhood effects (blur, refraction) read beyond the rect. The capture is
+  expanded by the chain's total sample radius and clamped to the screen; at the screen edge
+  sampling clamps to the last pixel.
+- **Precision**: the backdrop is 8-bit gamma-encoded; intermediates are RGBA16F where the GPU can
+  render to it (wgpu adapters that report RGBA16F renderable + filterable, desktop GL 3.3, WebGL2
+  with `EXT_color_buffer_float`), else RGBA8.
+- **OpenGL resources** must be freed with `destroy_glow` from `App::on_exit`. Calling
+  `install_glow` again with the same GL context frees the previous backend's objects first.
+- **OpenGL framebuffer formats**: the backdrop is blitted out of the framebuffer, which requires a
+  normalized fixed-point colour buffer; a multisampled one is resolved through a renderbuffer of
+  the same format (RGBA8, RGB8, RGB565, RGBA4, RGB5_A1, RGB10_A2, SRGB8_ALPHA8). Layers painted
+  into a float / integer / other framebuffer are skipped (logged once).
+- **Failures are contained**: an effect the driver rejects (or whose draw raises a GL error) is
+  disabled alone and listed by `failed_effects`; only failures of the crate's own GPU work disable
+  the backend (`status`). Either way nothing panics and the backdrop stays unfiltered. With a failed
+  backend, animated layers stop requesting repaints. The one exception is a `WgpuOptions` that
+  does not match egui's render pass (see the wgpu quick start): it cannot be detected, and wgpu
+  rejects egui's whole frame.
+- The installed backend lives in the `egui::Context` itself, so resetting egui `Memory` does not
+  uninstall it.
+- **wgpu specifics**: the backdrop is re-rendered (see the warning above), so a filter over another
+  filter sees the lower one's *unfiltered* backdrop, and paint callbacks beneath a filter are left
+  out of its backdrop. Outside a rounded mask (the corners of the layer's rect) the screen keeps
+  what is already there, so a lower filter does show through the corners. The beneath content is
+  collected by an egui plugin at the end of every pass (`Context::run_ui` / `end_pass`, which
+  eframe uses). On an `*Srgb` surface the backdrop is re-rendered with egui's linear blending,
+  except on GL / WebGL2 (no texture view formats): there semi-transparent edges under a filter
+  blend in gamma and visibly differ from the unfiltered screen (about 25 steps measured for 50%
+  white over dark grey; logged once); egui-wgpu
+  prefers non-sRGB surfaces, so this is rare. egui-wgpu's `predictable_texture_filtering` is not
+  mirrored by the re-render.
+- **WebGL1 is not supported.**
+
+## Offline: images and video
+
+The same chains run outside the UI: `OfflineRenderer` filters an ordinary RGBA8 frame (an image,
+a video frame) on wgpu and returns the pixels — what a filter layer covering that frame shows on
+screen. Use it to export what an editor previews.
+
+| Feature | Default | Adds |
+|---|---|---|
+| `glow` | yes | the `egui_glow` backend |
+| `wgpu` | yes | the `egui-wgpu` backend |
+| `image` | no | `OfflineRenderer` (implies `wgpu`) and PNG / JPEG adapters through the [`image`](https://crates.io/crates/image) crate (`default-features = false`) |
+| `video` | no | `OfflineRenderer` (implies `wgpu`) plus video processing (`offline::video`): frame streams, source / sink traits, ffmpeg command-line adapters; no extra Rust dependencies |
+
+Offline processing is wgpu-only; a glow app enables `image` / `video` just for export (its preview and
+export then agree within rounding, not bit for bit). More image formats: enable them on your own
+`image` dependency, e.g. `image = { version = "0.25", features = ["webp", "gif"] }`.
+
+```rust
+use egui_filter_layers::{AlphaMode, FrameRef, OfflineOptions, OfflineRenderer, presets};
+
+// On a worker thread: processing blocks until the GPU is done.
+let mut renderer = OfflineRenderer::from_render_state(&render_state)?; // or ::headless()?
+let chain = presets::gaussian_blur(4.0).then(presets::vignette(0.6, 0.4, 0.5));
+let options = OfflineOptions::default()
+    .with_pixels_per_point(1.0) // image pixels per layer point
+    .with_time(0.0);            // fl.time; the frame's timestamp for video
+let frame = FrameRef::new(&rgba, width, height, AlphaMode::Straight);
+let result = renderer.process(&frame, &chain, &options)?; // straight-alpha RGBA8
+
+// With the `image` feature:
+renderer.process_file("in.png".as_ref(), "out.jpg".as_ref(), &chain, &options)?;
+```
+
+`process_into` reuses one output buffer for frame streams (decode a video with any library,
+pass each frame with its presentation time); `process_async` is the non-blocking variant (on the
+web, or anywhere the device is polled by someone else). `cargo run --example process_image
+--features image -- in.png out.png` runs a complete example.
+
+**Identical to the UI** (bit for bit) when all of these hold:
+
+- the renderer runs on the UI's device (`OfflineRenderer::from_render_state`);
+- the UI shows the frame 1:1 — one frame pixel per physical pixel, pixel-aligned — and the
+  layer covers exactly the frame with its capture ending at the frame's edges (e.g. the frame
+  fills the viewport); `with_pixels_per_point` is then egui's scale factor;
+- dithering is off (`WgpuOptions::with_dithering(false)` and egui-wgpu's own) and the surface is not `*Srgb`;
+- the frame is opaque, or `with_background` gives the colour it is drawn over in the UI.
+
+Measured on the crate's GPU tests: 0 differing bytes for every preset and a custom effect at 1
+and 2 pixels per point. The one exception is the 1-px antialiased edge of a rounded mask
+(`corner_radius`): on wgpu the UI blends the filter over the screen by coverage there, so that
+edge differs by up to one step (and on an sRGB surface, where the blend happens in linear like
+egui's own antialiasing, by tens of steps: up to 70 measured on a high-contrast blur + invert).
+Otherwise:
+
+- dithering adds under one step to the UI's backdrop, which an effect amplifies by its gain
+  (colour effects: 1-2 steps, a strong sharpen more); an sRGB surface differs by one step
+  (outside a rounded mask's edge); a translucent frame over a background by one step;
+- a frame shown at another zoom is filtered as a resampled image in the UI: a preview, not the
+  export. Which `with_pixels_per_point` matches the editor's effect distances depends on how it
+  zooms: an image *painted* `zoom` times larger (no layer transform) needs `ui_ppp / zoom`; a
+  zoom by a layer transform (`egui::Scene`, the image painted 1:1 in layer points) scales the
+  effects together with the image, so the match is the UI's `ppp` itself at any zoom;
+- effects that sample *between* texel centres (refraction: ripple, lens, custom displacement,
+  and `gaussian_blur` above `sigma * pixels_per_point = 32 / 3`, where its taps step over pixels)
+  go through hardware bilinear filtering, whose sub-texel weights can differ rarely (a few pixels
+  in 100 000, at most 2 steps) with the texture size — so when the UI's grow-only capture
+  texture is larger than the layer, or when a frame is tiled;
+- the pipeline is 8-bit (like the UI's capture): 16-bit images are converted first; colour
+  profiles are ignored (sRGB assumed).
+
+**Large frames** are processed in tiles overlapping by the chain's sample radius: by default
+above 4096 pixels per side (`offline::DEFAULT_MAX_TILE_SIZE`, about 450 MiB of GPU memory per
+run), or the cap set by `with_max_tile_size` (`None` = the device's texture limit), and always
+within the device's texture and buffer limits. Results are identical to whole-frame processing
+except for the rare sub-texel differences above — so a frame larger than 4096 pixels that the
+UI shows untiled matches it bit for bit only with `with_max_tile_size(None)`. A device that runs
+out of memory yields `OfflineError::OutOfMemory` (retry with smaller tiles), never a panic. Effects must not read further than their
+declared sample radius — the `lens` preset reads anywhere in the layer, so give a tiled lens
+`Pass::with_sample_radius`. At the frame border sampling clamps to the edge, exactly as the UI
+clamps at the screen edge.
+
+### Video
+
+`video` gives four ways in, from the lowest level up:
+
+1. **Your own decode loop**: `VideoProcessor::process_frame(&frame, time_seconds)` filters one
+   frame; the device, pipelines, textures and readback buffers are reused across frames
+   (`process_frame_into` fills your buffer, `process_frame_async` awaits). `time_seconds` becomes
+   `fl.time`, so animated effects follow the video's timeline.
+2. **Your own source and sink**: implement the small, object-safe `VideoSource` (`info`,
+   `read_frame`) and `VideoSink` (`begin`, `write_frame`, `finish`, `abort`) traits — e.g. over
+   [ffmpeg-next](https://crates.io/crates/ffmpeg-next) or GStreamer; their docs sketch both — and
+   call `process_video(&mut processor, &mut source, &mut sink, progress)`. The progress callback
+   sees every frame and cancels by returning `ControlFlow::Break`.
+3. **The ffmpeg programs** (native): `FfmpegSource` / `FfmpegSink`, or in one call:
+
+   ```rust
+   use egui_filter_layers::offline::video::{VideoProcessor, ffmpeg::{AudioMode, FfmpegTranscode, VideoCodec}};
+
+   let mut processor = VideoProcessor::new(OfflineRenderer::headless()?, chain, OfflineOptions::default());
+   FfmpegTranscode::new("in.mp4", "out.mp4")
+       .with_codec(VideoCodec::H264 { crf: 18 })   // or Vp9, Av1, ProRes4444, Ffv1, Gif, Custom
+       .with_audio(AudioMode::Copy)                // the default; or Encode(args) / Drop
+       .run(&mut processor, |progress| { println!("{:?}", progress.fraction()); ControlFlow::Continue(()) })?;
+   ```
+
+   `ffmpeg` and `ffprobe` **5.1 or newer** must be installed (on `PATH`, or located with
+   `FfmpegTools`); they run as child processes and frames travel over pipes, so the crate links
+   no ffmpeg code. **The ffmpeg build you install decides which codecs exist and their licence
+   terms** (`libx264`, for one, is GPL). Codecs without alpha (H.264, AV1, GIF) reject
+   translucent frames with an error unless `OfflineOptions::with_background` flattens them —
+   transparency is never dropped silently (VP8/VP9 alpha in inputs is decoded with libvpx).
+   WebM takes only Opus / Vorbis audio: use `AudioMode::Encode` there.
+
+   **Colours match what the filters produced.** Inputs are converted to sRGB with their own
+   YCbCr matrix and range tags (untagged video: BT.709 when HD, BT.601 when SD, as players
+   assume; HDR and wide-gamut input is rejected with `VideoError::UnsupportedColor`). YCbCr
+   outputs are converted explicitly with the BT.709 matrix to limited range and tagged BT.709,
+   so players decode them back to the same colours; FFV1 is tagged sRGB. The first real video
+   stream is used (cover art is skipped) and its sample aspect ratio is kept. The output is
+   written to a temporary file beside it and renamed over it only on success, so it is never
+   left half-written, and an output that is the input is refused (`VideoError::OutputIsInput`).
+   The GIF preset keeps the whole clip in ffmpeg's memory until its palette is known — keep GIFs
+   short.
+4. **Image sequences** (with `image` too): `ImageSequenceSource::open(dir, "frame_%04d.png",
+   frame_rate)` and `ImageSequenceSink::new(dir, "out_%04d.png")`.
+
+**Timing**: the ffmpeg adapters produce **constant-frame-rate** video at the input's average frame
+rate. A variable-frame-rate input is resampled to it (ffmpeg duplicates or drops frames, as
+`-fps_mode cfr` does), and a video stream that starts after the file's audio is padded with its
+first frame, which keeps passed-through audio in sync. Frame `i` gets `fl.time = i / frame_rate`
+— its presentation time minus the first frame's. Rotation metadata is applied while decoding
+(frames arrive upright; the output carries no rotation). `cargo run --example process_video
+--features video -- in.mp4 out.mp4` runs a complete example.
+
+## Demo
+
+```sh
+cargo run --example demo -- --renderer glow
+cargo run --example demo -- --renderer glow --msaa 4
+cargo run --example demo -- --renderer wgpu
+cargo run --example demo -- --renderer wgpu --msaa 4 --stack lens --rect 500,150,300,200
+```
+
+Drag the rect, resize it from its corner, stack presets in the side panel, and edit the custom
+WGSL effect live.
+
+`--stack name:v1:v2` overrides a preset's parameters, and `--record DIR` renders a seamless
+4-second loop (no side panel, deterministic time, one PPM per frame) — the GIFs above come from:
+
+```sh
+cargo run --example demo -- --stack ripple:6:40:0.5 --record frames/
+ffmpeg -framerate 25 -i frames/frame_%04d.ppm \
+  -filter_complex "split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=bayer:bayer_scale=4" -loop 0 waves.gif
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
