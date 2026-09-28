@@ -2,15 +2,14 @@
 // region. In frag mode 0 (OpenGL) `frag_uv` is LOCAL to the viewport, which the
 // backend sets to the processed region; params[2] = that region inside the
 // capture, in capture UV (x, y, w, h). In frag mode 1 (wgpu) `frag_uv` already is
-// the capture uv, derived from the pixel position (see the prelude). params[0] = mask rect (min.xy, max.xy) in capture pixels,
+// the capture uv, derived from the pixel position (see the prelude). The original capture is
+// the prelude's `fl_original_texture` (binding 3). params[0] = mask rect (min.xy, max.xy) in capture pixels,
 // params[1] = corner radii (nw, ne, se, sw) in pixels.
 // `effect.rs` appends one of the `effect` wrappers: the replace composite `fl_composite`
 // (gamma or linear output; glow and offline), or the two draws of the blended composite the
 // wgpu UI draws over egui's pass (erase: `(0, 0, 0, coverage)` under a `dst * (1 - src.a)`
 // blend; add: `coverage * filtered` under an additive blend), which together give
 // `mix(dst, filtered, coverage)` without touching pixels outside the mask.
-
-@group(0) @binding(3) var fl_original_texture: texture_2d<f32>;
 
 fn fl_rounded_rect_distance(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>) -> f32 {
     let center = 0.5 * (rect.xy + rect.zw);

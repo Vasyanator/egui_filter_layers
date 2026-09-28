@@ -14,7 +14,6 @@ Key structures:
 
 Key functions:
 - `ErrorScopes` (out-of-memory + validation + internal), `with_error_scope()`, `pass_pipeline()`, `begin_pass()`, `renderable_and_filterable()`.
-- `texture_scale()` / `px_ratio()`: exact size ratios for storage-uv mapping (sizes up to 2^24).
 
 Notes:
 Everything here takes `&wgpu::Device` / `&wgpu::Queue` explicitly, so it works on any device.
@@ -150,38 +149,6 @@ impl Target {
         self.render_view_format
     }
 
-    /// Used region / allocated size, for the prelude's `internal_*_scale`.
-    #[must_use]
-    pub(crate) fn scale(&self, used: [u32; 2]) -> [f32; 2] {
-        texture_scale(used, self.size)
-    }
-}
-
-/// `used / allocated` per axis: how much of a texture's storage a used region covers (the
-/// prelude's `internal_*_scale`).
-#[must_use]
-pub(crate) fn texture_scale(used: [u32; 2], allocated: [u32; 2]) -> [f32; 2] {
-    [px_ratio(used[0], allocated[0]), px_ratio(used[1], allocated[1])]
-}
-
-/// `used / allocated` as one correctly rounded `f32` division of the exact sizes (`1` when
-/// `allocated` is 0). Sizes are exact below 2^24 (a whole image may exceed any texture limit when
-/// the offline tiler splits it); larger values saturate there. With a power-of-two `allocated`
-/// the result is exact.
-pub(crate) fn px_ratio(used: u32, allocated: u32) -> f32 {
-    if allocated == 0 {
-        return 1.0;
-    }
-    to_f32_exact(used) / to_f32_exact(allocated)
-}
-
-/// `value` as `f32`, exact below 2^24 (saturating at 2^24): the high and low 16 bits are both
-/// exact in `f32` and so is their recombination for values below 2^24.
-fn to_f32_exact(value: u32) -> f32 {
-    let value = value.min(1 << 24);
-    let high = u16::try_from(value >> 16).unwrap_or(u16::MAX);
-    let low = u16::try_from(value & 0xffff).unwrap_or(u16::MAX);
-    f32::from(high) * 65536.0 + f32::from(low)
 }
 
 /// A grow-only GPU buffer written with `Queue::write_buffer`.
@@ -221,12 +188,13 @@ impl GrowBuffer {
     }
 }
 
-/// A group-0 uniform entry holding one uniform block of `size` bytes.
-pub(crate) fn uniform_entry(binding: u32, size: usize) -> wgpu::BindGroupLayoutEntry {
+/// A uniform-buffer entry; `min_size` is the block's size in bytes when fixed (validated at
+/// pipeline creation), `None` when modules may declare blocks of any size there.
+pub(crate) fn uniform_entry(binding: u32, min_size: Option<usize>) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: NonZeroU64::new(u64::try_from(size).unwrap_or(u64::MAX)) },
+        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: min_size.and_then(|size| NonZeroU64::new(u64::try_from(size).unwrap_or(u64::MAX))) },
         count: None,
     }
 }
@@ -302,18 +270,6 @@ pub(crate) fn begin_pass<'e>(encoder: &'e mut wgpu::CommandEncoder, view: &wgpu:
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn px_ratio_is_exact_and_safe() {
-        assert!((px_ratio(300, 600) - 0.5).abs() < f32::EPSILON);
-        assert!((px_ratio(7, 7) - 1.0).abs() < f32::EPSILON);
-        assert!((px_ratio(5, 0) - 1.0).abs() < f32::EPSILON);
-        // Beyond 2^16 (a whole image split into tiles) the sizes stay exact.
-        assert!((px_ratio(100_000, 131_072) - 0.762_939_45).abs() < 1e-7);
-        assert!((px_ratio(70_000, 65_536) - 70_000.0 / 65_536.0).abs() < f32::EPSILON);
-        assert!((to_f32_exact((1 << 24) - 1) - 16_777_215.0).abs() < f32::EPSILON);
-        assert!((to_f32_exact(u32::MAX) - 16_777_216.0).abs() < f32::EPSILON, "saturates at 2^24");
-    }
 
     /// A refused allocation is reported by `ErrorScopes` instead of reaching wgpu's default
     /// uncaptured-error handler (which panics), and the scopes leave the stack balanced.

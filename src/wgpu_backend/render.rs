@@ -145,11 +145,11 @@ fn pack_meshes(plan: &BeneathPlan, pixels_per_point: f32, screen: [u32; 2], capt
 
 impl FilterCallback {
     /// Gets (creating on first use or after a re-install) this install's resources.
-    fn resources<'a>(&self, device: &wgpu::Device, resources: &'a mut CallbackResources) -> Option<&'a mut WgpuResources> {
+    fn resources<'a>(&self, device: &wgpu::Device, queue: &wgpu::Queue, resources: &'a mut CallbackResources) -> Option<&'a mut WgpuResources> {
         let generation = self.shared.generation;
         if resources.get::<WgpuResources>().is_none_or(|existing| existing.generation != generation) {
             let state = &self.shared.render_state;
-            match WgpuResources::create(device, &state.adapter, state.target_format, &self.shared.options, generation) {
+            match WgpuResources::create(device, queue, &state.adapter, state.target_format, &self.shared.options, generation) {
                 Ok(created) => {
                     log::info!(
                         "egui_filter_layers (wgpu): resources created (target {:?}, MSAA {}, intermediates {:?})",
@@ -224,7 +224,7 @@ impl egui_wgpu::CallbackTrait for FilterCallback {
         if self.shared.is_failed() || self.job.passes.is_empty() {
             return Vec::new();
         }
-        let Some(resources) = self.resources(device, callback_resources) else {
+        let Some(resources) = self.resources(device, queue, callback_resources) else {
             return Vec::new();
         };
         resources.chain.evict_dropped();

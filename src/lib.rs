@@ -143,6 +143,7 @@ mod effect;
 mod geometry;
 mod layer;
 mod pass;
+mod plan;
 pub mod presets;
 
 #[cfg(feature = "glow")]

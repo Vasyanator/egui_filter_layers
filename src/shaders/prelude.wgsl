@@ -4,7 +4,9 @@
 //   fl.rect_uv, fl.texel, fl.size_px, fl.time, fl.pixels_per_point,
 //   src(), src_px(), params(), to_linear(), to_gamma(), premultiply(),
 //   unpremultiply(), luma().
-// Every other `fl_*` / `internal_*` name is private to the crate and may change.
+// Every other `fl_*` / `internal_*` name, and every `fl` member not listed in the crate docs
+// (`delta_time`, `frame`, `pointer`, `pass_scale`, `pass_index` hold neutral values until they
+// are documented there), is private to the crate and may change.
 // Coordinates: `uv` is (0, 0) at the top-left of the captured region, y down.
 // `fl.pixels_per_point`: physical pixels per LAYER point = egui's pixels_per_point times the
 // layer transform's scale (Scene zoom), so point distances follow the zoom like the padding does.
@@ -27,13 +29,29 @@ struct FlUniforms {
     internal_frag_offset: vec2<f32>,
     internal_src_offset: vec2<f32>,
     internal_aux_offset: vec2<f32>,
-    internal_reserved: vec2<f32>,
+    delta_time: f32,
+    frame: u32,
+    pointer: vec4<f32>,
+    internal_state_scale: vec2<f32>,
+    internal_state_offset: vec2<f32>,
+    internal_cover_scale: vec2<f32>,
+    internal_cover_offset: vec2<f32>,
+    pass_scale: f32,
+    pass_index: u32,
+    internal_frag_texel: vec2<f32>,
     params: array<vec4<f32>, 16>,
 }
 
+// The complete `@group(0)` layout: every pass and the composite are bound with ALL of these
+// (unused ones get a neutral dummy), so one layout serves every module. Binding 4 is reserved
+// for a uniform block the crate appends itself; a snippet may declare no binding at all.
 @group(0) @binding(0) var<uniform> fl: FlUniforms;
 @group(0) @binding(1) var fl_src_texture: texture_2d<f32>;
 @group(0) @binding(2) var fl_sampler: sampler;
+@group(0) @binding(3) var fl_original_texture: texture_2d<f32>;
+@group(0) @binding(5) var fl_state_texture: texture_2d<f32>;
+@group(0) @binding(6) var fl_coverage_texture: texture_2d<f32>;
+@group(0) @binding(7) var fl_nearest_sampler: sampler;
 
 var<private> fl_frag_uv: vec2<f32>;
 

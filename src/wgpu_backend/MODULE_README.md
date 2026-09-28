@@ -19,16 +19,18 @@ One frame, per filter layer:
    meshes into an `Rgba8Unorm` capture (own mesh pipeline mirroring egui-wgpu's shader; on
    `*Srgb` targets through an `Rgba8UnormSrgb` view of it with the linear-output entry, so
    meshes blend in linear like egui's), then hands the capture's unorm view to the chain executor
-   (`ChainResources::record`, `chain.rs`): effect passes ping-pong (RGBA16F when the adapter can)
-   and the composite bind group.
+   (`ChainResources::record`, `chain.rs`): it runs the draws of `plan::plan` — effect passes
+   ping-pong (RGBA16F when the adapter can) — and returns the composite bind group.
 4. `FilterCallback::paint` draws the BLENDED composite (`chain::draw_composite_over`: an erase
    draw then an add draw, together `mix(dst, filtered, coverage)`, uncovered pixels discarded)
    into egui's pass. Outside the rounded mask the screen keeps what egui drew, including paint
    callbacks and lower filter layers the re-render lacks.
 
-**Chain executor boundary** (`chain.rs` + `gpu.rs`): everything about running a `FilterChain` on
-wgpu — intermediate format, ping-pong order, uniform slots / stride, `src_scale` / `aux_scale`,
-sampler, effect pipeline cache, composite pipelines for any output format — lives there and takes
+**Chain executor boundary** (`chain.rs` + `gpu.rs`): everything wgpu-specific about running a
+`FilterChain` — intermediate format, uniform buffer stride, the one `@group(0)` layout with its
+samplers and dummies, effect pipeline cache, composite pipelines for any output format — lives
+there, while the wiring (ping-pong order, which slot each binding gets, storage mappings, uniform
+blocks, viewports) comes from the backend-neutral `src/plan.rs`, shared with glow. It takes
 only `&wgpu::Device`, `&wgpu::Queue`, a `CommandEncoder`, a source texture view (capture at its
 origin), `LayerGeometry`, time and pixels-per-point. It knows nothing of egui (no
 `CallbackResources`, no egui `Renderer`), so a runner on its own device reuses it unchanged; the UI
@@ -50,7 +52,7 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
 - `textures.rs`: egui-wgpu bind groups; own copies of textures uploaded in full that egui-wgpu
   has not applied yet (kept across the passes of a frame, partial deltas followed).
 - `chain.rs`: the chain executor (`ChainResources`, `ChainTargets`, `ChainWindow`, `record`,
-  `chain_uniforms`; composites: replace `composite_pipeline` / `draw_composite` for offline,
+  `frame_uniforms`, `chain_uniforms` = the plan's blocks at the uniform stride; composites: replace `composite_pipeline` / `draw_composite` for offline,
   blended `CompositeOver` / `draw_composite_over` for the UI); egui-free; shared with `src/offline/`.
 - `gpu.rs`: egui-free wgpu helpers (`Target` with an optional reinterpreting render view, `GrowBuffer`, layout entries, `pass_pipeline`,
   `begin_pass`, `ErrorScopes` (out-of-memory + validation + internal, awaitable) and the
@@ -63,6 +65,9 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   path, `fs_main_linear` = linear framebuffer path).
 
 ## Contracts and invariants
+- Every effect and composite pipeline uses ONE pipeline layout (`ChainResources::layout`, all
+  eight prelude bindings); every draw's bind group fills all eight, dummies where the plan binds
+  nothing. The params binding (4) is unsized so modules may declare any block size there.
 - The mesh pipeline's group 1 layout is the SAME descriptor as egui-wgpu's texture layout, so
   egui's per-texture bind groups bind unchanged (wgpu-core dedups layouts; WebGPU group-equivalence).
 - Every layer of a frame gets its own `LayerTargets` (pool index = prepare order, reset in
@@ -111,8 +116,8 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
 
 ## Editing map
 - What counts as "beneath" / clipping: `beneath.rs`. Texture staleness: `textures.rs`.
-- Pass/composite recording, uniform slots, intermediate format: `chain.rs` (shared by every
-  wgpu caller). Backdrop re-render, egui-pass pipelines: `render.rs` / `resources.rs`.
+- Which texture / mapping a draw gets: `src/plan.rs` (shared with glow). Recording, bind groups,
+  uniform stride, intermediate format: `chain.rs` (shared by every wgpu caller). Backdrop re-render, egui-pass pipelines: `render.rs` / `resources.rs`.
 - Per-layer uniform values and composite params: core `FrameUniforms::for_layer` (`pass.rs`) and
   `LayerGeometry::composite_params` (`geometry.rs`), shared with glow.
 - Tests: unit tests in each file; GPU end-to-end in `tests/wgpu_headless.rs` (`--ignored`).

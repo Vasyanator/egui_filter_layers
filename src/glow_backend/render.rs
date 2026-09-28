@@ -3,7 +3,10 @@ File: glow_backend/render.rs
 
 Purpose:
 One filter layer, executed inside an `egui_glow` paint callback: capture the backdrop from the
-bound framebuffer, run the passes ping-pong in offscreen targets, composite the result back.
+bound framebuffer, run the draws of the backend-neutral `plan::ChainPlan` (passes ping-pong in
+offscreen targets, then the composite back into the caller's framebuffer). Which slot a draw reads
+and writes, its viewport and its uniform block come from `plan.rs` (shared with wgpu); this file
+maps slots to GL objects, binds them on the texture units of `glsl.rs` and draws.
 
 Key structures:
 - `CallerState`: the framebuffer bindings (and sample count) egui left bound, saved first.
@@ -19,8 +22,8 @@ Notes (GL state contract, checked against egui_glow 0.36.2 `painter.rs`):
   and restored on every exit path by `paint_layer`.
 - After every callback egui_glow re-runs `prepare_painting` (scissor ON, blend + func, colour
   mask, viewport, its program, TEXTURE0 active, its VAO, element buffer), so this file may change
-  those freely. It does NOT restore the framebuffer, unit-1 textures, renderbuffer or
-  uniform-buffer bindings, so those are reset here.
+  those freely. It does NOT restore the framebuffer, the other units' textures, sampler objects,
+  renderbuffer or uniform-buffer bindings, so those are reset here (`cleanup`).
 - The scissor box is set by egui to the callback's clip rect BEFORE the callback and left
   untouched here; scissor is disabled for the offscreen work (it also clips blits) and re-enabled
   for the composite so the write-back respects the clip rect.
@@ -42,11 +45,13 @@ use std::collections::HashSet;
 use glow::HasContext as _;
 
 use super::GlowState;
-use super::glsl::GlslTarget;
-use super::resources::{GlError, ReadFormat, ReadFormatError, ResolveTarget, Resources, UNIFORM_BINDING_POINT};
+use super::glsl::{GROUP0_TEXTURE_BINDINGS, GlslTarget, NEAREST_UNIT_BASE};
+use super::resources::{GlError, ReadFormat, ReadFormatError, RenderTarget, ResolveTarget, Resources, UNIFORM_BINDING_POINT};
 use crate::backend::LayerJob;
+use crate::effect::{BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_SOURCE_TEXTURE};
 use crate::geometry::{LayerGeometry, PxRect, layer_geometry, transform_scale};
-use crate::pass::{FrameUniforms, Params, pack_uniforms};
+use crate::pass::{FrameUniforms, UNIFORM_BLOCK_SIZE};
+use crate::plan::{Bindings, ChainPlan, Slot, SlotMappings, TextureMapping, composite_uniforms, plan, step_uniforms};
 
 /// Stand-in key for rejections that have no known format (no colour buffer, or a driver that
 /// cannot report it), so they are still logged only once.
@@ -292,15 +297,21 @@ unsafe fn run_layer(gl: &glow::Context, resources: &mut Resources, run: &LayerRu
             };
         }
 
-        let size = run.geometry.capture.size();
+        let capture = run.geometry.capture;
         let max = resources.max_size;
         for target in &mut resources.ping_pong {
-            if let Err(error) = target.ensure_size(gl, size, max) {
+            if let Err(error) = target.ensure_size(gl, capture.size(), max) {
                 return LayerOutcome::Latch { what: "allocating an intermediate target", error: error.to_string() };
             }
         }
+        // glow always computes the whole capture (fragment mode 0 interpolates over the viewport);
+        // the composite's origin is the capture's screen position, as on the wgpu UI.
+        let Some(plan) = plan(run.job.passes.len(), PxRect { x: 0, y: 0, w: capture.w, h: capture.h }, [capture.x, capture.y]) else {
+            return LayerOutcome::Done;
+        };
+        let maps = slot_mappings(resources, capture.size());
 
-        if let Some((index, error)) = run_passes(gl, resources, run, programs, diagnose) {
+        if let Some((index, error)) = run_passes(gl, resources, run, &plan, &maps, programs, diagnose) {
             return LayerOutcome::PassFailed { index, error };
         }
         let pass_error = gl.get_error();
@@ -310,7 +321,7 @@ unsafe fn run_layer(gl: &glow::Context, resources: &mut Resources, run: &LayerRu
             return LayerOutcome::PassesFailed { error: pass_error };
         }
 
-        composite(gl, resources, run, programs.len());
+        composite(gl, resources, run, &plan, &maps);
         let error = gl.get_error();
         if error != glow::NO_ERROR {
             return LayerOutcome::Latch { what: "compositing the filtered region", error: format!("GL error 0x{error:04x}") };
@@ -429,55 +440,98 @@ fn gl_rect(rect: PxRect, screen_h: i32) -> [i32; 4] {
     [rect.x, y0, rect.x + rect.w, y0 + rect.h]
 }
 
-/// Uploads one pass's uniforms and binds the buffer to the `fl` binding point.
+/// Uploads one draw's uniform block and binds the buffer to the `fl` binding point.
 ///
 /// # Safety
 /// `gl` must be current on this thread.
-unsafe fn upload_uniforms(gl: &glow::Context, buffer: glow::Buffer, frame: &FrameUniforms, params: &Params) {
-    let bytes = pack_uniforms(frame, params);
+unsafe fn upload_uniforms(gl: &glow::Context, buffer: glow::Buffer, bytes: &[u8; UNIFORM_BLOCK_SIZE]) {
     // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); `buffer` is our live uniform buffer, allocated with `UNIFORM_BLOCK_SIZE` bytes, exactly the length of `bytes`.
     unsafe {
         gl.bind_buffer(glow::UNIFORM_BUFFER, Some(buffer));
-        gl.buffer_sub_data_u8_slice(glow::UNIFORM_BUFFER, 0, &bytes);
+        gl.buffer_sub_data_u8_slice(glow::UNIFORM_BUFFER, 0, bytes);
         gl.bind_buffer_base(glow::UNIFORM_BUFFER, UNIFORM_BINDING_POINT, Some(buffer));
     }
 }
 
-/// The per-frame uniforms shared by every pass of a layer (scales filled per pass).
-fn frame_uniforms(run: &LayerRun<'_>) -> FrameUniforms {
-    // GL texture storage is bottom-up; the prelude flips so `uv` stays top-down.
-    FrameUniforms::for_layer(&run.geometry, run.job.time, true)
+/// The layer's `FrameUniforms` with the GL flags: texture storage is bottom-up (the prelude flips
+/// so `uv` stays top-down) and fragments interpolate their uv over the viewport (mode 0).
+fn frame_uniforms(geometry: &LayerGeometry, time: f32) -> FrameUniforms {
+    FrameUniforms::for_layer(geometry, time, true)
 }
 
-/// Runs every pass into the ping-pong targets; pass `i` writes `ping_pong[i % 2]`.
+/// The GL target a plan slot names.
+fn target_of(resources: &Resources, slot: Slot) -> &RenderTarget {
+    match slot {
+        Slot::Source => &resources.capture,
+        Slot::Ping => &resources.ping_pong[0],
+        Slot::Pong => &resources.ping_pong[1],
+    }
+}
+
+/// The storage mappings of the capture and the ping-pong targets for a capture of `capture`
+/// pixels, each held at its target's `(0, 0)` corner.
+fn slot_mappings(resources: &Resources, capture: [i32; 2]) -> SlotMappings {
+    let capture = capture.map(|side| u32::try_from(side).unwrap_or(0));
+    let of = |target: &RenderTarget| TextureMapping::of(capture, target.allocated_px(), [0, 0]);
+    SlotMappings { source: of(&resources.capture), ping_pong: [of(&resources.ping_pong[0]), of(&resources.ping_pong[1])] }
+}
+
+/// Binds every `@group(0)` texture of one draw on its texture units (`glsl.rs`): the plan's slots
+/// where it names one, the dummies elsewhere; each also on its nearest-sampler unit, with the
+/// nearest sampler object. Leaves `TEXTURE0` active.
+///
+/// # Safety
+/// `gl` must be current on this thread; `resources` alive on it.
+unsafe fn bind_textures(gl: &glow::Context, resources: &Resources, bindings: Bindings) {
+    // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); every texture and the sampler belong to `resources`, alive on this context.
+    unsafe {
+        for (unit, binding) in (0_u32..).zip(GROUP0_TEXTURE_BINDINGS) {
+            let texture = match binding {
+                BINDING_SOURCE_TEXTURE => target_of(resources, bindings.src).texture,
+                BINDING_ORIGINAL_TEXTURE => bindings.original.map_or(resources.transparent, |slot| target_of(resources, slot).texture),
+                BINDING_COVERAGE_TEXTURE => resources.white,
+                // `BINDING_STATE_TEXTURE` (no chain has state); `GROUP0_TEXTURE_BINDINGS` holds
+                // nothing else.
+                _ => resources.transparent,
+            };
+            gl.active_texture(glow::TEXTURE0 + unit);
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.active_texture(glow::TEXTURE0 + NEAREST_UNIT_BASE + unit);
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.bind_sampler(NEAREST_UNIT_BASE + unit, Some(resources.nearest_sampler));
+        }
+        gl.active_texture(glow::TEXTURE0);
+    }
+}
+
+/// Runs every pass step of `plan` into its ping-pong target.
 ///
 /// With `diagnose`, checks `glGetError` after every pass and stops at the first failing one,
 /// returning `(pass index, error)`; otherwise the caller checks once after all passes.
 ///
 /// # Safety
-/// `gl` must be current on this thread; targets must be at least the capture size; no GL error
-/// may be pending on entry.
-unsafe fn run_passes(gl: &glow::Context, resources: &Resources, run: &LayerRun<'_>, programs: &[glow::Program], diagnose: bool) -> Option<(usize, u32)> {
-    let size = run.geometry.capture.size();
-    let mut frame = frame_uniforms(run);
+/// `gl` must be current on this thread; targets must be at least the capture size; `programs`
+/// matches `run.job.passes`; no GL error may be pending on entry.
+unsafe fn run_passes(gl: &glow::Context, resources: &Resources, run: &LayerRun<'_>, plan: &ChainPlan, maps: &SlotMappings, programs: &[glow::Program], diagnose: bool) -> Option<(usize, u32)> {
+    let frame = frame_uniforms(&run.geometry, run.job.time);
     // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); targets are at least the capture size and `programs` matches `run.job.passes` (caller contract); all objects are alive on this context.
     unsafe {
         gl.bind_vertex_array(Some(resources.vertex_array));
-        gl.active_texture(glow::TEXTURE0);
-        for (index, (pass, program)) in run.job.passes.iter().zip(programs).enumerate() {
-            let input = if index == 0 { &resources.capture } else { &resources.ping_pong[(index - 1) % 2] };
-            let output = &resources.ping_pong[index % 2];
-            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(output.framebuffer));
-            gl.viewport(0, 0, size[0], size[1]);
+        for step in &plan.steps {
+            // `plan` was built from `run.job.passes`, which `programs` matches one to one.
+            let (Some(pass), Some(program)) = (run.job.passes.get(step.pass), programs.get(step.pass)) else {
+                continue;
+            };
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(target_of(resources, step.output).framebuffer));
+            gl.viewport(0, 0, step.used_px[0], step.used_px[1]);
             gl.use_program(Some(*program));
-            gl.bind_texture(glow::TEXTURE_2D, Some(input.texture));
-            frame.src_scale = input.scale(size);
-            upload_uniforms(gl, resources.uniform_buffer, &frame, pass.params());
+            bind_textures(gl, resources, step.bindings);
+            upload_uniforms(gl, resources.uniform_buffer, &step_uniforms(&frame, step, maps, pass));
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
             if diagnose {
                 let error = gl.get_error();
                 if error != glow::NO_ERROR {
-                    return Some((index, error));
+                    return Some((step.pass, error));
                 }
             }
         }
@@ -489,27 +543,19 @@ unsafe fn run_passes(gl: &glow::Context, resources: &Resources, run: &LayerRun<'
 /// by the rounded rect (outside the mask the original capture is written, i.e. unchanged).
 ///
 /// # Safety
-/// `gl` must be current on this thread; `pass_count >= 1`.
-unsafe fn composite(gl: &glow::Context, resources: &Resources, run: &LayerRun<'_>, pass_count: usize) {
+/// `gl` must be current on this thread; the passes of `plan` have run.
+unsafe fn composite(gl: &glow::Context, resources: &Resources, run: &LayerRun<'_>, plan: &ChainPlan, maps: &SlotMappings) {
     let geometry = &run.geometry;
-    let size = geometry.capture.size();
-    let filtered = &resources.ping_pong[(pass_count.saturating_sub(1)) % 2];
-    let mut frame = frame_uniforms(run);
-    frame.src_scale = filtered.scale(size);
-    frame.aux_scale = resources.capture.scale(size);
-    let params = geometry.composite_params();
+    let bytes = composite_uniforms(&frame_uniforms(geometry, run.job.time), plan, maps, geometry);
     let region = gl_rect(geometry.region, run.screen[1]);
-    // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); `pass_count >= 1` (caller contract), so `filtered` holds pass output; all objects are alive on this context.
+    // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); the passes ran (caller contract), so the plan's composite source holds their output; all objects are alive on this context.
     unsafe {
         run.caller.restore(gl);
         gl.viewport(region[0], region[1], geometry.region.w, geometry.region.h);
         gl.enable(glow::SCISSOR_TEST);
         gl.use_program(Some(resources.composite));
-        gl.active_texture(glow::TEXTURE1);
-        gl.bind_texture(glow::TEXTURE_2D, Some(resources.capture.texture));
-        gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, Some(filtered.texture));
-        upload_uniforms(gl, resources.uniform_buffer, &frame, &params);
+        bind_textures(gl, resources, plan.composite.bindings);
+        upload_uniforms(gl, resources.uniform_buffer, &bytes);
         gl.draw_arrays(glow::TRIANGLES, 0, 3);
     }
 }
@@ -521,10 +567,14 @@ unsafe fn composite(gl: &glow::Context, resources: &Resources, run: &LayerRun<'_
 unsafe fn cleanup(gl: &glow::Context) {
     // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); only unbinding (binding name 0) happens here.
     unsafe {
-        gl.active_texture(glow::TEXTURE1);
-        gl.bind_texture(glow::TEXTURE_2D, None);
-        gl.active_texture(glow::TEXTURE0);
-        gl.bind_texture(glow::TEXTURE_2D, None);
+        for unit in (0..u32::try_from(GROUP0_TEXTURE_BINDINGS.len()).unwrap_or(0)).rev() {
+            gl.bind_sampler(NEAREST_UNIT_BASE + unit, None);
+            gl.active_texture(glow::TEXTURE0 + NEAREST_UNIT_BASE + unit);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.active_texture(glow::TEXTURE0 + unit);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        // The loop ends on unit 0, which egui_glow expects active.
         gl.bind_buffer_base(glow::UNIFORM_BUFFER, UNIFORM_BINDING_POINT, None);
         gl.bind_buffer(glow::UNIFORM_BUFFER, None);
         gl.bind_renderbuffer(glow::RENDERBUFFER, None);
@@ -536,6 +586,44 @@ unsafe fn cleanup(gl: &glow::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// glow and wgpu upload the same uniform bytes for the same plan and mappings, except the two
+    /// backend flags (`internal_flip_y`, `internal_frag_mode`): every wiring decision is
+    /// `plan.rs`'s. The UI's wgpu window (`ChainWindow::whole`) also plans exactly like glow.
+    #[cfg(feature = "wgpu")]
+    #[test]
+    fn glow_and_wgpu_upload_identical_blocks() {
+        use crate::effect::Effect;
+        use crate::pass::{Pass, offsets};
+        use crate::wgpu_backend::chain::{ChainWindow, chain_uniforms, frame_uniforms as wgpu_frame_uniforms};
+        use egui::{CornerRadius, Rect, pos2, vec2};
+
+        let Ok(effect) = Effect::new("id", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }") else { panic!("identity must compile") };
+        let passes: Vec<Pass> = (0..3).map(|index| Pass::new(&effect).with_param(1, [f32::from(u8::try_from(index).unwrap_or(0)) + 0.5; 4]).unwrap_or_else(|error| panic!("{error}"))).collect();
+        let rect = Rect::from_min_size(pos2(40.0, 30.0), vec2(120.0, 80.0));
+        let Some(geometry) = layer_geometry(rect, Rect::EVERYTHING, 1.5, [800, 600], 6.0, CornerRadius::same(8), 1.0) else { panic!("visible") };
+        let capture = geometry.capture;
+        let Some(glow_plan) = plan(passes.len(), PxRect { x: 0, y: 0, w: capture.w, h: capture.h }, [capture.x, capture.y]) else { panic!("planned") };
+        let window = ChainWindow::whole(&geometry, [capture.x, capture.y]);
+        let Some(wgpu_plan) = plan(passes.len(), window.rect, window.composite_origin) else { panic!("planned") };
+        assert_eq!(glow_plan, wgpu_plan);
+
+        let used = capture.size().map(|side| u32::try_from(side).unwrap_or(0));
+        let maps = SlotMappings { source: TextureMapping::of(used, [256, 256], [0, 0]), ping_pong: [TextureMapping::of(used, [320, 192], [0, 0]), TextureMapping::of(used, used, [0, 0])] };
+        let time = 1.25;
+        let slot = 512;
+        let wgpu_bytes = chain_uniforms(&wgpu_frame_uniforms(&geometry, time), &wgpu_plan, &passes, &geometry, &maps, slot);
+        let glow_frame = frame_uniforms(&geometry, time);
+        let mut glow_blocks: Vec<[u8; UNIFORM_BLOCK_SIZE]> = glow_plan.steps.iter().map(|step| step_uniforms(&glow_frame, step, &maps, &passes[step.pass])).collect();
+        glow_blocks.push(composite_uniforms(&glow_frame, &glow_plan, &maps, &geometry));
+        assert_eq!(glow_blocks.len(), 4);
+        let flags = [offsets::FLIP_Y, offsets::FRAG_MODE];
+        for (index, glow_block) in glow_blocks.iter().enumerate() {
+            let wgpu_block = &wgpu_bytes[slot * index..slot * index + UNIFORM_BLOCK_SIZE];
+            let differing: Vec<usize> = (0..UNIFORM_BLOCK_SIZE / 4).map(|word| word * 4).filter(|&at| glow_block[at..at + 4] != wgpu_block[at..at + 4]).collect();
+            assert_eq!(differing, flags, "block {index}: only the backend flags may differ");
+        }
+    }
 
     #[test]
     fn gl_rects_are_bottom_up() {

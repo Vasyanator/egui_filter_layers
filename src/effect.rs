@@ -16,6 +16,8 @@ Key functions:
 - `Effect::new()`: assemble, parse, validate, check the resource interface.
 - `render_diagnostic()`: renders naga's labels with `codespan-reporting` against the snippet
   (line numbers match `SnippetLocation`), or the assembled source when naga points at the wrapper.
+- `check_interface()`: every bound global must be one the prelude declares (`PRELUDE_RESOURCES`,
+  the one `@group(0)` layout shared by effects and the composite).
 - `reads_time()`: conservative IR scan deciding `Effect::is_animated`.
 - `composite_module()` / `composite_linear_module()` (crate-internal): the internal replace pass
   that writes the filtered region back (gamma output / linear output for `*Srgb` targets; glow,
@@ -52,8 +54,32 @@ pub(crate) const BINDING_UNIFORMS: u32 = 0;
 pub(crate) const BINDING_SOURCE_TEXTURE: u32 = 1;
 /// `@binding` of the shared linear clamp-to-edge sampler.
 pub(crate) const BINDING_SAMPLER: u32 = 2;
-/// `@binding` of the original (unfiltered) capture, visible to the composite pass only.
+/// `@binding` of the original (unfiltered) capture (`fl_original_texture`).
 pub(crate) const BINDING_ORIGINAL_TEXTURE: u32 = 3;
+/// `@binding` reserved for a uniform block the crate appends to a module itself (never declared
+/// by the prelude or a snippet). wgpu's single layout binds a 16-byte zero buffer there; glow
+/// binds uniform blocks by reflection, so no module declaring none needs it.
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Only wgpu's explicit layout names it.
+pub(crate) const BINDING_PARAMS: u32 = 4;
+/// `@binding` of the state texture (`fl_state_texture`; a transparent dummy without state).
+pub(crate) const BINDING_STATE_TEXTURE: u32 = 5;
+/// `@binding` of the mask coverage texture (`fl_coverage_texture`; a white dummy without one).
+pub(crate) const BINDING_COVERAGE_TEXTURE: u32 = 6;
+/// `@binding` of the shared nearest clamp-to-edge sampler (`fl_nearest_sampler`).
+pub(crate) const BINDING_NEAREST_SAMPLER: u32 = 7;
+
+/// Every resource the prelude declares, as `(name, @binding)` in `@group(0)`. The interface check
+/// accepts exactly these: a snippet cannot redeclare a prelude name (naga rejects the
+/// redefinition), so a bound global with one of these names IS the prelude's.
+const PRELUDE_RESOURCES: [(&str, u32); 7] = [
+    ("fl", BINDING_UNIFORMS),
+    ("fl_src_texture", BINDING_SOURCE_TEXTURE),
+    ("fl_sampler", BINDING_SAMPLER),
+    ("fl_original_texture", BINDING_ORIGINAL_TEXTURE),
+    ("fl_state_texture", BINDING_STATE_TEXTURE),
+    ("fl_coverage_texture", BINDING_COVERAGE_TEXTURE),
+    ("fl_nearest_sampler", BINDING_NEAREST_SAMPLER),
+];
 
 /// Monotonic source of `CompiledModule::id`. Ids are never reused within a process, so a backend
 /// cache keyed by id can never confuse a dropped module with a new one.
@@ -63,15 +89,6 @@ pub(crate) const BINDING_ORIGINAL_TEXTURE: u32 = 3;
 /// process-wide counter gives ids unique across all of them. It is a monotonic id source, never
 /// reset or read back as state, and `u64` cannot wrap in practice.
 static NEXT_MODULE_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Which wrapper a module was assembled with; decides the allowed resource interface.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ModuleKind {
-    /// A user or preset effect: bindings 0..=2.
-    Effect,
-    /// The crate's composite pass: bindings 0..=3.
-    Composite,
-}
 
 /// A parsed and validated WGSL module, shared by every clone of the `Effect` that owns it.
 ///
@@ -89,13 +106,11 @@ pub(crate) struct CompiledModule {
     /// Validation info for `module` (needed by every naga back end).
     #[cfg_attr(not(feature = "glow"), allow(dead_code))] // Read by naga's GLSL back end only; wgpu takes the WGSL source.
     pub(crate) info: naga::valid::ModuleInfo,
-    /// Which wrapper was used.
-    pub(crate) kind: ModuleKind,
 }
 
 impl fmt::Debug for CompiledModule {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CompiledModule").field("id", &self.id).field("label", &self.label).field("kind", &self.kind).finish_non_exhaustive()
+        f.debug_struct("CompiledModule").field("id", &self.id).field("label", &self.label).finish_non_exhaustive()
     }
 }
 
@@ -246,7 +261,7 @@ impl Effect {
     /// location relative to `wgsl`; [`EffectError::Interface`] reports resources or entry points
     /// the snippet must not declare.
     pub fn new(label: &str, wgsl: &str) -> Result<Self, EffectError> {
-        let module = compile(label, wgsl, ModuleKind::Effect)?;
+        let module = compile(label, wgsl)?;
         let animated = reads_time(&module.module);
         Ok(Self { module: Arc::new(module), sample_radius_points: 0.0, animated })
     }
@@ -365,7 +380,7 @@ const WRAPPER_HINT: &str = " (reported inside the generated wrapper: the snippet
     `params`, `fl` or anything starting with `fl_`)";
 
 /// Assembles, parses, validates and interface-checks one module.
-fn compile(label: &str, snippet: &str, kind: ModuleKind) -> Result<CompiledModule, EffectError> {
+fn compile(label: &str, snippet: &str) -> Result<CompiledModule, EffectError> {
     let mut source = String::with_capacity(PRELUDE_WGSL.len() + snippet.len() + 1);
     source.push_str(PRELUDE_WGSL);
     source.push_str(snippet);
@@ -396,11 +411,11 @@ fn compile(label: &str, snippet: &str, kind: ModuleKind) -> Result<CompiledModul
         EffectError::Validation { label: label.to_owned(), message, location, diagnostic }
     })?;
 
-    check_interface(label, &module, kind)?;
+    check_interface(label, &module)?;
 
     let id = NEXT_MODULE_ID.fetch_add(1, Ordering::Relaxed);
     log::debug!("egui_filter_layers: compiled effect `{label}` (module id {id})");
-    Ok(CompiledModule { id, label: Arc::from(label), source, module, info, kind })
+    Ok(CompiledModule { id, label: Arc::from(label), source, module, info })
 }
 
 /// The `source()` chain of `error` (without `error` itself), one entry per cause.
@@ -451,8 +466,9 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     message
 }
 
-/// Rejects entry points and resource bindings the backends do not provide.
-fn check_interface(label: &str, module: &naga::Module, kind: ModuleKind) -> Result<(), EffectError> {
+/// Rejects entry points, `override`s, and every resource binding that is not one of the
+/// prelude's ([`PRELUDE_RESOURCES`]); the same rule holds for user effects and the composite.
+fn check_interface(label: &str, module: &naga::Module) -> Result<(), EffectError> {
     let interface_error = |reason: String| EffectError::Interface { label: label.to_owned(), reason };
 
     for entry in &module.entry_points {
@@ -469,16 +485,13 @@ fn check_interface(label: &str, module: &naga::Module, kind: ModuleKind) -> Resu
         return Err(interface_error(format!("declares the pipeline-overridable constant `{name}`; effects cannot use `override` — use `const` or `params(i)`")));
     }
 
-    let max_binding = match kind {
-        ModuleKind::Effect => BINDING_SAMPLER,
-        ModuleKind::Composite => BINDING_ORIGINAL_TEXTURE,
-    };
     for (_, global) in module.global_variables.iter() {
         let Some(binding) = &global.binding else {
             continue;
         };
-        if binding.group != 0 || binding.binding > max_binding {
-            let name = global.name.as_deref().unwrap_or("<unnamed>");
+        let name = global.name.as_deref().unwrap_or("<unnamed>");
+        let declared_by_prelude = binding.group == 0 && PRELUDE_RESOURCES.iter().any(|&(prelude_name, prelude_binding)| prelude_name == name && prelude_binding == binding.binding);
+        if !declared_by_prelude {
             return Err(interface_error(format!(
                 "declares resource `{name}` at @group({}) @binding({}); effects cannot bind their own resources — use `src()` for the input and `params(i)` for values",
                 binding.group, binding.binding
@@ -519,7 +532,7 @@ fn compile_composite(label: &str, tail: &str) -> Result<Arc<CompiledModule>, Eff
         snippet.push('\n');
     }
     snippet.push_str(tail);
-    compile(label, &snippet, ModuleKind::Composite).map(Arc::new)
+    compile(label, &snippet).map(Arc::new)
 }
 
 /// The internal composite pass writing gamma-space output, compiled once per process.
@@ -646,11 +659,15 @@ mod tests {
 
     #[test]
     fn extra_resources_and_entry_points_are_rejected() {
-        let extra_binding = "@group(0) @binding(7) var other: texture_2d<f32>;\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }";
-        assert!(matches!(Effect::new("binding", extra_binding), Err(EffectError::Interface { .. })));
+        // Any binding a snippet declares is rejected, also at a slot of the prelude's layout or
+        // in another group; only the prelude's own declarations are bound.
+        for declaration in ["@group(0) @binding(8) var other: texture_2d<f32>;", "@group(0) @binding(4) var<uniform> other: vec4<f32>;", "@group(0) @binding(6) var other: texture_2d<f32>;", "@group(1) @binding(0) var other: texture_2d<f32>;"] {
+            let snippet = format!("{declaration}\nfn effect(uv: vec2<f32>) -> vec4<f32> {{ return src(uv); }}");
+            assert!(matches!(Effect::new("binding", &snippet), Err(EffectError::Interface { .. })), "{declaration}");
+        }
 
-        let original = "fn effect(uv: vec2<f32>) -> vec4<f32> { return textureSampleLevel(fl_original_texture, fl_sampler, uv, 0.0); }";
-        assert!(Effect::new("private", original).is_err(), "the composite-only texture must not be reachable from effects");
+        let redeclared = "@group(0) @binding(3) var fl_original_texture: texture_2d<f32>;\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }";
+        assert!(Effect::new("redeclared", redeclared).is_err(), "a prelude resource cannot be redeclared");
 
         let entry = "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }\n@compute @workgroup_size(1) fn extra() {}";
         assert!(matches!(Effect::new("entry", entry), Err(EffectError::Interface { .. })));

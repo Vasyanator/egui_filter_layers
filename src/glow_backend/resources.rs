@@ -13,7 +13,8 @@ Key structures:
   a multisample resolve must use to match it (GLES 3 / WebGL2 require identical formats).
 - `ResolveTarget`: renderbuffer + framebuffer for that resolve, reallocated on format change.
 - `Resources`: the shared set (VAO, uniform buffer, capture / resolve / ping-pong targets,
-  composite program, cached default-framebuffer format).
+  composite program, dummy textures and the nearest sampler object for the texture units a draw
+  leaves unused, cached default-framebuffer format).
 
 Key functions:
 - `build_program()`: compile + link a translated `GlslProgram` and bind its block / samplers.
@@ -148,7 +149,7 @@ pub(super) fn grown_size(allocated: [i32; 2], needed: [i32; 2], max: i32) -> [i3
 }
 
 /// A colour texture attached to its own framebuffer. The allocation only grows; a frame uses the
-/// `(0, 0, w, h)` corner of it (see `FrameUniforms::src_scale`).
+/// `(0, 0, w, h)` corner of it (mapped by `plan::TextureMapping::of`).
 #[derive(Debug)]
 pub(super) struct RenderTarget {
     /// Framebuffer with `texture` as `COLOR_ATTACHMENT0`.
@@ -219,11 +220,11 @@ impl RenderTarget {
         Ok(())
     }
 
-    /// `used / allocated` per axis: the UV scale that maps a `used`-sized region to storage.
+    /// The allocated size as the unsigned pixel counts `plan::TextureMapping::of` takes
+    /// (`0` before the first allocation, which that mapping treats as neutral).
     #[must_use]
-    pub fn scale(&self, used: [i32; 2]) -> [f32; 2] {
-        let axis = |used: i32, allocated: i32| if allocated > 0 { px_ratio(used, allocated) } else { 1.0 };
-        [axis(used[0], self.allocated[0]), axis(used[1], self.allocated[1])]
+    pub fn allocated_px(&self) -> [u32; 2] {
+        self.allocated.map(|side| u32::try_from(side).unwrap_or(0))
     }
 
     /// Frees both objects.
@@ -425,10 +426,23 @@ impl ResolveTarget {
     }
 }
 
-/// `a / b` for pixel counts bounded by the screen size (< 2^24, exact in `f32`).
-#[allow(clippy::cast_precision_loss)] // Screen-bounded pixel counts are exact in f32.
-fn px_ratio(a: i32, b: i32) -> f32 {
-    a as f32 / b as f32
+/// Creates a 1x1 RGBA8 texture holding `rgba` (linear, clamp-to-edge), bound on units a draw
+/// leaves unused. Leaves no texture bound on the active unit.
+///
+/// # Safety
+/// `gl` must be current on this thread.
+unsafe fn dummy_texture(gl: &glow::Context, rgba: [u8; 4]) -> Result<glow::Texture, GlError> {
+    // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); the texture is created here and 4 bytes are exactly one RGBA8 texel.
+    unsafe {
+        let texture = gl.create_texture().map_err(|detail| GlError::CreateResource { resource: "dummy texture", detail })?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        for (name, value) in [(glow::TEXTURE_MIN_FILTER, glow::LINEAR), (glow::TEXTURE_MAG_FILTER, glow::LINEAR), (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE), (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE)] {
+            gl.tex_parameter_i32(glow::TEXTURE_2D, name, gl_i32(value));
+        }
+        gl.tex_image_2d(glow::TEXTURE_2D, 0, gl_i32(glow::RGBA8), 1, 1, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&rgba)));
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        Ok(texture)
+    }
 }
 
 /// The objects shared by every layer painted through one backend.
@@ -455,6 +469,12 @@ pub(super) struct Resources {
     pub ping_pong: [RenderTarget; 2],
     /// The composite program writing the result back.
     pub composite: glow::Program,
+    /// 1x1 transparent texture for texture units a draw leaves unused (original, state).
+    pub transparent: glow::Texture,
+    /// 1x1 opaque white texture for the coverage units when there is no coverage texture.
+    pub white: glow::Texture,
+    /// Nearest, clamp-to-edge sampler object bound on the `NEAREST_UNIT_BASE..` units.
+    pub nearest_sampler: glow::Sampler,
 }
 
 impl Resources {
@@ -504,6 +524,9 @@ impl Resources {
             a.destroy(gl);
             b.destroy(gl);
             gl.delete_program(self.composite);
+            gl.delete_texture(self.transparent);
+            gl.delete_texture(self.white);
+            gl.delete_sampler(self.nearest_sampler);
         }
     }
 }
@@ -517,6 +540,9 @@ struct Partial {
     capture: Option<RenderTarget>,
     ping: Option<RenderTarget>,
     pong: Option<RenderTarget>,
+    transparent: Option<glow::Texture>,
+    white: Option<glow::Texture>,
+    nearest_sampler: Option<glow::Sampler>,
 }
 
 impl Partial {
@@ -551,8 +577,16 @@ impl Partial {
             }
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
 
-            match (self.composite.take(), self.vertex_array.take(), self.uniform_buffer.take(), self.capture.take(), self.ping.take(), self.pong.take()) {
-                (Some(composite), Some(vertex_array), Some(uniform_buffer), Some(capture), Some(first), Some(second)) => {
+            self.transparent = Some(dummy_texture(gl, [0; 4])?);
+            self.white = Some(dummy_texture(gl, [u8::MAX; 4])?);
+            let sampler = gl.create_sampler().map_err(|detail| GlError::CreateResource { resource: "sampler", detail })?;
+            self.nearest_sampler = Some(sampler);
+            for (name, value) in [(glow::TEXTURE_MIN_FILTER, glow::NEAREST), (glow::TEXTURE_MAG_FILTER, glow::NEAREST), (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE), (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE)] {
+                gl.sampler_parameter_i32(sampler, name, gl_i32(value));
+            }
+
+            match (self.composite.take(), self.vertex_array.take(), self.uniform_buffer.take(), self.capture.take(), self.ping.take(), self.pong.take(), self.transparent.take(), self.white.take(), self.nearest_sampler.take()) {
+                (Some(composite), Some(vertex_array), Some(uniform_buffer), Some(capture), Some(first), Some(second), Some(transparent), Some(white), Some(nearest_sampler)) => {
                     let max_size = [glow::MAX_TEXTURE_SIZE, glow::MAX_RENDERBUFFER_SIZE].into_iter().map(|limit| gl.get_parameter_i32(limit)).filter(|limit| *limit > 0).min().unwrap_or(i32::MAX);
                     Ok(Resources {
                         vertex_array,
@@ -564,6 +598,9 @@ impl Partial {
                         rejected_formats: HashSet::new(),
                         ping_pong: [first, second],
                         composite,
+                        transparent,
+                        white,
+                        nearest_sampler,
                     })
                 }
                 // Unreachable by construction (every field was set above); handled without a
@@ -616,6 +653,12 @@ impl Partial {
             }
             for target in [self.capture.take(), self.ping.take(), self.pong.take()].into_iter().flatten() {
                 target.destroy(gl);
+            }
+            for texture in [self.transparent.take(), self.white.take()].into_iter().flatten() {
+                gl.delete_texture(texture);
+            }
+            if let Some(sampler) = self.nearest_sampler.take() {
+                gl.delete_sampler(sampler);
             }
         }
     }
@@ -731,11 +774,5 @@ mod tests {
         assert!(!half.is_normalized());
         assert!(half.resolve_format().is_err_and(|reason| reason.contains("not a normalized")));
         assert!(format([6, 6, 6, 6], unorm, glow::LINEAR).resolve_format().is_err());
-    }
-
-    #[test]
-    fn px_ratio_is_exact_for_screen_sizes() {
-        assert!((px_ratio(960, 1920) - 0.5).abs() < f32::EPSILON);
-        assert!((px_ratio(1, 1) - 1.0).abs() < f32::EPSILON);
     }
 }

@@ -111,8 +111,8 @@ impl WgpuResources {
     ///
     /// # Errors
     /// A message when the crate's composite module is broken or the device rejects any object.
-    pub(super) fn create(device: &wgpu::Device, adapter: &wgpu::Adapter, target_format: wgpu::TextureFormat, options: &WgpuOptions, generation: u64) -> Result<Self, String> {
-        let chain = ChainResources::create(device, adapter)?;
+    pub(super) fn create(device: &wgpu::Device, queue: &wgpu::Queue, adapter: &wgpu::Adapter, target_format: wgpu::TextureFormat, options: &WgpuOptions, generation: u64) -> Result<Self, String> {
+        let chain = ChainResources::create(device, queue, adapter)?;
         // Mirrors egui-wgpu's depth state so the pipeline is compatible with its pass.
         let depth_stencil = options.depth_stencil_format().map(|format| wgpu::DepthStencilState {
             format,
@@ -141,7 +141,7 @@ impl WgpuResources {
         let (mesh_format, mesh_entry) = if srgb_capture { (CAPTURE_SRGB_VIEW_FORMAT, "fs_main_linear") } else { (CAPTURE_FORMAT, "fs_main") };
 
         let (mesh_locals_layout, mesh_pipeline) = with_error_scope(device, || {
-            let mesh_locals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers mesh locals"), entries: &[uniform_entry(0, MESH_LOCALS_SIZE)] });
+            let mesh_locals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers mesh locals"), entries: &[uniform_entry(0, Some(MESH_LOCALS_SIZE))] });
             // Identical descriptor to egui-wgpu's `egui_texture_bind_group_layout`: wgpu-core
             // deduplicates equal layouts and WebGPU treats them as group-equivalent, so egui's
             // own per-texture bind groups can be bound to this pipeline unchanged.

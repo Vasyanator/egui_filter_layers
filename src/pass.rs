@@ -12,8 +12,9 @@ Key structures:
 
 Key functions:
 - `FrameUniforms::for_layer()`: the one place the per-layer uniforms are derived from geometry.
-- `pack_uniforms()`: serializes one pass's uniforms into the exact std140 / WGSL-uniform layout
+- `pack_uniforms()`: serializes one draw's uniforms into the exact std140 / WGSL-uniform layout
   of `FlUniforms` in `shaders/prelude.wgsl` (offsets pinned by a test against naga's layout).
+  Which texture mapping and fragment offset each draw gets is decided by `plan.rs`, not here.
 */
 
 use crate::effect::{Effect, sanitize_radius};
@@ -208,7 +209,7 @@ impl Extend<Pass> for FilterChain {
 }
 
 /// Size in bytes of the `FlUniforms` block (see `shaders/prelude.wgsl`).
-pub(crate) const UNIFORM_BLOCK_SIZE: usize = 352;
+pub(crate) const UNIFORM_BLOCK_SIZE: usize = 416;
 
 /// Byte offsets of the `FlUniforms` members; pinned against naga's computed layout by a test.
 pub(crate) mod offsets {
@@ -236,8 +237,28 @@ pub(crate) mod offsets {
     pub const SRC_OFFSET: usize = 72;
     /// `internal_aux_offset: vec2<f32>`.
     pub const AUX_OFFSET: usize = 80;
+    /// `delta_time: f32`.
+    pub const DELTA_TIME: usize = 88;
+    /// `frame: u32`.
+    pub const FRAME: usize = 92;
+    /// `pointer: vec4<f32>`.
+    pub const POINTER: usize = 96;
+    /// `internal_state_scale: vec2<f32>`.
+    pub const STATE_SCALE: usize = 112;
+    /// `internal_state_offset: vec2<f32>`.
+    pub const STATE_OFFSET: usize = 120;
+    /// `internal_cover_scale: vec2<f32>`.
+    pub const COVER_SCALE: usize = 128;
+    /// `internal_cover_offset: vec2<f32>`.
+    pub const COVER_OFFSET: usize = 136;
+    /// `pass_scale: f32`.
+    pub const PASS_SCALE: usize = 144;
+    /// `pass_index: u32`.
+    pub const PASS_INDEX: usize = 148;
+    /// `internal_frag_texel: vec2<f32>`.
+    pub const FRAG_TEXEL: usize = 152;
     /// `params: array<vec4<f32>, 16>`.
-    pub const PARAMS: usize = 96;
+    pub const PARAMS: usize = 160;
 }
 
 /// The non-parameter uniforms of one pass.
@@ -269,6 +290,21 @@ pub(crate) struct FrameUniforms {
     pub src_offset: [f32; 2],
     /// Same for the auxiliary texture.
     pub aux_offset: [f32; 2],
+    /// Seconds since the previous frame (`fl.delta_time`); no producer yet, so always `0`.
+    pub delta_time: f32,
+    /// Frame counter (`fl.frame`); no producer yet, so always `0`.
+    pub frame: u32,
+    /// Pointer in capture uv, `z` pressed, `w` present (`fl.pointer`); `w = 0`: no pointer.
+    pub pointer: [f32; 4],
+    /// Capture uv -> storage uv of the state texture (`internal_state_*`); identity while no
+    /// chain has state.
+    pub state: [[f32; 2]; 2],
+    /// Same for the coverage texture (`internal_cover_*`); identity while no mask needs one.
+    pub cover: [[f32; 2]; 2],
+    /// Output resolution of the draw relative to the capture (`fl.pass_scale`); `1` = full.
+    pub pass_scale: f32,
+    /// Index of the draw among the frame's draws of its kind (`fl.pass_index`).
+    pub pass_index: u32,
 }
 
 impl FrameUniforms {
@@ -276,8 +312,9 @@ impl FrameUniforms {
     /// `texel` / `size_px` from the capture size, and `fl.pixels_per_point` =
     /// `geometry.pixels_per_layer_point` (physical pixels per LAYER point, so effect distances in
     /// points follow a layer transform's zoom exactly like the padding does). `src_scale` /
-    /// `aux_scale` start at `1` and are set per pass by the backend (grow-only targets); the
-    /// window fields (`frag_*`, `*_offset`) start in the interpolated, whole-capture state.
+    /// `aux_scale` start at `1` and are set per draw by `plan.rs` (grow-only targets); the
+    /// window fields (`frag_*`, `*_offset`) start in the interpolated, whole-capture state. The
+    /// remaining members hold their neutral values (see each field).
     ///
     /// `time` is seconds; `flip_y` whether the backend's texture storage is bottom-up (OpenGL).
     #[must_use]
@@ -296,6 +333,13 @@ impl FrameUniforms {
             frag_offset: [0.0, 0.0],
             src_offset: [0.0, 0.0],
             aux_offset: [0.0, 0.0],
+            delta_time: 0.0,
+            frame: 0,
+            pointer: [0.0; 4],
+            state: [[1.0, 1.0], [0.0, 0.0]],
+            cover: [[1.0, 1.0], [0.0, 0.0]],
+            pass_scale: 1.0,
+            pass_index: 0,
         }
     }
 }
@@ -310,8 +354,16 @@ fn put_f32s(bytes: &mut [u8; UNIFORM_BLOCK_SIZE], offset: usize, values: &[f32])
     }
 }
 
-/// Serializes one pass's uniforms into the `FlUniforms` byte layout (native endianness, as the
-/// GPU APIs expect for host-written buffers).
+/// Writes `value` as a native-endian `u32` at `offset`.
+fn put_u32(bytes: &mut [u8; UNIFORM_BLOCK_SIZE], offset: usize, value: u32) {
+    if let Some(chunk) = bytes.get_mut(offset..offset + 4) {
+        chunk.copy_from_slice(&value.to_ne_bytes());
+    }
+}
+
+/// Serializes one draw's uniforms into the `FlUniforms` byte layout (native endianness, as the
+/// GPU APIs expect for host-written buffers). `internal_frag_texel` is derived here as
+/// `texel / pass_scale` (the texel of the draw's own output resolution).
 #[must_use]
 pub(crate) fn pack_uniforms(frame: &FrameUniforms, params: &Params) -> [u8; UNIFORM_BLOCK_SIZE] {
     let mut bytes = [0_u8; UNIFORM_BLOCK_SIZE];
@@ -327,6 +379,16 @@ pub(crate) fn pack_uniforms(frame: &FrameUniforms, params: &Params) -> [u8; UNIF
     put_f32s(&mut bytes, offsets::FRAG_OFFSET, &frame.frag_offset);
     put_f32s(&mut bytes, offsets::SRC_OFFSET, &frame.src_offset);
     put_f32s(&mut bytes, offsets::AUX_OFFSET, &frame.aux_offset);
+    put_f32s(&mut bytes, offsets::DELTA_TIME, &[frame.delta_time]);
+    put_u32(&mut bytes, offsets::FRAME, frame.frame);
+    put_f32s(&mut bytes, offsets::POINTER, &frame.pointer);
+    put_f32s(&mut bytes, offsets::STATE_SCALE, &frame.state[0]);
+    put_f32s(&mut bytes, offsets::STATE_OFFSET, &frame.state[1]);
+    put_f32s(&mut bytes, offsets::COVER_SCALE, &frame.cover[0]);
+    put_f32s(&mut bytes, offsets::COVER_OFFSET, &frame.cover[1]);
+    put_f32s(&mut bytes, offsets::PASS_SCALE, &[frame.pass_scale]);
+    put_u32(&mut bytes, offsets::PASS_INDEX, frame.pass_index);
+    put_f32s(&mut bytes, offsets::FRAG_TEXEL, &[frame.texel[0] / frame.pass_scale, frame.texel[1] / frame.pass_scale]);
     for (i, slot) in params.iter().enumerate() {
         put_f32s(&mut bytes, offsets::PARAMS + i * 16, slot);
     }
@@ -369,7 +431,18 @@ mod tests {
         assert_eq!(offset_of("internal_frag_offset"), offsets::FRAG_OFFSET);
         assert_eq!(offset_of("internal_src_offset"), offsets::SRC_OFFSET);
         assert_eq!(offset_of("internal_aux_offset"), offsets::AUX_OFFSET);
+        assert_eq!(offset_of("delta_time"), offsets::DELTA_TIME);
+        assert_eq!(offset_of("frame"), offsets::FRAME);
+        assert_eq!(offset_of("pointer"), offsets::POINTER);
+        assert_eq!(offset_of("internal_state_scale"), offsets::STATE_SCALE);
+        assert_eq!(offset_of("internal_state_offset"), offsets::STATE_OFFSET);
+        assert_eq!(offset_of("internal_cover_scale"), offsets::COVER_SCALE);
+        assert_eq!(offset_of("internal_cover_offset"), offsets::COVER_OFFSET);
+        assert_eq!(offset_of("pass_scale"), offsets::PASS_SCALE);
+        assert_eq!(offset_of("pass_index"), offsets::PASS_INDEX);
+        assert_eq!(offset_of("internal_frag_texel"), offsets::FRAG_TEXEL);
         assert_eq!(offset_of("params"), offsets::PARAMS);
+        assert_eq!(members.len(), 23, "every member is pinned above");
         assert_eq!(usize::try_from(*span).unwrap_or(0), UNIFORM_BLOCK_SIZE);
     }
 
@@ -388,6 +461,13 @@ mod tests {
             frag_offset: [-3.0, 5.0],
             src_offset: [0.25, 0.5],
             aux_offset: [0.0625, 2.0],
+            delta_time: 0.0625,
+            frame: 77,
+            pointer: [0.5, 0.25, 1.0, 1.0],
+            state: [[0.5, 0.75], [0.125, 0.25]],
+            cover: [[0.375, 1.0], [0.0, 0.5]],
+            pass_scale: 0.5,
+            pass_index: 3,
         };
         let mut params = [[0.0; 4]; PARAM_SLOTS];
         params[0] = [1.0, 2.0, 3.0, 4.0];
@@ -407,7 +487,30 @@ mod tests {
         assert!((read_f32(&bytes, offsets::FRAG_OFFSET) + 3.0).abs() < f32::EPSILON);
         assert!((read_f32(&bytes, offsets::SRC_OFFSET + 4) - 0.5).abs() < f32::EPSILON);
         assert!((read_f32(&bytes, offsets::AUX_OFFSET + 4) - 2.0).abs() < f32::EPSILON);
-        assert!(read_f32(&bytes, offsets::AUX_OFFSET + 8).abs() < f32::EPSILON, "reserved slot stays zero");
+        let read_u32 = |offset: usize| u32::from_ne_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]);
+        assert!((read_f32(&bytes, offsets::DELTA_TIME) - 0.0625).abs() < f32::EPSILON);
+        assert_eq!(read_u32(offsets::FRAME), 77);
+        assert!((read_f32(&bytes, offsets::POINTER + 4) - 0.25).abs() < f32::EPSILON);
+        assert!((read_f32(&bytes, offsets::STATE_SCALE + 4) - 0.75).abs() < f32::EPSILON);
+        assert!((read_f32(&bytes, offsets::STATE_OFFSET) - 0.125).abs() < f32::EPSILON);
+        assert!((read_f32(&bytes, offsets::COVER_SCALE) - 0.375).abs() < f32::EPSILON);
+        assert!((read_f32(&bytes, offsets::COVER_OFFSET + 4) - 0.5).abs() < f32::EPSILON);
+        assert!((read_f32(&bytes, offsets::PASS_SCALE) - 0.5).abs() < f32::EPSILON);
+        assert_eq!(read_u32(offsets::PASS_INDEX), 3);
+        // texel / pass_scale.
+        assert!((read_f32(&bytes, offsets::FRAG_TEXEL) - 1.0).abs() < f32::EPSILON && (read_f32(&bytes, offsets::FRAG_TEXEL + 4) - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn layer_uniforms_start_neutral() {
+        use egui::{CornerRadius, Rect, pos2, vec2};
+        let rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(40.0, 20.0));
+        let Some(geometry) = crate::geometry::layer_geometry(rect, Rect::EVERYTHING, 1.0, [100, 100], 0.0, CornerRadius::ZERO, 1.0) else { panic!("visible") };
+        let bytes = pack_uniforms(&FrameUniforms::for_layer(&geometry, 1.0, false), &[[0.0; 4]; PARAM_SLOTS]);
+        assert!((read_f32(&bytes, offsets::PASS_SCALE) - 1.0).abs() < f32::EPSILON);
+        assert!((read_f32(&bytes, offsets::FRAG_TEXEL) - read_f32(&bytes, offsets::TEXEL)).abs() < f32::EPSILON, "full resolution: the draw's texel is the capture's");
+        assert!((read_f32(&bytes, offsets::STATE_SCALE) - 1.0).abs() < f32::EPSILON && (read_f32(&bytes, offsets::COVER_SCALE + 4) - 1.0).abs() < f32::EPSILON);
+        assert!(read_f32(&bytes, offsets::POINTER + 12).abs() < f32::EPSILON, "no pointer present");
     }
 
     #[test]

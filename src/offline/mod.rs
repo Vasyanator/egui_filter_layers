@@ -281,7 +281,7 @@ impl OfflineRenderer {
     /// # Errors
     /// [`OfflineError::Gpu`] when the device rejects the crate's pipelines.
     pub fn new(adapter: &wgpu::Adapter, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self, OfflineError> {
-        let chain = ChainResources::create(device, adapter).map_err(OfflineError::Gpu)?;
+        let chain = ChainResources::create(device, queue, adapter).map_err(OfflineError::Gpu)?;
         let composite = chain.composite_pipeline(device, FRAME_FORMAT, wgpu::MultisampleState::default(), None).map_err(OfflineError::Gpu)?;
         let limits = device.limits();
         let max_readback_side = readback_side_limit(limits.max_buffer_size);

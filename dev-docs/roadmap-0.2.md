@@ -481,3 +481,4 @@ UI. The demo requires both backend features as today.
 
 ## 17. Progress
 Each phase is marked done here in the same commit that lands it.
+- Phase 1 (plan.rs single owner, full `@group(0)` layout with dummies, 416-byte `FlUniforms`, prelude-name interface check, `ModuleKind` removed): done.

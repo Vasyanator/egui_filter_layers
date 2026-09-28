@@ -13,14 +13,17 @@ user code ──► FilterLayer::paint (layer.rs)
                  │                                         ├─ glow_backend/  (feature "glow")
                  ▼                                         └─ wgpu_backend/  (feature "wgpu")
           Backend::paint_layer adds its own Shape::Callback; at paint time it uses
-          geometry.rs (pixel math) + pass.rs (uniform packing) + effect.rs (validated naga module)
+          geometry.rs (pixel math) + plan.rs (the draws of a run: slots, viewports, uniform
+          blocks) + pass.rs (uniform layout) + effect.rs (validated naga module)
 ```
 - **Shader model**: every effect is WGSL = `shaders/prelude.wgsl` + the user's `fn effect(uv)`.
   naga parses and validates it once in `Effect::new` on every backend. Backends translate the
   validated `naga::Module` (glow: GLSL via naga `glsl-out`; wgpu: WGSL directly).
 - **Pipeline per layer** (backend-neutral contract): capture the backdrop region (padded by
   `FilterChain::padding_points`, clamped to the screen) into an 8-bit texture; run passes
-  ping-pong into intermediates; run the internal composite pass (`shaders/composite.wgsl`) that
+  ping-pong into intermediates (the wiring — which slot each draw binds and writes, its viewport
+  and complete uniform block — is `plan.rs`'s alone; backends map slots to objects and draw); run
+  the internal composite pass (`shaders/composite.wgsl`) that
   writes the result over the visible region by the rounded-rect mask. glow copies the backdrop
   out of the framebuffer and REPLACES the region (mixing with that exact copy); wgpu re-renders
   the beneath content offscreen (it cannot read its surface), so on wgpu that content is drawn
@@ -41,6 +44,9 @@ user code ──► FilterLayer::paint (layer.rs)
   (gamma / linear output), binding constants.
 - `pass.rs`: `Pass`, `FilterChain`, `PARAM_SLOTS`, uniform block layout (`offsets`, `pack_uniforms`),
   `FrameUniforms::for_layer` (the per-layer uniform values every backend uploads).
+- `plan.rs`: backend-neutral wiring of one chain run — `plan()` (steps: bindings by `Slot`,
+  output, viewport, fragment offset; the composite), `TextureMapping::of` (the one storage-uv
+  formula), `step_uniforms` / `composite_uniforms` (every block a backend uploads).
 - `geometry.rs`: `layer_geometry` — region / capture / UV / mask math (pure, unit-tested);
   `LayerGeometry::composite_params` (the composite pass's parameter block, every backend).
 - `layer.rs`: `FilterLayer` and its `paint` (skips a missing or failed backend; requests a
@@ -63,8 +69,16 @@ user code ──► FilterLayer::paint (layer.rs)
 - Public API never panics on user input; the only panics are in `presets::builtin` for invalid
   built-in WGSL, which tests exclude.
 - `FlUniforms` byte layout: `pass::offsets` must match the WGSL struct (pinned by a naga-layout test).
-- Bindings in `@group(0)`: 0 = `fl` uniforms, 1 = pass input, 2 = sampler, 3 = original capture
-  (composite only). User effects may not declare other resources or entry points.
+  Members without a producer yet hold neutral values set in `FrameUniforms::for_layer`.
+- Bindings in `@group(0)`, all declared by the prelude and bound for EVERY draw (effects and the
+  composite share one layout): 0 = `fl`, 1 = pass input, 2 = linear sampler, 3 = original
+  capture, 4 = a crate-appended uniform block, 5 = state, 6 = mask coverage, 7 = nearest sampler.
+  A binding a draw does not use gets a neutral dummy (transparent / white texture, zero buffer);
+  today only the composite binds a real original. The interface check accepts only these
+  prelude declarations (`effect::PRELUDE_RESOURCES`): a snippet declares no binding at all.
+- Wiring has one owner: backends never decide which slot a draw reads, which mapping or
+  fragment offset it uploads; they call `plan.rs` (glow and wgpu blocks are byte-identical but for
+  `flip_y` / fragment mode, pinned by `glow_and_wgpu_upload_identical_blocks`).
 - A backend never draws a fake: when it is missing or failed, layers draw nothing extra and
   `status()` says why. Failures are latched and logged once (`log` crate), never retried per frame.
   Per-effect failures disable only that effect (`failed_effects()`), not the backend.
@@ -87,6 +101,8 @@ user code ──► FilterLayer::paint (layer.rs)
 ## Editing map
 - New preset: add the WGSL constant + entry in `BUILTIN_EFFECTS` + constructor in `presets.rs`.
 - New prelude helper or uniform: `shaders/prelude.wgsl`, then `pass.rs` offsets/packing and tests.
+- A new texture a draw reads, a new kind of step, per-step sizes: `plan.rs` first, then each
+  backend's slot -> object mapping (wgpu `chain.rs`, glow `render.rs` + `glsl.rs` units).
 - New backend: implement `backend::Backend` in a feature-gated module, add its `install_*` API,
   register with `backend::register`.
 - Capture/padding/mask math: `geometry.rs`.

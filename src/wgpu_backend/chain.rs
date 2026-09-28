@@ -2,30 +2,36 @@
 File: wgpu_backend/chain.rs
 
 Purpose:
-The ONE owner of how a `FilterChain` is executed on wgpu: given an input texture that holds the
-capture (at its origin) and the layer's `LayerGeometry`, run every pass ping-pong into
-intermediates and prepare the composite pass that writes the result, masked by the rounded rect,
-into any render target. Holds no egui state: callers bring `&wgpu::Device`, `&wgpu::Queue` and a
+The ONE wgpu executor of a `FilterChain`: given an input texture that holds the capture (at its
+origin) and the layer's `LayerGeometry`, it runs the draws of the backend-neutral `plan::ChainPlan`
+(which slot each draw reads and writes, its viewport and uniform block are decided there, shared
+with glow) and prepares the composite that writes the result, masked by the rounded rect, into any
+render target. Holds no egui state: callers bring `&wgpu::Device`, `&wgpu::Queue` and a
 `CommandEncoder`, so both the UI paint callback (`render.rs`) and a standalone runner on its own
 device use exactly the same objects, formats, uniform layout and pass order.
 
 Key structures:
-- `ChainResources`: per-device objects (sampler, effect / composite layouts, intermediate format,
-  uniform stride, effect pipeline cache); builds composite pipelines for any output format.
+- `ChainResources`: per-device objects (linear and nearest samplers, the ONE `@group(0)` bind
+  group layout of every effect and composite pipeline, dummies for bindings a draw leaves unused,
+  intermediate format, uniform stride, effect pipeline cache); builds composite pipelines for any
+  output format.
 - `ChainTargets`: per-concurrent-run ping-pong intermediates and the uniform buffer.
 - `ChainSource`, `ChainRecording`, `ChainJob`, `ChainWindow`: the inputs of one recorded run.
 
 Key functions:
 - `ChainResources::create()`, `effect_pipeline()`, `composite_pipeline()` (replace),
   `composite_over_pipelines()` (blended, `CompositeOver`), `record()`.
-- `chain_uniforms()`: pure serialization of every pass's and the composite's uniform block.
+- `frame_uniforms()`: the wgpu flags on the layer's `FrameUniforms` (top-down storage, position
+  fragment mode).
+- `chain_uniforms()`: the plan's uniform blocks laid out at the device's uniform stride.
 - `draw_composite()` / `draw_composite_over()`: the composite draw(s) into a caller-owned render
   pass (replace: offline; blended over the pass's pixels: the UI).
 
 Notes:
-Uniform slot `i` (at `uniform_stride * i`) holds pass `i`; slot `n` (the pass count) the
-composite. Pass `i` reads the source (i = 0) or pass `i - 1`'s output and writes
-`ping_pong[i % 2]`. Textures are stored top-down on wgpu, so `flip_y` is false.
+Uniform slot `i` (at `uniform_stride * i`) holds plan step `i`; slot `n` (the step count) the
+composite. Every draw binds all eight `@group(0)` entries of the prelude's layout; a binding the
+plan leaves empty gets a dummy (transparent texture, white coverage, a 16-byte zero buffer).
+Textures are stored top-down on wgpu, so `flip_y` is false.
 A run computes a WINDOW of the capture (`ChainWindow`): the UI always uses the whole capture; the
 offline tiler runs one window per tile. Fragments derive their capture uv from their pixel
 position (prelude frag mode 1), and every texture holds its window at its origin, so a pixel's
@@ -35,10 +41,17 @@ arithmetic does not depend on which window computed it.
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
-use super::gpu::{GrowBuffer, Target, begin_pass, pass_pipeline, px_ratio, renderable_and_filterable, sampler_entry, texture_entry, texture_scale, uniform_entry, with_error_scope};
-use crate::effect::{BINDING_ORIGINAL_TEXTURE, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_UNIFORMS, CompiledModule, composite_add_linear_module, composite_add_module, composite_erase_module, composite_linear_module, composite_module};
+use super::gpu::{GrowBuffer, Target, begin_pass, pass_pipeline, renderable_and_filterable, sampler_entry, texture_entry, uniform_entry, with_error_scope};
+use crate::effect::{
+    BINDING_COVERAGE_TEXTURE, BINDING_NEAREST_SAMPLER, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, CompiledModule, composite_add_linear_module, composite_add_module,
+    composite_erase_module, composite_linear_module, composite_module,
+};
 use crate::geometry::{LayerGeometry, PxRect, px_f32};
-use crate::pass::{FrameUniforms, Params, Pass, UNIFORM_BLOCK_SIZE, pack_uniforms};
+use crate::pass::{FrameUniforms, Pass, UNIFORM_BLOCK_SIZE};
+use crate::plan::{Bindings, ChainPlan, Slot, SlotMappings, TextureMapping, composite_uniforms, plan, step_uniforms};
+
+/// Size of the zero buffer bound at `BINDING_PARAMS` (the smallest valid uniform binding).
+const DUMMY_PARAMS_SIZE: u64 = 16;
 
 /// Blend of the blended composite's erase draw: `dst * (1 - src.a)` on colour and alpha (the
 /// shader outputs `(0, 0, 0, coverage)`, so the source term is zero).
@@ -84,27 +97,32 @@ pub(crate) struct ChainResources {
     intermediate_format: wgpu::TextureFormat,
     /// Byte distance between uniform blocks in a run's uniform buffer (device alignment).
     uniform_stride: u64,
-    /// Linear, clamp-to-edge sampler for pass inputs.
+    /// Linear, clamp-to-edge sampler (`fl_sampler`).
     sampler: wgpu::Sampler,
-    /// Layout of the effect passes' group 0.
-    effect_layout: wgpu::BindGroupLayout,
-    /// Pipeline layout shared by every effect pipeline.
-    effect_pipeline_layout: wgpu::PipelineLayout,
-    /// Layout of the composite pass's group 0.
-    composite_layout: wgpu::BindGroupLayout,
-    /// Pipeline layout of every composite pipeline.
-    composite_pipeline_layout: wgpu::PipelineLayout,
+    /// Nearest, clamp-to-edge sampler (`fl_nearest_sampler`).
+    nearest_sampler: wgpu::Sampler,
+    /// The `@group(0)` layout of the prelude, shared by every effect and composite pipeline.
+    layout: wgpu::BindGroupLayout,
+    /// Pipeline layout of every effect and composite pipeline.
+    pipeline_layout: wgpu::PipelineLayout,
+    /// Bound where a draw has no texture: 1x1 transparent (original, state).
+    transparent: wgpu::TextureView,
+    /// Bound where a draw has no mask coverage texture: 1x1 opaque white.
+    white: wgpu::TextureView,
+    /// Bound at `BINDING_PARAMS` when a module declares no block there: 16 zero bytes.
+    dummy_params: wgpu::Buffer,
     /// Effect pipelines by `CompiledModule::id`.
     pipelines: HashMap<u64, CachedPipeline>,
 }
 
 impl ChainResources {
-    /// Builds the sampler and layouts, and picks the intermediate format (RGBA16F when the
-    /// adapter can render to and filter it, else RGBA8).
+    /// Builds the samplers, the layout and the dummies (the white one is uploaded with
+    /// `queue.write_texture`, i.e. before the next submission of `queue`), and picks the
+    /// intermediate format (RGBA16F when the adapter can render to and filter it, else RGBA8).
     ///
     /// # Errors
     /// The device's validation message when it rejects any object.
-    pub(crate) fn create(device: &wgpu::Device, adapter: &wgpu::Adapter) -> Result<Self, String> {
+    pub(crate) fn create(device: &wgpu::Device, queue: &wgpu::Queue, adapter: &wgpu::Adapter) -> Result<Self, String> {
         let float_intermediates = renderable_and_filterable(adapter, wgpu::TextureFormat::Rgba16Float);
         let intermediate_format = if float_intermediates { wgpu::TextureFormat::Rgba16Float } else { wgpu::TextureFormat::Rgba8Unorm };
         let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment.max(1));
@@ -118,17 +136,41 @@ impl ChainResources {
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             });
-            let effect_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("egui_filter_layers effect"),
-                entries: &[uniform_entry(BINDING_UNIFORMS, UNIFORM_BLOCK_SIZE), texture_entry(BINDING_SOURCE_TEXTURE), sampler_entry(BINDING_SAMPLER)],
+            let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("egui_filter_layers nearest sampler"), ..Default::default() });
+            // A layout may hold entries a shader does not use, so this one layout serves every
+            // module; the params block is unsized (`None`): a module may declare any size there.
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("egui_filter_layers group 0"),
+                entries: &[
+                    uniform_entry(BINDING_UNIFORMS, Some(UNIFORM_BLOCK_SIZE)),
+                    texture_entry(BINDING_SOURCE_TEXTURE),
+                    sampler_entry(BINDING_SAMPLER),
+                    texture_entry(BINDING_ORIGINAL_TEXTURE),
+                    uniform_entry(BINDING_PARAMS, None),
+                    texture_entry(BINDING_STATE_TEXTURE),
+                    texture_entry(BINDING_COVERAGE_TEXTURE),
+                    sampler_entry(BINDING_NEAREST_SAMPLER),
+                ],
             });
-            let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("egui_filter_layers composite"),
-                entries: &[uniform_entry(BINDING_UNIFORMS, UNIFORM_BLOCK_SIZE), texture_entry(BINDING_SOURCE_TEXTURE), sampler_entry(BINDING_SAMPLER), texture_entry(BINDING_ORIGINAL_TEXTURE)],
-            });
-            let effect_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("egui_filter_layers effect"), bind_group_layouts: &[Some(&effect_layout)], immediate_size: 0 });
-            let composite_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("egui_filter_layers composite"), bind_group_layouts: &[Some(&composite_layout)], immediate_size: 0 });
-            Self { float_intermediates, intermediate_format, uniform_stride, sampler, effect_layout, effect_pipeline_layout, composite_layout, composite_pipeline_layout, pipelines: HashMap::new() }
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("egui_filter_layers group 0"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+            // Zero-initialized by wgpu (textures and buffers are cleared before first use).
+            let transparent = dummy_texture(device, "egui_filter_layers transparent dummy");
+            let white_texture = dummy_texture(device, "egui_filter_layers white dummy");
+            queue.write_texture(white_texture.as_image_copy(), &[u8::MAX; 4], wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) }, wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 });
+            let dummy_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("egui_filter_layers params dummy"), size: DUMMY_PARAMS_SIZE, usage: wgpu::BufferUsages::UNIFORM, mapped_at_creation: false });
+            Self {
+                float_intermediates,
+                intermediate_format,
+                uniform_stride,
+                sampler,
+                nearest_sampler,
+                layout,
+                pipeline_layout,
+                transparent: transparent.create_view(&wgpu::TextureViewDescriptor::default()),
+                white: white_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                dummy_params,
+                pipelines: HashMap::new(),
+            }
         })
     }
 
@@ -152,7 +194,7 @@ impl ChainResources {
         if let Some(entry) = self.pipelines.get(&module.id) {
             return Ok(entry.pipeline.clone());
         }
-        let pipeline = with_error_scope(device, || pass_pipeline(device, &self.effect_pipeline_layout, module, self.intermediate_format, None, wgpu::MultisampleState::default(), None))?;
+        let pipeline = with_error_scope(device, || pass_pipeline(device, &self.pipeline_layout, module, self.intermediate_format, None, wgpu::MultisampleState::default(), None))?;
         log::debug!("egui_filter_layers (wgpu): built pipeline for effect `{}`", module.label);
         self.pipelines.insert(module.id, CachedPipeline { module: Arc::downgrade(module), pipeline: pipeline.clone() });
         Ok(pipeline)
@@ -174,7 +216,7 @@ impl ChainResources {
     #[cfg_attr(not(any(feature = "image", feature = "video")), allow(dead_code))] // The replace composite serves the offline renderer only.
     pub(crate) fn composite_pipeline(&self, device: &wgpu::Device, format: wgpu::TextureFormat, multisample: wgpu::MultisampleState, depth_stencil: Option<wgpu::DepthStencilState>) -> Result<wgpu::RenderPipeline, String> {
         let composite = if format.is_srgb() { composite_linear_module() } else { composite_module() }.map_err(|error| format!("the composite pass does not compile (crate bug): {error}"))?;
-        with_error_scope(device, || pass_pipeline(device, &self.composite_pipeline_layout, &composite, format, None, multisample, depth_stencil))
+        with_error_scope(device, || pass_pipeline(device, &self.pipeline_layout, &composite, format, None, multisample, depth_stencil))
     }
 
     /// The two pipelines of the BLENDED composite into `format` (multisample / depth state as for
@@ -190,8 +232,8 @@ impl ChainResources {
         let erase = composite_erase_module().map_err(crate_bug)?;
         let add = if format.is_srgb() { composite_add_linear_module() } else { composite_add_module() }.map_err(crate_bug)?;
         with_error_scope(device, || CompositeOver {
-            erase: pass_pipeline(device, &self.composite_pipeline_layout, &erase, format, Some(ERASE_BLEND), multisample, depth_stencil.clone()),
-            add: pass_pipeline(device, &self.composite_pipeline_layout, &add, format, Some(ADD_BLEND), multisample, depth_stencil),
+            erase: pass_pipeline(device, &self.pipeline_layout, &erase, format, Some(ERASE_BLEND), multisample, depth_stencil.clone()),
+            add: pass_pipeline(device, &self.pipeline_layout, &add, format, Some(ADD_BLEND), multisample, depth_stencil),
         })
     }
 
@@ -204,18 +246,15 @@ impl ChainResources {
     /// within the chain's reach of a window edge that is not a capture edge are only as exact as
     /// the data the window holds there (the offline tiler overlaps windows by the padding).
     pub(crate) fn record(&self, rec: &mut ChainRecording<'_>, targets: &mut ChainTargets, job: &ChainJob<'_>) -> Option<wgpu::BindGroup> {
-        let pass_count = job.passes.len();
-        if pass_count == 0 || job.pipelines.len() != pass_count {
+        if job.pipelines.len() != job.passes.len() {
             return None;
         }
-        let capture = job.geometry.capture.size().map(|extent| u32::try_from(extent).unwrap_or(1));
         let window = job.window.rect;
+        let plan = plan(job.passes.len(), window, job.window.composite_origin)?;
+        // `plan` rejected empty and negative windows, so these conversions cannot fail.
         let (Ok(window_w), Ok(window_h), Ok(window_x), Ok(window_y)) = (u32::try_from(window.w), u32::try_from(window.h), u32::try_from(window.x), u32::try_from(window.y)) else {
             return None;
         };
-        if window_w == 0 || window_h == 0 {
-            return None;
-        }
         let needed = [window_w.max(job.window.min_target_size[0]), window_h.max(job.window.min_target_size[1])];
         for (index, slot) in targets.ping_pong.iter_mut().enumerate() {
             Target::ensure(slot, rec.device, self.intermediate_format, None, if index == 0 { "egui_filter_layers ping" } else { "egui_filter_layers pong" }, needed);
@@ -223,58 +262,63 @@ impl ChainResources {
         let [Some(first), Some(second)] = &targets.ping_pong else {
             return None;
         };
-        let intermediates = [first, second];
 
+        let capture = job.geometry.capture.size().map(|extent| u32::try_from(extent).unwrap_or(1));
+        let origin = [window_x, window_y];
+        let maps = SlotMappings { source: TextureMapping::of(capture, job.source.allocated, origin), ping_pong: [TextureMapping::of(capture, first.size, origin), TextureMapping::of(capture, second.size, origin)] };
         let stride = self.uniform_stride;
         let slot_bytes = usize::try_from(stride).unwrap_or(UNIFORM_BLOCK_SIZE);
-        // wgpu textures are stored top-down, like the effect `uv`; fragments take their capture
-        // uv from their pixel position, so any window of the capture computes identical pixels.
-        let mut frame = FrameUniforms::for_layer(&job.geometry, job.time, false);
-        frame.frag_from_position = true;
-        let origin_in = |allocated: [u32; 2]| [px_ratio(window_x, allocated[0]), px_ratio(window_y, allocated[1])];
-        let mapping = ChainMapping {
-            source: TextureMapping { scale: texture_scale(capture, job.source.allocated), offset: origin_in(job.source.allocated) },
-            intermediates: [TextureMapping { scale: first.scale(capture), offset: origin_in(first.size) }, TextureMapping { scale: second.scale(capture), offset: origin_in(second.size) }],
-            pass_frag_offset: [px_f32(window.x), px_f32(window.y)],
-            composite_frag_offset: [-px_f32(job.window.composite_origin[0]), -px_f32(job.window.composite_origin[1])],
-        };
-        let uniforms = chain_uniforms(frame, job.passes, &job.geometry.composite_params(), slot_bytes, mapping);
+        let uniforms = chain_uniforms(&frame_uniforms(&job.geometry, job.time), &plan, job.passes, &job.geometry, &maps, slot_bytes);
         let uniform_buffer = targets.uniforms.write(rec.device, rec.queue, &uniforms).clone();
-        let uniform_at = |slot: usize| {
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &uniform_buffer, offset: stride * u64::try_from(slot).unwrap_or(0), size: std::num::NonZeroU64::new(u64::try_from(UNIFORM_BLOCK_SIZE).unwrap_or(0)) })
+        let view_of = |slot: Slot| match slot {
+            Slot::Source => job.source.view,
+            Slot::Ping => &first.view,
+            Slot::Pong => &second.view,
+        };
+        let bind_group = |slot: usize, bindings: Bindings| {
+            let uniforms = wgpu::BufferBinding { buffer: &uniform_buffer, offset: stride * u64::try_from(slot).unwrap_or(0), size: std::num::NonZeroU64::new(u64::try_from(UNIFORM_BLOCK_SIZE).unwrap_or(0)) };
+            let original = bindings.original.map_or(&self.transparent, view_of);
+            rec.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("egui_filter_layers draw"),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: BINDING_UNIFORMS, resource: wgpu::BindingResource::Buffer(uniforms) },
+                    wgpu::BindGroupEntry { binding: BINDING_SOURCE_TEXTURE, resource: wgpu::BindingResource::TextureView(view_of(bindings.src)) },
+                    wgpu::BindGroupEntry { binding: BINDING_SAMPLER, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: BINDING_ORIGINAL_TEXTURE, resource: wgpu::BindingResource::TextureView(original) },
+                    wgpu::BindGroupEntry { binding: BINDING_PARAMS, resource: self.dummy_params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: BINDING_STATE_TEXTURE, resource: wgpu::BindingResource::TextureView(&self.transparent) },
+                    wgpu::BindGroupEntry { binding: BINDING_COVERAGE_TEXTURE, resource: wgpu::BindingResource::TextureView(&self.white) },
+                    wgpu::BindGroupEntry { binding: BINDING_NEAREST_SAMPLER, resource: wgpu::BindingResource::Sampler(&self.nearest_sampler) },
+                ],
+            })
         };
 
-        // Filter passes, ping-pong: pass `i` reads the source (i = 0) or pass `i - 1`'s output.
-        let [w, h] = [px_f32(window.w), px_f32(window.h)];
-        for (index, pipeline) in job.pipelines.iter().enumerate() {
-            let input = if index == 0 { job.source.view } else { &intermediates[(index - 1) % 2].view };
-            let bind_group = rec.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("egui_filter_layers pass"),
-                layout: &self.effect_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: BINDING_UNIFORMS, resource: uniform_at(index) },
-                    wgpu::BindGroupEntry { binding: BINDING_SOURCE_TEXTURE, resource: wgpu::BindingResource::TextureView(input) },
-                    wgpu::BindGroupEntry { binding: BINDING_SAMPLER, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                ],
-            });
-            let mut pass = begin_pass(rec.encoder, &intermediates[index % 2].view, "egui_filter_layers filter pass", wgpu::Color::TRANSPARENT);
-            pass.set_viewport(0.0, 0.0, w, h, 0.0, 1.0);
+        for (index, step) in plan.steps.iter().enumerate() {
+            let pipeline = job.pipelines.get(step.pass)?;
+            let group = bind_group(index, step.bindings);
+            let mut pass = begin_pass(rec.encoder, view_of(step.output), "egui_filter_layers filter pass", wgpu::Color::TRANSPARENT);
+            pass.set_viewport(0.0, 0.0, px_f32(step.used_px[0]), px_f32(step.used_px[1]), 0.0, 1.0);
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
-
-        Some(rec.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("egui_filter_layers composite"),
-            layout: &self.composite_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: BINDING_UNIFORMS, resource: uniform_at(pass_count) },
-                wgpu::BindGroupEntry { binding: BINDING_SOURCE_TEXTURE, resource: wgpu::BindingResource::TextureView(&intermediates[(pass_count - 1) % 2].view) },
-                wgpu::BindGroupEntry { binding: BINDING_SAMPLER, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: BINDING_ORIGINAL_TEXTURE, resource: wgpu::BindingResource::TextureView(job.source.view) },
-            ],
-        }))
+        Some(bind_group(plan.steps.len(), plan.composite.bindings))
     }
+}
+
+/// A 1x1 `Rgba8Unorm` texture bound where a draw has no texture of its own.
+fn dummy_texture(device: &wgpu::Device, label: &str) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
 }
 
 /// The ping-pong intermediates and uniform buffer of ONE chain run. A run's composite reads
@@ -353,52 +397,32 @@ pub(crate) struct ChainJob<'a> {
     pub pipelines: &'a [wgpu::RenderPipeline],
 }
 
-/// How capture uv maps into one texture's storage uv: `clamp(uv) * scale - offset` (the
-/// prelude's `internal_*_scale` / `internal_*_offset`).
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct TextureMapping {
-    /// Capture size / allocated size.
-    pub scale: [f32; 2],
-    /// The window origin / allocated size (0 for a whole-capture window).
-    pub offset: [f32; 2],
-}
-
-/// Storage mappings of the chain's textures and the fragment offsets of one run.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ChainMapping {
-    /// Of the source texture.
-    pub source: TextureMapping,
-    /// Of `ping_pong[0]` and `ping_pong[1]`.
-    pub intermediates: [TextureMapping; 2],
-    /// Added to a pass fragment's position (target pixels) to get capture pixels: the window origin.
-    pub pass_frag_offset: [f32; 2],
-    /// Same for the composite's fragments: minus `ChainWindow::composite_origin`.
-    pub composite_frag_offset: [f32; 2],
-}
-
-/// Serializes the uniform blocks of one run: slot `i` = pass `i` (its `src_*` mapping is its
-/// input's), slot `passes.len()` = the composite (`src_*` of the last pass output, `aux_*` of the
-/// source, `composite_params`), each at a multiple of `slot_bytes` (>= the block size).
+/// The layer's `FrameUniforms` with the wgpu flags: textures are stored top-down, like the effect
+/// `uv` (`flip_y` false), and fragments take their capture uv from their pixel position, so any
+/// window of the capture computes identical pixels.
 #[must_use]
-pub(crate) fn chain_uniforms(mut frame: FrameUniforms, passes: &[Pass], composite_params: &Params, slot_bytes: usize, mapping: ChainMapping) -> Vec<u8> {
-    let pass_count = passes.len();
-    let mut uniforms = vec![0_u8; slot_bytes * (pass_count + 1)];
-    frame.frag_offset = mapping.pass_frag_offset;
-    for (index, pass) in passes.iter().enumerate() {
-        let input = if index == 0 { mapping.source } else { mapping.intermediates[(index - 1) % 2] };
-        frame.src_scale = input.scale;
-        frame.src_offset = input.offset;
-        let offset = slot_bytes * index;
-        uniforms[offset..offset + UNIFORM_BLOCK_SIZE].copy_from_slice(&pack_uniforms(&frame, pass.params()));
+pub(crate) fn frame_uniforms(geometry: &LayerGeometry, time: f32) -> FrameUniforms {
+    let mut frame = FrameUniforms::for_layer(geometry, time, false);
+    frame.frag_from_position = true;
+    frame
+}
+
+/// The uniform blocks of one run laid out for one buffer: slot `i` (at `slot_bytes * i`, a
+/// multiple >= the block size) = `plan.steps[i]`, slot `plan.steps.len()` = the composite. The
+/// blocks themselves come from `plan.rs`.
+#[must_use]
+pub(crate) fn chain_uniforms(frame: &FrameUniforms, plan: &ChainPlan, passes: &[Pass], geometry: &LayerGeometry, maps: &SlotMappings, slot_bytes: usize) -> Vec<u8> {
+    let step_count = plan.steps.len();
+    let mut uniforms = vec![0_u8; slot_bytes * (step_count + 1)];
+    for (index, step) in plan.steps.iter().enumerate() {
+        // `plan` indexes `passes` it was built from; a mismatch leaves the slot zero.
+        if let Some(pass) = passes.get(step.pass) {
+            let offset = slot_bytes * index;
+            uniforms[offset..offset + UNIFORM_BLOCK_SIZE].copy_from_slice(&step_uniforms(frame, step, maps, pass));
+        }
     }
-    let last = mapping.intermediates[pass_count.saturating_sub(1) % 2];
-    frame.src_scale = last.scale;
-    frame.src_offset = last.offset;
-    frame.aux_scale = mapping.source.scale;
-    frame.aux_offset = mapping.source.offset;
-    frame.frag_offset = mapping.composite_frag_offset;
-    let offset = slot_bytes * pass_count;
-    uniforms[offset..offset + UNIFORM_BLOCK_SIZE].copy_from_slice(&pack_uniforms(&frame, composite_params));
+    let offset = slot_bytes * step_count;
+    uniforms[offset..offset + UNIFORM_BLOCK_SIZE].copy_from_slice(&composite_uniforms(frame, plan, maps, geometry));
     uniforms
 }
 
@@ -430,45 +454,25 @@ pub(crate) fn draw_composite_over(render_pass: &mut wgpu::RenderPass<'_>, pipeli
 mod tests {
     use super::*;
     use crate::effect::Effect;
-    use crate::pass::{PARAM_SLOTS, offsets};
 
-    /// Whether the two `f32`s at `offset` equal `expected` (all test values are exact in f32).
-    fn holds(bytes: &[u8], offset: usize, expected: [f32; 2]) -> bool {
-        let read = |at: usize| f32::from_ne_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-        (read(offset) - expected[0]).abs() < f32::EPSILON && (read(offset + 4) - expected[1]).abs() < f32::EPSILON
-    }
-
+    /// Every step's block and the composite's land at their stride slot, byte-identical to the
+    /// blocks `plan.rs` produces.
     #[test]
-    fn uniform_slots_follow_the_ping_pong_order() {
+    fn uniform_slots_hold_the_plan_blocks_in_step_order() {
         let Ok(effect) = Effect::new("id", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }") else { panic!("identity must compile") };
         let passes: Vec<Pass> = (0..3).map(|index| Pass::new(&effect).with_param(0, [f32::from(u8::try_from(index).unwrap_or(0)); 4]).unwrap_or_else(|error| panic!("{error}"))).collect();
-        let mut composite: Params = [[0.0; 4]; PARAM_SLOTS];
-        composite[2] = [9.0; 4];
-        let map = |scale: [f32; 2], offset: [f32; 2]| TextureMapping { scale, offset };
-        let mapping = ChainMapping {
-            source: map([0.5, 0.25], [0.125, 0.0]),
-            intermediates: [map([0.75, 0.75], [0.25, 0.5]), map([1.0, 0.5], [0.0, 0.25])],
-            pass_frag_offset: [16.0, 32.0],
-            composite_frag_offset: [-4.0, -8.0],
-        };
+        let window = PxRect { x: 0, y: 0, w: 40, h: 30 };
+        let Some(plan) = plan(passes.len(), window, [5, 6]) else { panic!("planned") };
+        let geometry = LayerGeometry { region: window, capture: window, rect_uv: [0.0, 0.0, 1.0, 1.0], region_uv: [0.0, 0.0, 1.0, 1.0], mask_rect_px: [0.0, 0.0, 40.0, 30.0], mask_radii_px: [0.0; 4], pixels_per_layer_point: 1.0 };
+        let maps = SlotMappings { source: TextureMapping::of([40, 30], [64, 64], [0, 0]), ping_pong: [TextureMapping::of([40, 30], [40, 30], [0, 0]), TextureMapping::of([40, 30], [128, 32], [0, 0])] };
+        let frame = frame_uniforms(&geometry, 0.5);
         let slot = 512;
-        let bytes = chain_uniforms(FrameUniforms::default(), &passes, &composite, slot, mapping);
+        let bytes = chain_uniforms(&frame, &plan, &passes, &geometry, &maps, slot);
         assert_eq!(bytes.len(), slot * 4);
-        // Pass 0 reads the source, pass 1 ping (0), pass 2 pong (1); composite reads pass 2's output (ping).
-        assert!(holds(&bytes, offsets::SRC_SCALE, [0.5, 0.25]));
-        assert!(holds(&bytes, slot + offsets::SRC_SCALE, [0.75, 0.75]));
-        assert!(holds(&bytes, 2 * slot + offsets::SRC_SCALE, [1.0, 0.5]));
-        assert!(holds(&bytes, 3 * slot + offsets::SRC_SCALE, [0.75, 0.75]));
-        assert!(holds(&bytes, 3 * slot + offsets::AUX_SCALE, [0.5, 0.25]));
-        assert!(holds(&bytes, 2 * slot + offsets::AUX_SCALE, [0.0, 0.0]), "passes keep the frame's aux scale");
-        assert!(holds(&bytes, 2 * slot + offsets::PARAMS, [2.0, 2.0]));
-        assert!(holds(&bytes, 3 * slot + offsets::PARAMS + 2 * 16, [9.0, 9.0]));
-        // Offsets travel with their textures; fragments of passes vs the composite differ.
-        assert!(holds(&bytes, offsets::SRC_OFFSET, [0.125, 0.0]));
-        assert!(holds(&bytes, 2 * slot + offsets::SRC_OFFSET, [0.0, 0.25]));
-        assert!(holds(&bytes, 3 * slot + offsets::SRC_OFFSET, [0.25, 0.5]));
-        assert!(holds(&bytes, 3 * slot + offsets::AUX_OFFSET, [0.125, 0.0]));
-        assert!(holds(&bytes, slot + offsets::FRAG_OFFSET, [16.0, 32.0]));
-        assert!(holds(&bytes, 3 * slot + offsets::FRAG_OFFSET, [-4.0, -8.0]));
+        for (index, step) in plan.steps.iter().enumerate() {
+            assert_eq!(&bytes[slot * index..slot * index + UNIFORM_BLOCK_SIZE], &step_uniforms(&frame, step, &maps, &passes[index])[..], "slot {index}");
+        }
+        assert_eq!(&bytes[slot * 3..slot * 3 + UNIFORM_BLOCK_SIZE], &composite_uniforms(&frame, &plan, &maps, &geometry)[..]);
+        assert!(bytes[UNIFORM_BLOCK_SIZE..slot].iter().all(|&byte| byte == 0), "stride padding stays zero");
     }
 }
