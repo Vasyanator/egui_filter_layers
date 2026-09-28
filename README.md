@@ -490,13 +490,16 @@ cargo run --example demo -- --renderer glow
 cargo run --example demo -- --renderer glow --msaa 4
 cargo run --example demo -- --renderer wgpu
 cargo run --example demo -- --renderer wgpu --msaa 4 --stack lens --rect 500,150,300,200
+cargo run --example demo -- --scene stack --stack kawase_blur,bloom
 ```
 
-Drag the rect, resize it from its corner, stack presets in the side panel, and edit the custom
-WGSL effect live.
+Pick a scene in the side panel (or with `--scene NAME`). In the "stack" scene, drag the rect,
+resize it from its corner, stack presets, tune named parameters, and edit the custom WGSL effect
+live.
 
 `--stack name:v1:v2` overrides a preset's parameters, and `--record DIR` renders a seamless
-4-second loop (no side panel, deterministic time, one PPM per frame) — the GIFs above come from:
+4-second loop of the selected scene (no side panel, deterministic time, one PPM per frame) — the
+GIFs above come from:
 
 ```sh
 cargo run --example demo -- --stack ripple:6:40:0.5 --record frames/
