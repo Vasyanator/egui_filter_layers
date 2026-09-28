@@ -54,6 +54,14 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   are set once after linking.
 - WebGL1 / GLES2 / GL < 3.3 are rejected at install (`glsl_target`), before any GL object exists.
 
+## Tests
+- Unit tests: translation and dialect choice in `glsl.rs`.
+- Runtime: `tests/glow_headless.rs` (Linux, `#[ignore]`d; `cargo test --all-features --test
+  glow_headless -- --ignored`) paints real egui frames through `egui_glow::Painter` on a
+  windowless EGL device context into a plain / 4x MSAA FBO and checks read-back pixels
+  (invert, lossless identity, rounded mask, multi-pass chains, zoom, alpha, per-effect failure).
+  Extend it with every change to this backend; the demo example needs a display and is no test.
+
 ## Editing map
 - GLSL dialect or translation issues: `glsl.rs`.
 - New GL object or format, resolve format mapping (`ReadFormat::resolve_format`): `resources.rs`.
