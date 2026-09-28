@@ -7,7 +7,7 @@ documentation (semantics, shader model, backend matrix).
 
 Key items:
 - `FilterLayer`, `FilterChain`, `Pass`, `Effect` (re-exported from their modules)
-- `presets` module
+- `presets` module (its `WaveObstacle` also re-exported at the root: the one preset input type)
 - `Impulses` (+ `Impulse`, `ImpulsePack`, param-name constants): input-driven transient effects
 - `install_glow()` / `destroy_glow()` (feature `glow`), `install_wgpu()` / `WgpuOptions`
   (feature `wgpu`), `status()`, `failed_effects()`, `failed_textures()`
@@ -42,6 +42,24 @@ module names a backend type.
 //!     .paint(ui.painter());
 //! # }
 //! ```
+//!
+//! What the crate offers, each detailed below:
+//!
+//! * **Presets** ([`presets`]): blurs (Gaussian, dual-Kawase [`presets::kawase_blur`]), colour
+//!   adjustments, sharpen, pixelate, lens, vignette, frosted glass, [`presets::bloom`], animated
+//!   ripples, input-driven [`presets::click_ripples`], and the stateful [`presets::trails`] and
+//!   water ([`presets::wave_sim`] + [`presets::wave_display`] around [`WaveObstacle`]s).
+//! * **Custom effects** ([`Effect`]): one WGSL function with a prelude (the pass input, the
+//!   untouched backdrop `original()`, time, frame, pointer, user textures, persistent state),
+//!   validated by naga with errors located in your snippet; typed **named parameters** from a
+//!   `struct Params` ([`Pass::set`]).
+//! * **Chains** ([`FilterChain`]) of passes, each optionally at reduced resolution
+//!   ([`Pass::with_scale`]).
+//! * **Input**: [`Impulses`] turns clicks into transient animations that repaint only while alive.
+//! * **User textures** ([`FilterLayer::texture`]), **persistent per-layer state**
+//!   ([`Effect::new_state`], [`FilterLayer::id`]) and **shape masks** ([`FilterLayer::mask`]).
+//! * **Backends**: `egui_glow` and `egui-wgpu`; **offline** processing of images and video
+//!   (features `image` / `video`); **hot reload** of WGSL files (feature `hot-reload`).
 //!
 //! # Semantics
 //!
@@ -250,7 +268,9 @@ module names a backend type.
 //! meshes, text galleys (UI only), in the layer's points (so it follows layer transforms). The
 //! shape's alpha is the coverage (paint it opaque for a full-strength filter; egui's feathered edge
 //! anti-aliases it); outside it the backdrop stays untouched. It is tessellated when the layer is
-//! painted and rasterized into a coverage texture at capture resolution.
+//! painted and rasterized into a coverage texture at capture resolution. egui fills convex paths
+//! only: build a concave outline from convex pieces that **overlap** (pieces meeting edge to edge
+//! leave a visible seam, where both feathered edges fade out) or from a mesh.
 //!
 //! ```no_run
 //! # fn frame(ui: &mut egui::Ui, rect: egui::Rect) {
@@ -348,6 +368,7 @@ pub use impulses::{IMPULSE_COUNT_PARAM, IMPULSE_SLOTS, IMPULSES_PARAM, Impulse, 
 pub use layer::FilterLayer;
 pub use mask::{Mask, MaskError};
 pub use pass::{FilterChain, MIN_PASS_SCALE, PARAM_SLOTS, ParamIndexError, Params, Pass};
+pub use presets::WaveObstacle;
 pub use state::{StateError, StateFailure, StateFormat, StateOptions, failed_states, reset_state, state_count};
 
 #[cfg(feature = "glow")]

@@ -58,7 +58,9 @@ pub enum Mask {
     /// Any egui shape in LAYER points (the space the layer's rect is in): paths, circles, rects,
     /// meshes, text galleys (UI only), or a `Shape::Vec` of them. Its alpha is the coverage:
     /// paint it opaque (e.g. `Color32::WHITE`) for a full-strength filter; egui's feathered edge
-    /// anti-aliases it. Paint callbacks are rejected ([`MaskError::Callback`]).
+    /// anti-aliases it. Paint callbacks are rejected ([`MaskError::Callback`]). egui fills convex
+    /// paths only: build a concave outline from OVERLAPPING convex pieces (pieces meeting edge to
+    /// edge leave a seam where both feathered edges fade) or from a mesh.
     Shape(Shape),
 }
 

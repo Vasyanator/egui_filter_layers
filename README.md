@@ -19,7 +19,13 @@ blur, colour adjustments, refraction, or your own WGSL shader.
 - Hot reload of custom effects from `.wgsl` files (feature `hot-reload`, native): edits recompile
   off the GUI thread, the last good version keeps rendering while the file is broken, and named
   parameter values survive a reload (`HotEffect`, `rebind`).
-- Rounded-rect masks with anti-aliased edges.
+- Input-driven effects: `Impulses` records clicks / taps that effects turn into transient
+  animations (`presets::click_ripples`); the app repaints only while one is alive.
+- Frame inputs in every effect: `fl.delta_time`, `fl.frame`, the pointer (`fl.pointer`) and the
+  untouched backdrop (`original(uv)`) next to the pass input.
+- User textures: attach up to three egui textures (noise, normal maps, LUTs) to a layer.
+- Masks: the rect, a rounded rect, or any egui shape (paths, circles, meshes, text), anti-aliased.
+- Offline processing of images and video with the same chains (features `image` / `video`).
 - View-only: never touches egui textures or your data.
 - One shader language on every backend (WGSL, translated to GLSL for OpenGL).
 
@@ -46,17 +52,21 @@ blur, colour adjustments, refraction, or your own WGSL shader.
 Both features are on by default. Disable the one you do not use:
 
 ```toml
-egui_filter_layers = { version = "0.1", default-features = false, features = ["glow"] }
+egui_filter_layers = { version = "0.2", default-features = false, features = ["glow"] }
 ```
 
 ## Compatibility
 
 | egui_filter_layers | egui / eframe | wgpu (via egui-wgpu) | glow (via egui_glow) | MSRV |
 |---|---|---|---|---|
+| 0.2 | 0.36 | 30 (egui-wgpu 0.36) | 0.17 (egui_glow 0.36) | Rust 1.95 |
 | 0.1 | 0.36 | 30 (egui-wgpu 0.36) | 0.17 (egui_glow 0.36) | Rust 1.95 |
 
 These crates appear in the public API, so moving to a new egui / wgpu / glow line is a breaking
-release of this crate.
+release of this crate. 0.2 changes the API in a few places (see the
+[changelog](CHANGELOG.md#020---2026-09-29)): most 0.1 code compiles unchanged, but effects that
+define functions named like the new prelude helpers (`original`, `tex`, `state`, ...) or a
+`struct Params` of their own must rename them.
 
 ## Quick start (eframe + glow)
 
@@ -174,13 +184,17 @@ Prelude available to every effect:
 | `fl.pass_scale` | the pass's output resolution relative to the capture (`Pass::with_scale`, 1 = full) |
 | `fl.rect_uv` | the layer rect inside the capture (`xy` min, `zw` size) |
 | `fl.time`, `fl.pixels_per_point` | egui time in seconds; physical pixels per layer point (egui scale factor × layer zoom) |
+| `fl.delta_time`, `fl.frame` | seconds since the previous frame (egui's `stable_dt`, clamped to `0..=0.1`); frame counter (`u32`, wrapping) |
+| `fl.pointer` | pointer in `uv` (`xy`, outside `0..1` off the capture), `z` = 1 while the primary button is down, `w` = 1 when a pointer exists |
 | `to_linear`, `to_gamma`, `premultiply`, `unpremultiply`, `luma` | colour helpers |
 
 An effect whose code reads `fl.time` is detected as **animated** (from naga's IR, not a text
 search): painting a layer with it requests an egui repaint every frame, so it keeps moving in an
 otherwise idle app (copying the whole block, `let u = fl;`, also counts). Override with
 `Effect::with_animated(false / true)`. Effects cannot declare their own bindings, entry points or
-`override` constants.
+`override` constants. Reading `fl.delta_time`, `fl.frame` or `fl.pointer` does not make an effect
+animated (pointer changes repaint anyway); offline they come from `OfflineOptions::with_delta_time`
+/ `with_frame` / `with_pointer`, or from a video's frame clock.
 
 Distances are in **layer points**: sample radii, corner radii and effect distances converted
 with `fl.pixels_per_point` scale with the zoom of the layer the filter is painted in (an
@@ -198,6 +212,35 @@ reads that smaller image. `uv`, `src()`, `original()`, `fl.texel` and `fl.size_p
 capture meaning, so distance maths is unchanged; kernels that step in pixels use `src_px()` /
 `src_texel()` (input pixels) or `out_texel()`. `presets::kawase_blur(radius)` and
 `presets::bloom(threshold, intensity, radius)` are built from such passes.
+
+```rust
+let glow = presets::bloom(0.7, 1.2, 12.0);           // bright pass, scaled blur, combine
+let big_blur = presets::kawase_blur(40.0);           // dual-Kawase pyramid, cheap at any radius
+let half = Pass::new(&my_effect).with_scale(0.5);    // a custom pass at half resolution
+```
+
+### Input impulses
+
+`Impulses` is a small collection kept in your app state: push an impulse where the user clicked,
+hand it to `presets::click_ripples` (rings expanding from each click) or to your own effect
+(`Impulses::apply` fills the named parameters `impulses: array<vec4<f32>, 16>` — each
+`(uv.x, uv.y, age_seconds, strength)` — and `impulse_count: u32`).
+
+```rust
+use egui_filter_layers::{FilterLayer, Impulses, presets};
+
+// App state: `let mut ripples = Impulses::new(1.5);` (each ripple lives 1.5 s)
+let now = ui.input(|input| input.time);
+let response = ui.interact(rect, ui.id().with("ripples"), egui::Sense::click());
+if let Some(pos) = response.interact_pointer_pos().filter(|_| response.clicked()) {
+    ripples.push_point(pos, rect, 1.0, now);
+}
+ripples.retire(now);
+ripples.request_repaint_if_alive(ui.ctx(), now); // animates while a ring lives, idle afterwards
+FilterLayer::new(rect, presets::click_ripples(&ripples, now, 6.0, 24.0, 120.0)).paint(ui.painter());
+```
+
+At most 16 impulses are kept (`with_capacity` lowers it); a full collection drops the oldest.
 
 ### Textures
 
@@ -265,7 +308,8 @@ The shape's alpha is the coverage (paint it opaque; egui's feathered edge anti-a
 translucent fill filters partially); outside it — and outside the rect — the backdrop is untouched,
 on wgpu too (a lower filter layer shows through). The mask follows layer transforms; its feathered
 edge scales with a `Scene` zoom (it is tessellated before the zoom is known). egui fills convex
-paths only: build concave outlines from convex pieces or a mesh. Offline (`OfflineOptions::with_mask`)
+paths only: build concave outlines from convex pieces **that overlap** (pieces meeting exactly edge
+to edge leave a visible seam, because both feathered edges fade out along it) or from a mesh. Offline (`OfflineOptions::with_mask`)
 text masks and textured meshes are refused (`OfflineError::Mask`: there is no font atlas offline).
 
 ### Named parameters
@@ -296,6 +340,28 @@ Members may be `f32`, `i32`, `u32`, `vec2/3/4<f32>`, `mat4x4<f32>` or fixed-size
 `vec3<f32>` / `vec4<f32>` / `mat4x4<f32>` (set with `Pass::set_slice`); the struct may be up to
 16 KiB (the WebGL2 uniform block limit). Values start at zero. `params(i)` keeps working next
 to named parameters.
+
+### Hot reload
+
+With the `hot-reload` feature (native), a `HotEffect` follows a `.wgsl` file: a background thread
+polls its modification time and recompiles it off the GUI thread; `poll()` never blocks.
+
+```rust
+use egui_filter_layers::{HotEffect, HotOptions, HotReloadEvent, Pass, rebind};
+
+// At startup:
+let mut hot = HotEffect::watch_with("water", "shaders/water.wgsl", HotOptions::default().with_repaint(ctx))?;
+// Every frame:
+if hot.poll() == HotReloadEvent::Reloaded {
+    if let Some(effect) = hot.current() {
+        // Keeps named parameter values whose name and type still match.
+        pass = Some(match &pass { Some(old) => rebind(old, effect).pass, None => Pass::new(effect) });
+    }
+}
+if let Some(error) = hot.error() {
+    ui.label(error.to_string()); // the last good effect keeps rendering meanwhile
+}
+```
 
 ## Semantics and limitations
 
@@ -493,9 +559,18 @@ cargo run --example demo --features hot-reload -- --renderer wgpu --msaa 4 --sta
 cargo run --example demo --features hot-reload -- --scene stack --stack kawase_blur,bloom
 ```
 
-Pick a scene in the side panel (or with `--scene NAME`). In the "stack" scene, drag the rect,
-resize it from its corner, stack presets, tune named parameters, and edit the custom WGSL effect
-live.
+Pick a scene in the side panel, or start on one with `--scene NAME`:
+
+| `--scene` | Shows |
+|---|---|
+| `stack` (default) | the preset stack on a draggable, resizable rect: stack presets (incl. `kawase_blur`, `bloom`), tune named parameters, edit a custom WGSL effect live |
+| `hot` | a `HotEffect` watching `examples/demo/scenes/hot.wgsl`, with an in-app editor |
+| `ripples` | `click_ripples` driven by `Impulses` from clicks and drags |
+| `water` | `wave_sim` + `wave_display` around a menu window that is a `WaveObstacle`, splashes, rain, pointer wake |
+| `trails` | `presets::trails` behind moving content and a pointer brush |
+| `bloom` | a custom bloom with a scaled bright pass vs `presets::bloom`; Gaussian vs Kawase blur with frame times |
+| `textures` | noise displacement, normal-map refraction and a 3D colour LUT from user textures |
+| `mask` | shape masks: a star from overlapping convex pieces, a circle, a text galley |
 
 The "hot" scene edits `examples/demo/scenes/hot.wgsl` through `HotEffect` (hence the
 `hot-reload` feature the demo requires): save from the in-app editor (Ctrl+S) or from any
@@ -512,6 +587,13 @@ cargo run --example demo --features hot-reload -- --stack ripple:6:40:0.5 --reco
 ffmpeg -framerate 25 -i frames/frame_%04d.ppm \
   -filter_complex "split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=bayer:bayer_scale=4" -loop 0 waves.gif
 ```
+
+**Wayland**: `--screenshot` and `--record` can hang on native Wayland: launched from a script,
+the window draws its first two frames and then never redraws, so the capture never arrives. A
+minimal eframe app that requests a repaint every frame stalls the same way, so this is winit /
+eframe waiting for a frame callback the compositor does not send (typically for a window it does
+not show), not the demo. Run under XWayland instead: `WAYLAND_DISPLAY= cargo run --example demo
+--features hot-reload -- ... --screenshot out.ppm`.
 
 ## License
 

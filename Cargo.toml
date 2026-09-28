@@ -1,6 +1,6 @@
 [package]
 name = "egui_filter_layers"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "GPU filter layers for egui: redraw everything painted beneath a rect through a chain of WGSL effects (blur, colour adjustments, refraction, custom shaders) on egui_glow and egui-wgpu."
@@ -65,9 +65,10 @@ pollster = "0.4"
 eframe = { version = "0.36", default-features = false, features = ["glow", "wgpu", "default_fonts", "wayland", "x11"] }
 
 # Windowless EGL context (device platform, surfaceless) for the headless glow integration test;
-# the same glutin eframe already locks. Linux only: the test is empty elsewhere.
+# the same glutin eframe already locks (eframe 0.36 needs >= 0.32.3). Linux only: the test is empty
+# elsewhere.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-glutin = { version = "0.32", default-features = false, features = ["egl"] }
+glutin = { version = "0.32.3", default-features = false, features = ["egl"] }
 
 [[example]]
 name = "demo"

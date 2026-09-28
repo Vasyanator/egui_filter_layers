@@ -18,6 +18,9 @@ Notes:
 Recording pins `RawInput::time` to `step / fps` and advances a step only when that step's tagged
 screenshot has arrived, so each `frame_NNNN.ppm` is exactly one step. Frames are written
 synchronously on the GUI thread on purpose: a recording tool, ~1 MB per frame, milliseconds.
+Both modes need eframe to keep redrawing. On native Wayland a script-launched window stops after
+two frames (winit waits for a frame callback the compositor withholds; a bare eframe app behaves
+the same), so run scripted captures under XWayland (`WAYLAND_DISPLAY=`).
 */
 
 use std::path::{Path, PathBuf};
