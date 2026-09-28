@@ -194,11 +194,20 @@ pub(crate) struct LayerJob {
     pub viewport: ViewportId,
     /// `FilterLayer::state`.
     pub state: StateOptions,
-    /// A `reset_state` request for `id` was consumed by this paint: start from zero.
-    pub reset_state: bool,
+    /// The pending `reset_state` request for `id`, if any. The backend claims it only where the
+    /// state registry starts this layer's run ([`LayerJob::claim_reset`]); a paint that returns
+    /// earlier leaves it pending for the next paint.
+    pub reset_state: Option<crate::state::ResetTicket>,
 }
 
 impl LayerJob {
+    /// Claims this job's pending `reset_state` request (at most one run claims it): call exactly
+    /// where the state registry's `begin` runs for this job.
+    #[must_use]
+    pub(crate) fn claim_reset(&self) -> bool {
+        self.reset_state.as_ref().is_some_and(crate::state::ResetTicket::claim)
+    }
+
     /// The layer's state key when the job is stateful (a state pass and an id), else `None`.
     #[must_use]
     pub(crate) fn state_key(&self) -> Option<crate::state::StateKey> {

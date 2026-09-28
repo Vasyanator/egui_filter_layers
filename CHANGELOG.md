@@ -13,7 +13,7 @@ adheres to [Semantic Versioning](https://semver.org/).
   `fl.frame` (egui's `cumulative_frame_nr`, wrapping) and `fl.pointer` (`xy` in capture uv, `z`
   primary button down, `w` pointer present), the same for every layer of a frame. Reading them
   does not make an effect animated. Offline: `OfflineOptions::with_delta_time` / `with_frame` /
-  `with_pointer` (`PointerState`); `VideoProcessor` derives delta time and frame index from its
+  `with_pointer` (`PointerState::new`); `VideoProcessor` derives delta time and frame index from its
   frame clock (`reset_frame_clock`), explicit options win.
 - `Impulses` (`Impulse`, `ImpulsePack`, `IMPULSE_SLOTS`, `IMPULSES_PARAM`,
   `IMPULSE_COUNT_PARAM`): a user-owned, bounded collection of timed impulses (clicks, taps)
@@ -41,12 +41,16 @@ adheres to [Semantic Versioning](https://semver.org/).
   `FilterLayer::id` (required for stateful chains: `StateError::MissingId`, `check_state`,
   `layer_id`), `FilterLayer::state(StateOptions)` (`with_scale`, `with_format`: `StateFormat`
   RGBA16F by default, RGBA8 opt-in), `reset_state`, `state_count`, `failed_states`
-  (`StateFailure`); states unpainted for 120 frames and 2 s are freed. Offline the renderer
+  (`StateFailure`); states unpainted for 120 frames of their own viewport and 2 s are freed (an
+  idle viewport keeps its states while another animates); a `reset_state` requested while the
+  layer draws nothing (off screen) stays pending until a paint actually runs. Offline the renderer
   carries the state across calls (`OfflineOptions::with_state`, `OfflineRenderer::reset_state`,
   `VideoProcessor::reset_state`; `OfflineError::State`). Presets `presets::trails`,
-  `presets::wave_sim` + `presets::wave_display` with `WaveObstacle` / `WAVE_OBSTACLES`.
+  `presets::wave_sim` + `presets::wave_display` with `WaveObstacle` (`new`, `from_rect`) /
+  `WAVE_OBSTACLES`.
 - Shape masks: `Mask` (`RoundedRect`, `Shape`: any egui shape incl. meshes and text galleys, in
-  layer points), `MaskError`, `FilterLayer::mask` / `layer_mask` / `check_mask`,
+  layer points), `MaskError` (callbacks, and malformed meshes: `InvalidMesh`),
+  `FilterLayer::mask` / `layer_mask` / `check_mask`,
   `OfflineOptions::with_mask`, `OfflineError::Mask`. The shape's alpha is the coverage.
 - Feature `hot-reload` (native only, no extra dependencies): `HotEffect` (`watch`,
   `watch_with` + `HotOptions`, `poll` -> `HotReloadEvent`, `current`, `error`, `status_text`)
@@ -72,6 +76,12 @@ adheres to [Semantic Versioning](https://semver.org/).
   module-scope `p`. A snippet that used its own `struct Params` for something else must rename it
   (unsupported member types are an `EffectError::Interface`, and a module-scope `p` of its own
   then collides).
+- The new public types are `#[non_exhaustive]` so they can grow in minor releases: `Mask`,
+  `HotReloadEvent` (match with a wildcard arm), `WaveObstacle` and `PointerState` (build them
+  with `new` / `WaveObstacle::from_rect`), and the output-only `Impulse`, `ImpulsePack`,
+  `Rebound` (read their fields; destructure with `..`). `OfflineOptions::state()` stays the
+  getter of `with_state` (every `OfflineOptions` getter is the bare name of its `with_*` builder),
+  while `FilterLayer::state(..)` is a builder whose getter is `state_options()`.
 - `OfflineError` has new variants (`NotTileable`, `Texture`, `State`, `Mask`,
   `TextureTooLarge`); it is `#[non_exhaustive]`, so exhaustive matches were already impossible.
 - `FilterLayer::corner_radius` and `OfflineOptions::with_corner_radius` are shorthands for

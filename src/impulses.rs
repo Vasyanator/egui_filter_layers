@@ -46,8 +46,10 @@ pub const IMPULSES_PARAM: &str = "impulses";
 /// `impulse_count: u32` in WGSL.
 pub const IMPULSE_COUNT_PARAM: &str = "impulse_count";
 
-/// One impulse: where and when it started and how strong it is.
+/// One impulse: where and when it started and how strong it is (output only: made by
+/// [`Impulses::push`], read through [`Impulses::iter`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Impulse {
     /// Position relative to the layer rect: `(0, 0)` its top-left corner, `(1, 1)` its
     /// bottom-right, y down (values outside `0..1` lie outside the rect).
@@ -59,8 +61,9 @@ pub struct Impulse {
 }
 
 /// The live impulses packed for a shader: element `i < count` is
-/// `[uv.x, uv.y, age_seconds, strength]`, the rest are zero.
+/// `[uv.x, uv.y, age_seconds, strength]`, the rest are zero (output only: [`Impulses::pack`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ImpulsePack {
     /// The packed impulses, oldest first.
     pub impulses: [[f32; 4]; IMPULSE_SLOTS],

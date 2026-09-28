@@ -11,7 +11,9 @@ processors. They are also the manual test bench for both backends.
   (`[[example]] required-features`; the "hot" scene uses `HotEffect`).
   - `main.rs`: command line, stderr logger, eframe start-up on either renderer, the app shell
     (status block, scene selector, lazily built scenes, dispatch).
-  - `record.rs`: `--record` / `--screenshot` machinery and the PPM writer; scene-independent.
+  - `record.rs`: `--record` / `--screenshot` machinery and the PPM writer thread (`FrameWriter`,
+    bounded queue: the GUI thread does no file I/O; a full queue blocks the hand-over on purpose so
+    each step is painted a fixed number of times); scene-independent.
     On native Wayland a script-launched window stalls after two frames (winit waits for a frame
     callback the compositor withholds; a bare eframe app does the same), so scripted captures
     run under XWayland: `WAYLAND_DISPLAY= cargo run --example demo ...`.

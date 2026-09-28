@@ -17,7 +17,10 @@ Key structures:
 
 Notes:
 No new dependency (owner decision §16 (d)): change detection is `(mtime, length)` polling, plus a
-content comparison so a touch without an edit does not reload. The worker and the GUI share only
+content comparison so a touch without an edit does not reload. On file systems with coarse
+modification times (FAT, some network mounts) a save within the same timestamp tick that keeps the
+length is missed until the file changes again; hashing the content every tick was judged too
+costly for that corner case. The worker and the GUI share only
 channels (no lock at all); the GUI never blocks on the worker except for a bounded wait in `Drop`.
 On wasm32 there is no file system or thread: the module is not compiled there (see `lib.rs`).
 */
@@ -181,6 +184,7 @@ impl HotReloadError {
 
 /// What one [`HotEffect::poll`] observed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HotReloadEvent {
     /// Nothing new since the previous poll.
     Unchanged,
@@ -513,8 +517,9 @@ impl Watcher {
     }
 }
 
-/// A [`Pass`] rebuilt on another effect by [`rebind`].
+/// A [`Pass`] rebuilt on another effect by [`rebind`] (output only: read its fields).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Rebound {
     /// The new pass.
     pub pass: Pass,

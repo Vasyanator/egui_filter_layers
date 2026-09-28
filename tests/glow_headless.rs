@@ -984,7 +984,8 @@ fn assert_grey(pixels: &[u8], x: u32, y: u32, expected: u8, what: &str) {
     assert!(actual.iter().all(|value| value.abs_diff(expected) <= 1), "{what}: pixel ({x}, {y}) is {actual:?}, expected grey {expected}");
 }
 
-/// F7 on glow: accumulation over frames (RGBA16F), `reset_state`, one step per frame for an id
+/// F7 on glow: accumulation over frames (RGBA16F), `reset_state` (kept pending across an
+/// off-screen paint), one step per frame for an id
 /// painted twice, a missing id refused, an explicit RGBA8 state, and a layer growing past its
 /// allocation keeping its state (the blit of `ensure_kept`, rows bottom-up).
 #[test]
@@ -1012,8 +1013,11 @@ fn state_accumulates_resets_grows_and_steps_once_per_frame() {
     assert_active(&harness.ctx);
     assert_eq!(egui_filter_layers::state_count(&harness.ctx), 1);
     egui_filter_layers::reset_state(&harness.ctx, id);
+    // A paint that never runs (the layer off screen, no geometry) must leave the request pending.
+    let offscreen = Rect::from_min_max(pos2(1000.0, 1000.0), pos2(1100.0, 1100.0));
+    harness.frame(&mut |ui: &mut egui::Ui| FilterLayer::new(offscreen, chain.clone()).id(id).paint(ui.painter()));
     let pixels = harness.frame(&mut paint);
-    assert_grey(&pixels, 60, 60, accumulated(1), "after reset_state");
+    assert_grey(&pixels, 60, 60, accumulated(1), "after reset_state (requested before an off-screen paint)");
 
     for options in [StateOptions::default().with_format(StateFormat::Rgba8Unorm), StateOptions::default().with_scale(0.5)] {
         let id = egui::Id::new(("growing", options.scale().to_bits(), options.format() == StateFormat::Rgba8Unorm));

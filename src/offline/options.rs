@@ -65,11 +65,21 @@ pub struct OfflineOptions {
 /// the frame, top-left origin, y down — the effects' `uv` space (the frame is the layer and the
 /// capture). Values outside `0..1` are a pointer off the frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct PointerState {
     /// Position in frame uv.
     pub uv: [f32; 2],
     /// Whether the primary button is down (`fl.pointer.z`).
     pub pressed: bool,
+}
+
+impl PointerState {
+    /// The pointer at `uv` (frame uv), with the primary button `pressed` or not. Validated by
+    /// `OfflineOptions::validate` (a non-finite position is refused).
+    #[must_use]
+    pub fn new(uv: [f32; 2], pressed: bool) -> Self {
+        Self { uv, pressed }
+    }
 }
 
 impl Default for OfflineOptions {
@@ -335,7 +345,7 @@ mod tests {
         assert!(OfflineOptions::default().with_delta_time(0.0).with_frame(3).validate().is_ok());
         assert!(matches!(OfflineOptions::default().with_delta_time(-0.1).validate(), Err(OfflineError::InvalidOption { option: "delta_time", .. })));
         assert!(matches!(OfflineOptions::default().with_delta_time(f32::NAN).validate(), Err(OfflineError::InvalidOption { option: "delta_time", .. })));
-        let bad_pointer = Some(PointerState { uv: [f32::INFINITY, 0.0], pressed: false });
+        let bad_pointer = Some(PointerState::new([f32::INFINITY, 0.0], false));
         assert!(matches!(OfflineOptions::default().with_pointer(bad_pointer).validate(), Err(OfflineError::InvalidOption { option: "pointer", .. })));
 
         // A 200x100 frame at 2 pixels per point: the capture is the frame, whatever the scale.
@@ -343,7 +353,7 @@ mod tests {
         assert_eq!(geometry.capture, PxRect { x: 0, y: 0, w: 200, h: 100 });
         let neutral = OfflineOptions::default().input_uniforms(&geometry);
         assert_eq!(neutral, InputUniforms::default());
-        let options = OfflineOptions::default().with_delta_time(0.5).with_frame(4).with_pointer(Some(PointerState { uv: [0.25, 0.75], pressed: true }));
+        let options = OfflineOptions::default().with_delta_time(0.5).with_frame(4).with_pointer(Some(PointerState::new([0.25, 0.75], true)));
         let input = options.input_uniforms(&geometry);
         assert_eq!((input.frame, input.delta_time.to_bits()), (4, 0.5_f32.to_bits()));
         assert_eq!(input.pointer.map(f32::to_bits), [0.25_f32, 0.75, 1.0, 1.0].map(f32::to_bits), "frame uv is capture uv");

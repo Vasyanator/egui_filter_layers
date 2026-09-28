@@ -285,7 +285,8 @@ FilterLayer::new(rect, water).id(ui.id().with("water")).paint(ui.painter());
 A stateful layer without `FilterLayer::id` is refused (`StateError::MissingId`, logged once).
 The state spans the whole capture at `StateOptions::with_scale` resolution, lives in layer uv (a
 moved or resized layer keeps it, stretched), starts at zero, is zeroed by `reset_state(ctx, id)`
-and freed after 120 frames and 2 s unpainted; an id painted twice in one frame is stepped once.
+and freed after 120 frames (of its own viewport) and 2 s unpainted; an id painted twice in one
+frame is stepped once. A reset requested while the layer is off screen applies at its next drawn paint.
 RGBA16F must be renderable and filterable on the device, else stateful layers are refused and
 listed by `failed_states(ctx)` (WebGL2 without `EXT_color_buffer_float`); `StateFormat::Rgba8Unorm`
 is an explicit opt-in. It advances only on painted frames (request repaints while it moves).

@@ -288,7 +288,7 @@ unsafe fn paint_saved(gl: &glow::Context, state: &mut GlowState, target: GlslTar
         // entry is looked up (a format change replaces its targets, freed too).
         let (frame, time) = (job.frame_input.frame, f64::from(job.time));
         GlowState::free_state_targets(gl, state.states.evict(job.viewport, frame, time));
-        let mut entry = state_key.map(|key| state.states.begin(key, state_format, frame, time, job.reset_state, || [None, None]));
+        let mut entry = state_key.map(|key| state.states.begin(key, state_format, frame, time, job.claim_reset(), || [None, None]));
         if let Some((_, _, replaced)) = entry.as_mut() {
             GlowState::free_state_targets(gl, replaced.take());
         }
@@ -304,8 +304,9 @@ unsafe fn paint_saved(gl: &glow::Context, state: &mut GlowState, target: GlslTar
         if let Some((entry, run, _)) = entry {
             match &outcome {
                 LayerOutcome::Done(Some(state_plan)) => entry.finish(run, frame, state_plan.final_index, state_plan.final_px),
-                // Not run (or not cleanly): the content is unknown, start over from zero.
-                _ => entry.invalidate(),
+                // A stateful run always plans its state; without a plan, or not run cleanly, the
+                // content is unknown: start over from zero.
+                LayerOutcome::Done(None) | LayerOutcome::Latch { .. } | LayerOutcome::Rejected { .. } | LayerOutcome::PassFailed { .. } | LayerOutcome::PassesFailed { .. } => entry.invalidate(),
             }
         }
         cleanup(gl);

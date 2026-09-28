@@ -633,7 +633,7 @@ fn offline_frame_input_follows_the_options_and_the_video_clock() {
         let base = OfflineOptions::default().with_max_tile_size(tile);
         let none = offline.process(&frame, &chain, &base).unwrap_or_else(|error| panic!("{error}"));
         near(pixel(none.pixels(), 50, 40), [0, 0, 0], &format!("tile {tile:?}: no pointer"));
-        let options = base.with_pointer(Some(PointerState { uv: [0.25, 0.75], pressed: true }));
+        let options = base.with_pointer(Some(PointerState::new([0.25, 0.75], true)));
         let pressed = offline.process(&frame, &chain, &options).unwrap_or_else(|error| panic!("{error}"));
         for (x, y) in [(1, 1), (50, 40), (95, 63)] {
             near(pixel(pressed.pixels(), x, y), [64, 191, 255], &format!("tile {tile:?}: pointer at ({x}, {y})"));

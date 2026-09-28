@@ -494,6 +494,7 @@ Each phase is marked done here in the same commit that lands it.
 - Phase 5 (F9 shape masks: public `Mask` (`RoundedRect` default / `Shape`), `MaskError`, `FilterLayer::mask` / `layer_mask` / `check_mask` (`corner_radius` = shorthand), `OfflineOptions::with_mask`, `OfflineError::Mask`; `src/mask.rs` (`tessellate`, `JobMask`, `CoverageMeshes::pack` -> `PackedCoverage`); `LayerJob::mask`; `geometry::mask_transform` (layer points -> capture pixels through the layer transform); `plan.rs` `Slot::Coverage`, `CoverageStep`, `ChainPlan::with_coverage`, `COVERAGE_MASK_FLAG` (`params[3].x`), `mesh_locals` / `coverage_locals`, `Allocations::coverage`; `composite.wgsl` `fl_coverage` selects SDF / coverage alpha (snap kept); `mesh.wgsl` moved to `src/shaders/`; wgpu `coverage.rs` (shared mesh pipeline, rasterizer used by `chain::record`, UI and offline); glow `coverage.rs` + `glsl::translate_mesh` (naga translation, no hand-written GLSL); GPU tests wgpu (Vulkan + GL) / glow (incl. 4x MSAA) / offline (UI equivalence, tiled == whole, refusals)): done.
 - Phase 7a (demo scaffold: `examples/demo/` directory example — `main.rs` shell + `--scene`, `record.rs`, `backdrop.rs`, `stack.rs` (+ kawase / bloom entries and custom `struct Params` via `params_ui.rs`), `scenes/mod.rs` `Scene` trait + `SCENES` registry, scene "stack"; no new scenes yet): done.
 - Phase 8 (docs + release prep: version 0.2.0, CHANGELOG `[0.2.0]` with every breaking change, README feature overview / prelude table / compatibility / demo scenes / Wayland capture note, `WaveObstacle` re-exported at the root, crate docs overview, direct-minimal-versions re-checked (dev-dep `glutin` floor 0.32.3 for eframe 0.36), package list + publish dry run): done.
+- Final review fixes (per-viewport eviction clocks in `StateRegistry`; `reset_state` as a `ResetTicket` claimed where the registry's `begin` runs, so an unrun paint keeps it; malformed user mask meshes refused (`MaskError::InvalidMesh`) and skipped by `CoverageMeshes::pack`; explicit `LayerOutcome` arms in glow; `#[non_exhaustive]` on `Mask`, `HotReloadEvent`, `WaveObstacle` (+ `new`), `PointerState` (+ `new`), `Impulse`, `ImpulsePack`, `Rebound`; demo captures written on a `FrameWriter` thread; hot-reload mtime granularity documented): done.
 
 ## 18. Findings during execution
 - Phase 1: naga's GLSL writer rejects one texture read through two samplers in one module
@@ -613,7 +614,10 @@ Each phase is marked done here in the same commit that lands it.
   dummy — identical to a state never written, so no id is required there.
 - Phase 4: eviction is "not painted for > 120 frames AND > 2 s", not "whichever first": time alone
   would evict every state of an app that idled > 2 s on its first frame back, frames alone every
-  state of a fast app within 0.5 s at 240 fps. Checked at every paint (both UI backends).
+  state of a fast app within 0.5 s at 240 fps. Checked at every paint (both UI backends). Frames
+  are counted on the ENTRY'S OWN viewport (the registry keeps each viewport's latest frame): the
+  first version treated every foreign-viewport entry as frame-stale, so an idle child viewport
+  lost its state after 2 s of root animation (final review).
 - Phase 4: states are keyed by `(ViewportId, Id)`: egui 0.36 counts `cumulative_frame_nr` per
   viewport, and eframe renders every viewport through one renderer (shared `CallbackResources` on
   wgpu), so "same frame" is only meaningful per viewport. One id in two viewports = two states

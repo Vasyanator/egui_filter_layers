@@ -27,7 +27,8 @@ One frame, per filter layer:
    texture groups the plugin resolved (mask textures join the beneath textures there); the
    executor rasterizes it (`coverage.rs`) before the passes. A stateful
    layer (F7) first looks up its entry in `WgpuResources::states` (viewport + id; eviction of
-   unpainted entries runs at every prepare) and hands its two state textures to the executor
+   unpainted entries runs at every prepare; the job's reset ticket is claimed at that lookup,
+   `LayerJob::claim_reset`) and hands its two state textures to the executor
    (`ChainState`), then records where the latest state is.
 4. `FilterCallback::paint` draws the BLENDED composite (`chain::draw_composite_over`: an erase
    draw then an add draw, together `mix(dst, filtered, coverage)`, uncovered pixels discarded)

@@ -1013,7 +1013,8 @@ fn assert_grey(pixels: &[u8], x: u32, y: u32, expected: u8, what: &str) {
 }
 
 /// F7: over four frames the state accumulates 0.25 per frame (surviving the per-frame target pool
-/// reset), then `reset_state` starts it over; the same id painted twice in a frame is stepped once
+/// reset), then `reset_state` starts it over (even across an off-screen paint that does not run);
+/// the same id painted twice in a frame is stepped once
 /// (both paints show the same value); a layer without an id is refused (backdrop kept).
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
@@ -1041,8 +1042,11 @@ fn state_accumulates_resets_and_steps_once_per_frame() {
     assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
     assert_eq!(egui_filter_layers::state_count(&ctx), 1);
     egui_filter_layers::reset_state(&ctx, id);
+    // A paint that never runs (the layer off screen, no plan) must leave the request pending.
+    let offscreen = Rect::from_min_max(pos2(1000.0, 1000.0), pos2(1100.0, 1100.0));
+    render_frame(&ctx, &state, &target, &mut |ui: &mut egui::Ui| FilterLayer::new(offscreen, chain.clone()).id(id).paint(ui.painter()));
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
-    assert_grey(&pixels, 60, 60, accumulated(1), "after reset_state");
+    assert_grey(&pixels, 60, 60, accumulated(1), "after reset_state (requested before an off-screen paint)");
     assert!(egui_filter_layers::failed_states(&ctx).is_empty() && egui_filter_layers::failed_effects(&ctx).is_empty());
 }
 

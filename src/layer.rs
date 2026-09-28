@@ -26,8 +26,9 @@ neither case requests repaints for animated chains. A layer whose user textures 
 effects (`TextureError`: an invalid slot, or a slot an effect reads with nothing attached) is
 skipped too, its error logged once per context and message (`log_texture_error_once`), and so
 is a layer with a state pass but no id (`StateError::MissingId`, same latch), and one whose mask
-shape contains a paint callback (`MaskError::Callback`, same latch). A pending
-`reset_state` request for the layer's id is consumed at its paint (`state::take_reset`).
+shape contains a paint callback or a malformed mesh (`MaskError`, same latch). A pending
+`reset_state` request for the layer's id travels in its job as a ticket (`state::pending_reset`);
+the backend claims it where the state registry runs, so a paint that draws nothing keeps it.
 */
 
 use std::sync::Arc;
@@ -39,7 +40,7 @@ use crate::effect::TEXTURE_SLOTS;
 use crate::mask::{JobMask, Mask, MaskError, tessellate};
 use crate::pass::FilterChain;
 use crate::plan::check_textures;
-use crate::state::{StateError, StateOptions, take_reset};
+use crate::state::{StateError, StateOptions, pending_reset};
 
 /// Sets `ctx`'s "no backend installed" latch; returns whether it was unset (i.e. whether to warn).
 fn first_not_installed_warning(ctx: &Context) -> bool {
@@ -185,7 +186,8 @@ impl FilterLayer {
     /// chain has a state pass ([`crate::Effect::new_state`]): the layer's persistent state is
     /// found again by this id (and the painting viewport) every frame. Paint one id once per
     /// frame: a second paint in the same frame shows the state without stepping it. A state not
-    /// painted for 120 frames and 2 seconds is freed; [`crate::reset_state`] zeroes it.
+    /// painted for 120 frames of its viewport and 2 seconds is freed; [`crate::reset_state`]
+    /// zeroes it at the next paint the backend runs.
     #[must_use]
     pub fn id(mut self, id: Id) -> Self {
         self.id = Some(id);
@@ -291,11 +293,11 @@ impl FilterLayer {
         &self.mask
     }
 
-    /// Whether the mask can be rasterized ([`Mask::check`]: no paint callbacks).
+    /// Whether the mask can be rasterized ([`Mask::check`]: no paint callbacks, no malformed meshes).
     /// [`FilterLayer::paint`] runs this and skips the layer on an error (logged once per context).
     ///
     /// # Errors
-    /// [`MaskError::Callback`].
+    /// [`MaskError::Callback`] or [`MaskError::InvalidMesh`].
     pub fn check_mask(&self) -> Result<(), MaskError> {
         self.mask.check()
     }
@@ -357,8 +359,9 @@ impl FilterLayer {
         let frame_input = frame_input(ctx);
         let padding_points = self.chain.padding_points();
         let stateful = self.chain.passes().iter().any(|pass| pass.effect().is_state());
-        // Consumed only by a stateful layer's paint, so a request waits for the layer it targets.
-        let reset_state = stateful && self.id.is_some_and(|id| take_reset(ctx, id));
+        // Handed only to a stateful layer's paint, so a request waits for the layer it targets;
+        // the backend claims it where the state registry actually runs.
+        let reset_state = if stateful { self.id.and_then(|id| pending_reset(ctx, id)) } else { None };
         let viewport = ctx.viewport_id();
         let mask = resolve_mask(ctx, self.mask, self.rect);
         let job = LayerJob { rect: self.rect, mask, passes: self.chain.into_passes(), padding_points, time, frame_input, textures: self.textures, id: self.id, viewport, state: self.state, reset_state };
@@ -536,9 +539,11 @@ mod tests {
         }
     }
 
-    /// A backend that keeps `(id, reset_state, stateful)` of every job.
+    /// A backend that keeps `(id, reset claimed, stateful)` of every job; it claims a job's reset
+    /// ticket (as a real backend does where its state registry runs) only while `claim` is set.
     struct Jobs {
         jobs: std::sync::Mutex<Vec<(Option<Id>, bool, bool)>>,
+        claim: std::sync::atomic::AtomicBool,
     }
 
     impl Backend for Jobs {
@@ -562,7 +567,8 @@ mod tests {
         }
         fn paint_layer(&self, _painter: &Painter, job: LayerJob) {
             let stateful = job.state_key().is_some();
-            self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((job.id, job.reset_state, stateful));
+            let claimed = self.claim.load(Ordering::Relaxed) && job.claim_reset();
+            self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((job.id, claimed, stateful));
         }
         fn as_any(&self) -> &dyn Any {
             self
@@ -570,7 +576,8 @@ mod tests {
     }
 
     /// F7: a stateful chain without an id never reaches the backend (`MissingId`); with one it
-    /// does, and a `reset_state` request is consumed by the next paint of that id only.
+    /// does, and a `reset_state` request is claimed by the first paint of that id the backend
+    /// runs; a paint that never reaches the backend's state registry leaves it pending.
     #[test]
     fn stateful_layers_need_an_id_and_consume_resets() {
         let Ok(state) = crate::Effect::new_state("sim", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state(uv); }") else { panic!("must compile") };
@@ -581,7 +588,7 @@ mod tests {
         assert_eq!(FilterLayer::new(rect, presets::invert(1.0)).check_state(), Ok(()), "no state pass, no id needed");
 
         let ctx = Context::default();
-        let backend = Arc::new(Jobs { jobs: std::sync::Mutex::new(Vec::new()) });
+        let backend = Arc::new(Jobs { jobs: std::sync::Mutex::new(Vec::new()), claim: std::sync::atomic::AtomicBool::new(true) });
         register(&ctx, Arc::clone(&backend) as Arc<dyn Backend>);
         let frame = |paint: &dyn Fn(&Painter)| {
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| paint(&Painter::new(ui.ctx().clone(), LayerId::background(), Rect::EVERYTHING)));
@@ -596,11 +603,18 @@ mod tests {
             FilterLayer::new(rect, crate::Pass::new(&state)).id(other).paint(painter);
         });
         assert_eq!(jobs, [(Some(id), false, false), (Some(other), false, true)]);
+        // A paint whose run returns before the state registry (layer out of view) claims nothing.
+        backend.claim.store(false, Ordering::Relaxed);
+        let jobs = frame(&|painter| FilterLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter));
+        assert_eq!(jobs, [(Some(id), false, true)]);
+        backend.claim.store(true, Ordering::Relaxed);
         let jobs = frame(&|painter| {
             FilterLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter);
             FilterLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter);
         });
-        assert_eq!(jobs, [(Some(id), true, true), (Some(id), false, true)], "consumed by the first paint of the id");
+        assert_eq!(jobs, [(Some(id), true, true), (Some(id), false, true)], "claimed by the first run of the id, after the unclaimed paint");
+        let jobs = frame(&|painter| FilterLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter));
+        assert_eq!(jobs, [(Some(id), false, true)], "claimed once");
     }
 
     /// A backend that keeps the mask of every job.

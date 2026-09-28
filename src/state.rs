@@ -17,7 +17,8 @@ Key structures:
 
 Key functions:
 - `reset_state()` / `state_count()` / `failed_states()` (public, re-exported at the crate root).
-- `take_reset()` (crate): consumes a pending reset request for an id (`FilterLayer::paint`).
+- `pending_reset()` (crate): the pending reset request for an id as a `ResetTicket`
+  (`FilterLayer::paint` puts it into the job; the backend claims it where the registry runs).
 - `StateRegistry::begin()` / `finish()` / `evict()`.
 
 Notes:
@@ -26,11 +27,17 @@ eframe renders several viewports through one renderer, so one id painted in two 
 two independent states (documented). Within one viewport and frame, only the FIRST paint of an
 id steps the state; later paints of that id in the same frame run their display passes over the
 state as it is (their state passes are skipped, debug-logged once per key). Eviction: an entry
-not painted for more than `EVICT_FRAMES` frames AND more than `EVICT_SECONDS` seconds is freed
-(both, so an idle app — no frames — and a fast one — many frames per second — keep their state).
+not painted for more than `EVICT_FRAMES` frames OF ITS OWN VIEWPORT AND more than `EVICT_SECONDS`
+seconds is freed (both, so an idle app — no frames — and a fast one — many frames per second —
+keep their state). The registry remembers the latest frame seen per viewport, so an idle viewport's
+states survive while another viewport animates. A reset request is claimed only where the registry
+actually starts the entry's run (`ResetTicket::claim`), so a paint that never gets that far (layer
+out of view, no plan) leaves the request pending for the next paint.
 */
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use egui::{Context, Id, ViewportId};
 
@@ -140,13 +147,16 @@ pub struct StateFailure {
     pub error: StateError,
 }
 
-/// Resets the persistent state of the layer `id` on `ctx`: the next paint of that id (in any
-/// viewport, the first one to paint it) starts from zero. Cheap; call it from UI code.
+/// Resets the persistent state of the layer `id` on `ctx`: the next paint of that id that the
+/// backend actually runs (in any viewport, the first one to run it) starts from zero; a paint
+/// that draws nothing (the layer out of view) leaves the request pending. Cheap; call it from UI
+/// code.
 pub fn reset_state(ctx: &Context, id: Id) {
     ctx.data_mut(|data| {
         let pending = data.get_temp_mut_or_default::<PendingResets>(Id::new(PENDING_RESETS));
-        if !pending.0.contains(&id) {
-            pending.0.push(id);
+        pending.0.retain(|(_, ticket)| !ticket.is_claimed());
+        if !pending.0.iter().any(|(pending, _)| *pending == id) {
+            pending.0.push((id, ResetTicket::default()));
         }
     });
 }
@@ -168,17 +178,37 @@ pub fn failed_states(ctx: &Context) -> Vec<StateFailure> {
 /// Key of the pending reset requests in a context's temporary memory.
 const PENDING_RESETS: &str = "egui_filter_layers::pending_state_resets";
 
-/// Layer ids whose state must be reset at their next paint (`reset_state`).
+/// Layer ids whose state must be reset at their next run (`reset_state`), each with the ticket
+/// its paints carry; claimed tickets are pruned at the next request / lookup.
 #[derive(Clone, Debug, Default)]
-struct PendingResets(Vec<Id>);
+struct PendingResets(Vec<(Id, ResetTicket)>);
 
-/// Consumes a pending [`reset_state`] request for `id`; returns whether there was one.
-pub(crate) fn take_reset(ctx: &Context, id: Id) -> bool {
+/// One [`reset_state`] request, shared between the GUI thread (which hands it to every paint of
+/// the id until it is claimed) and the backend's paint callback (which claims it where the state
+/// registry starts the entry's run). Claimed at most once.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ResetTicket(Arc<AtomicBool>);
+
+impl ResetTicket {
+    /// Claims the request: `true` for the first caller only (that run starts from zero).
+    pub(crate) fn claim(&self) -> bool {
+        !self.0.swap(true, Ordering::AcqRel)
+    }
+
+    /// Whether a run already claimed the request.
+    fn is_claimed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// The pending [`reset_state`] request for `id`, if any (not claimed yet). Claimed requests are
+/// pruned here; an unclaimed one stays pending, so a paint whose run never reaches the registry
+/// hands the same ticket to the next paint.
+pub(crate) fn pending_reset(ctx: &Context, id: Id) -> Option<ResetTicket> {
     ctx.data_mut(|data| {
         let pending = data.get_temp_mut_or_default::<PendingResets>(Id::new(PENDING_RESETS));
-        let before = pending.0.len();
-        pending.0.retain(|pending| *pending != id);
-        pending.0.len() != before
+        pending.0.retain(|(_, ticket)| !ticket.is_claimed());
+        pending.0.iter().find(|(pending, _)| *pending == id).map(|(_, ticket)| ticket.clone())
     })
 }
 
@@ -234,11 +264,14 @@ pub(crate) struct StateRun {
 pub(crate) struct StateRegistry<T> {
     /// The entries.
     entries: HashMap<StateKey, StateEntry<T>>,
+    /// The latest `(frame, time)` seen per viewport (every `begin` / `evict`): an entry's frame
+    /// age is measured against ITS viewport's clock, since egui counts frames per viewport.
+    viewports: HashMap<ViewportId, (u32, f64)>,
 }
 
 impl<T> Default for StateRegistry<T> {
     fn default() -> Self {
-        Self { entries: HashMap::new() }
+        Self { entries: HashMap::new(), viewports: HashMap::new() }
     }
 }
 
@@ -253,6 +286,7 @@ impl<T> StateRegistry<T> {
     /// applies a `reset`, and decides whether this paint steps the state (the first of the frame).
     /// Returns the entry and the run description.
     pub(crate) fn begin(&mut self, key: StateKey, format: StateFormat, frame: u32, time: f64, reset: bool, make: impl FnOnce() -> T) -> (&mut StateEntry<T>, StateRun, Option<T>) {
+        self.observe(key.viewport, frame, time);
         let replaced = match self.entries.get(&key) {
             Some(entry) if entry.format != format => self.entries.remove(&key).map(|entry| entry.targets),
             _ => None,
@@ -276,20 +310,36 @@ impl<T> StateRegistry<T> {
         (entry, run, replaced)
     }
 
-    /// Evicts every entry not painted for more than [`EVICT_FRAMES`] frames and more than
-    /// [`EVICT_SECONDS`] seconds before `frame` / `time` of `viewport` (other viewports count
-    /// their own frames, so only their time is compared), returning their targets to free.
+    /// Records a paint of `viewport` at `frame` / `time` as that viewport's latest clock.
+    fn observe(&mut self, viewport: ViewportId, frame: u32, time: f64) {
+        self.viewports.insert(viewport, (frame, time));
+    }
+
+    /// Records the paint of `viewport` at `frame` / `time`, then evicts every entry whose OWN
+    /// viewport has painted more than [`EVICT_FRAMES`] frames since the entry's last paint AND
+    /// that was last painted more than [`EVICT_SECONDS`] seconds before `time`, returning their
+    /// targets to free. An idle viewport (no frames) therefore keeps its states however long
+    /// another viewport animates.
     pub(crate) fn evict(&mut self, viewport: ViewportId, frame: u32, time: f64) -> Vec<T> {
+        self.observe(viewport, frame, time);
+        let viewports = &self.viewports;
         let stale: Vec<StateKey> = self
             .entries
             .iter()
             .filter(|(key, entry)| {
-                let old_frames = key.viewport != viewport || frame.wrapping_sub(entry.last_frame) > EVICT_FRAMES;
-                old_frames && time - entry.last_time > EVICT_SECONDS
+                // Every entry's viewport was observed by the `begin` that created it and is kept
+                // while it holds entries; a missing clock would mean "no frames passed" (keep).
+                let latest_frame = viewports.get(&key.viewport).map_or(entry.last_frame, |(latest, _)| *latest);
+                latest_frame.wrapping_sub(entry.last_frame) > EVICT_FRAMES && time - entry.last_time > EVICT_SECONDS
             })
             .map(|(key, _)| *key)
             .collect();
-        stale.into_iter().filter_map(|key| self.entries.remove(&key)).map(|entry| entry.targets).collect()
+        let freed: Vec<T> = stale.into_iter().filter_map(|key| self.entries.remove(&key)).map(|entry| entry.targets).collect();
+        // Forget the clocks of viewports that hold no state any more (closed windows), except the
+        // one painting now, so the map stays as small as the set of viewports with state.
+        let entries = &self.entries;
+        self.viewports.retain(|id, _| *id == viewport || entries.keys().any(|key| key.viewport == *id));
+        freed
     }
 
     /// Removes every entry, returning the targets to free.
@@ -379,24 +429,50 @@ mod tests {
         let mut wrapping: StateRegistry<u32> = StateRegistry::default();
         wrapping.begin(key("a"), StateFormat::Rgba16Float, u32::MAX - 5, 0.0, false, || 1);
         assert!(wrapping.evict(ViewportId::ROOT, 5, 10.0).is_empty(), "11 frames across the wrap");
-        // Another viewport's frame numbers are not comparable: its entries age by time only.
-        let mut viewports: StateRegistry<u32> = StateRegistry::default();
-        viewports.begin(StateKey { viewport: ViewportId::from_hash_of("other"), id: Id::new("a") }, StateFormat::Rgba16Float, 1000, 0.0, false, || 1);
-        assert!(viewports.evict(ViewportId::ROOT, 1000, 1.0).is_empty());
-        assert_eq!(viewports.evict(ViewportId::ROOT, 1000, 3.0), vec![1]);
-        assert_eq!(viewports.drain(), Vec::<u32>::new());
+        assert_eq!(wrapping.drain(), vec![1]);
+    }
+
+    /// Frames are counted per viewport: an idle viewport's state survives while another viewport
+    /// animates for more than 2 s and 120 frames, and ages only once its own viewport paints on.
+    #[test]
+    fn an_idle_viewport_keeps_its_state_while_another_animates() {
+        let other = ViewportId::from_hash_of("other");
+        let idle = StateKey { viewport: other, id: Id::new("idle") };
+        let mut registry: StateRegistry<u32> = StateRegistry::default();
+        registry.begin(idle, StateFormat::Rgba16Float, 1000, 0.0, false, || 1);
+        // The root viewport animates: 600 frames over 10 s, painting its own stateful layer.
+        for frame in 1..=600_u32 {
+            let time = f64::from(frame) / 60.0;
+            assert!(registry.evict(ViewportId::ROOT, frame, time).is_empty(), "root frame {frame}");
+            registry.begin(key("busy"), StateFormat::Rgba16Float, frame, time, false, || 2);
+        }
+        assert_eq!(registry.len(), 2, "the idle viewport's state survived");
+        // The other viewport paints again, without its idle layer: few frames, no eviction yet.
+        assert!(registry.evict(other, 1100, 11.0).is_empty(), "100 frames of its own viewport");
+        assert_eq!(registry.evict(other, 1121, 11.5), vec![1], "121 frames of its own viewport and > 2 s");
+        // The root's layer, last painted at root frame 600, is untouched by the other viewport.
+        assert!(registry.evict(other, 5000, 100.0).is_empty());
+        assert_eq!(registry.evict(ViewportId::ROOT, 721, 100.0), vec![2]);
+        assert_eq!(registry.len(), 0);
     }
 
     #[test]
-    fn reset_requests_are_consumed_once_per_id() {
+    fn reset_tickets_are_claimed_once_and_stay_pending_until_claimed() {
         let ctx = Context::default();
         let (a, b) = (Id::new("a"), Id::new("b"));
-        assert!(!take_reset(&ctx, a));
+        assert!(pending_reset(&ctx, a).is_none());
         reset_state(&ctx, a);
         reset_state(&ctx, a);
-        assert!(!take_reset(&ctx, b));
-        assert!(take_reset(&ctx, a));
-        assert!(!take_reset(&ctx, a), "consumed");
+        assert!(pending_reset(&ctx, b).is_none());
+        // A paint that never reaches the registry leaves the request pending.
+        assert!(pending_reset(&ctx, a).is_some());
+        let Some(ticket) = pending_reset(&ctx, a) else { panic!("still pending") };
+        let repeat = ticket.clone();
+        assert!(ticket.claim(), "the first run claims it");
+        assert!(!repeat.claim(), "a repeated paint in the same frame does not reset again");
+        assert!(pending_reset(&ctx, a).is_none(), "claimed requests are pruned");
+        reset_state(&ctx, a);
+        assert!(pending_reset(&ctx, a).is_some_and(|ticket| ticket.claim()), "a new request after a claim");
         assert_eq!(state_count(&ctx), 0);
         assert!(failed_states(&ctx).is_empty());
     }

@@ -11,19 +11,29 @@ Key structures:
 - Recorder: drives one recording (input hook + per-frame screenshot requests).
 - ScriptedScreenshot: drives `--screenshot`.
 
+- FrameWriter: the file-writing worker thread both modes hand their captures to.
+
 Key functions:
-- write_ppm(): binary PPM (P6) writer shared by both modes.
+- write_ppm(): binary PPM (P6) writer, run on the writer thread.
 
 Notes:
 Recording pins `RawInput::time` to `step / fps` and advances a step only when that step's tagged
-screenshot has arrived, so each `frame_NNNN.ppm` is exactly one step. Frames are written
-synchronously on the GUI thread on purpose: a recording tool, ~1 MB per frame, milliseconds.
+screenshot has arrived, so each `frame_NNNN.ppm` is exactly one step. The GUI thread never
+touches the file system: captures go to a `FrameWriter` thread over a bounded queue (which also
+creates the output directory), and the window closes only once the writer has drained and exited
+(polled, never joined blocking). When the disk falls `WRITE_QUEUE` frames behind, handing over a
+frame waits for the writer: deliberate backpressure in these scripted capture modes, because
+rendering on while a frame waits would paint the pinned step extra times and make recordings of
+stateful scenes depend on disk speed.
 Both modes need eframe to keep redrawing. On native Wayland a script-launched window stops after
 two frames (winit waits for a frame callback the compositor withholds; a bare eframe app behaves
 the same), so run scripted captures under XWayland (`WAYLAND_DISPLAY=`).
 */
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{SendError, SyncSender, sync_channel};
+use std::thread::JoinHandle;
 
 use eframe::egui::{self, Vec2};
 
@@ -35,6 +45,93 @@ const RECORD_WARMUP_FRAMES: u64 = 10;
 
 /// Frame number at which `--screenshot` requests its capture.
 const SCREENSHOT_FRAME: u64 = 10;
+
+/// Captures that may wait for the writer thread before handing one over blocks (~1 MB each).
+const WRITE_QUEUE: usize = 8;
+
+/// One capture to save: the target path and the image.
+type WriteJob = (PathBuf, Arc<egui::ColorImage>);
+
+/// Saves captures as PPM files on a worker thread, so the GUI thread does no file I/O. The queue
+/// is bounded ([`WRITE_QUEUE`]): `write` blocks only while it is full (see the file notes).
+#[derive(Debug)]
+struct FrameWriter {
+    /// The queue into the worker; `None` once finished (or when the thread could not start).
+    sender: Option<SyncSender<WriteJob>>,
+    /// The worker; it returns how many writes failed (each is logged).
+    worker: Option<JoinHandle<usize>>,
+}
+
+impl FrameWriter {
+    /// Starts the worker; it first creates `dir` when given (a failure is logged, and every write
+    /// into it then fails and is logged too). A thread that cannot start is logged, and every
+    /// `write` then drops its capture with an error.
+    fn spawn(dir: Option<PathBuf>) -> Self {
+        let (sender, receiver) = sync_channel::<WriteJob>(WRITE_QUEUE);
+        let worker = std::thread::Builder::new().name("demo-frame-writer".to_owned()).spawn(move || {
+            if let Some(dir) = dir
+                && let Err(error) = std::fs::create_dir_all(&dir)
+            {
+                log::error!("demo: could not create {}: {error}", dir.display());
+            }
+            let mut failed = 0_usize;
+            // Ends when the sender is dropped (`finish`) and the queue is drained.
+            for (path, image) in receiver {
+                if let Err(error) = write_ppm(&path, &image) {
+                    log::error!("demo: could not save {}: {error}", path.display());
+                    failed += 1;
+                }
+            }
+            failed
+        });
+        match worker {
+            Ok(worker) => Self { sender: Some(sender), worker: Some(worker) },
+            Err(error) => {
+                log::error!("demo: could not start the frame writer thread: {error}; captures will not be saved");
+                Self { sender: None, worker: None }
+            }
+        }
+    }
+
+    /// Queues `job`, waiting only while [`WRITE_QUEUE`] frames are already queued. A capture
+    /// that cannot be queued (no worker, or it exited) is dropped with an error.
+    fn write(&self, job: WriteJob) {
+        let Some(sender) = &self.sender else {
+            log::error!("demo: {} not saved: the frame writer is not running", job.0.display());
+            return;
+        };
+        if let Err(SendError((path, _))) = sender.send(job) {
+            log::error!("demo: {} not saved: the frame writer thread has exited", path.display());
+        }
+    }
+
+    /// Closes the queue and, without blocking, reports whether the worker is done: `Some(failed
+    /// writes)` once it has drained and exited, `None` while it is still writing (call again).
+    fn finish(&mut self) -> Option<usize> {
+        self.sender = None;
+        let Some(worker) = self.worker.take_if(|worker| worker.is_finished()) else {
+            return if self.worker.is_some() { None } else { Some(0) };
+        };
+        // `is_finished` was true: this join returns at once.
+        Some(worker.join().unwrap_or_else(|_| {
+            log::error!("demo: the frame writer thread panicked; some captures may be missing");
+            1
+        }))
+    }
+}
+
+impl Drop for FrameWriter {
+    /// Lets the worker drain what is queued when the app exits early (window closed mid-recording):
+    /// a blocking join, but only at shutdown, so no queued capture is lost.
+    fn drop(&mut self) {
+        self.sender = None;
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            log::error!("demo: the frame writer thread panicked; some captures may be missing");
+        }
+    }
+}
 
 /// `--record DIR [--frames N] [--fps F]`.
 #[derive(Debug)]
@@ -63,16 +160,16 @@ pub struct Recorder {
     step: u32,
     /// Whether the screenshot of `step` has been requested.
     requested: bool,
+    /// Saves the frames off the GUI thread (and creates the output directory).
+    writer: FrameWriter,
 }
 
 impl Recorder {
-    /// A recorder at step 0. Creates the output directory (a failure is logged; every frame
-    /// save then fails and is logged too).
+    /// A recorder at step 0. Its writer thread creates the output directory (a failure is logged;
+    /// every frame save then fails and is logged too).
     pub fn new(options: RecordOptions) -> Self {
-        if let Err(error) = std::fs::create_dir_all(&options.dir) {
-            log::error!("demo: could not create {}: {error}", options.dir.display());
-        }
-        Self { options, step: 0, requested: false }
+        let writer = FrameWriter::spawn(Some(options.dir.clone()));
+        Self { options, step: 0, requested: false, writer }
     }
 
     /// Takes the screenshot events out of `raw_input`, saves the one for the current step and
@@ -89,9 +186,7 @@ impl Recorder {
                 continue;
             }
             let path = self.options.dir.join(format!("frame_{:04}.ppm", self.step));
-            if let Err(error) = write_ppm(&path, &image) {
-                log::error!("demo: could not save frame {} to {}: {error}", self.step, path.display());
-            }
+            self.writer.write((path, image));
             self.step += 1;
             self.requested = false;
         }
@@ -111,8 +206,11 @@ impl Recorder {
             return;
         }
         if self.step >= self.options.frames {
-            log::info!("demo: recorded {} frames to {}", self.step, self.options.dir.display());
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            // Close only once every frame is on disk (the writer drained and exited).
+            if let Some(failed) = self.writer.finish() {
+                log::info!("demo: recorded {} frames to {} ({failed} failed to save)", self.step, self.options.dir.display());
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         } else if !self.requested && ctx.cumulative_frame_nr() >= RECORD_WARMUP_FRAMES {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(self.step)));
             self.requested = true;
@@ -127,41 +225,55 @@ impl Recorder {
     }
 }
 
-/// `--screenshot out.ppm`: requests one screenshot at frame 10, saves it, then closes the window.
+/// `--screenshot out.ppm`: requests one screenshot at frame 10, saves it (on the writer thread),
+/// then closes the window.
 #[derive(Debug)]
 pub struct ScriptedScreenshot {
     /// Where to save the capture.
     path: PathBuf,
+    /// Saves the capture off the GUI thread.
+    writer: FrameWriter,
+    /// Whether the capture arrived (and was handed to the writer).
+    captured: bool,
 }
 
 impl ScriptedScreenshot {
     /// A pending screenshot to `path`.
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, writer: FrameWriter::spawn(None), captured: false }
     }
 
-    /// Call once per frame. Returns `true` once the capture has been handled (saved or failed,
-    /// both logged) and the window close was requested; the caller then drops `self`.
-    pub fn drive(&self, ctx: &egui::Context) -> bool {
-        let image = ctx.input(|input| {
-            input.events.iter().find_map(|event| match event {
-                egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                _ => None,
-            })
-        });
+    /// Call once per frame. Returns `true` once the capture has been written (or its failure
+    /// logged) and the window close was requested; the caller then drops `self`.
+    pub fn drive(&mut self, ctx: &egui::Context) -> bool {
         ctx.request_repaint();
-        if let Some(image) = image {
-            match write_ppm(&self.path, &image) {
-                Ok(()) => log::info!("demo: screenshot saved to {}", self.path.display()),
-                Err(error) => log::error!("demo: could not save the screenshot to {}: {error}", self.path.display()),
+        if !self.captured {
+            let image = ctx.input(|input| {
+                input.events.iter().find_map(|event| match event {
+                    egui::Event::Screenshot { image, .. } => Some(Arc::clone(image)),
+                    _ => None,
+                })
+            });
+            if let Some(image) = image {
+                self.captured = true;
+                self.writer.write((self.path.clone(), image));
+            } else if ctx.cumulative_frame_nr() == SCREENSHOT_FRAME {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return true;
+            if !self.captured {
+                return false;
+            }
         }
-        if ctx.cumulative_frame_nr() == SCREENSHOT_FRAME {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+        match self.writer.finish() {
+            Some(failed) => {
+                if failed == 0 {
+                    log::info!("demo: screenshot saved to {}", self.path.display());
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                true
+            }
+            None => false,
         }
-        false
     }
 }
 

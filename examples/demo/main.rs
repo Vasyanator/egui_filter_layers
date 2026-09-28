@@ -327,7 +327,7 @@ impl eframe::App for DemoApp {
             egui::CentralPanel::no_frame().show(ui, |ui| self.central(ui));
             return;
         }
-        if self.screenshot.as_ref().is_some_and(|screenshot| screenshot.drive(ui.ctx())) {
+        if self.screenshot.as_mut().is_some_and(|screenshot| screenshot.drive(ui.ctx())) {
             self.screenshot = None;
         }
         egui::Panel::left("controls").resizable(true).default_size(340.0).show(ui, |ui| {

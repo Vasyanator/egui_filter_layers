@@ -17,7 +17,8 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
    capture texture;
 5. plan the run (`plan::plan`, whole capture, `with_coverage` for a shape mask whose meshes are
    then rasterized into the coverage target by `coverage.rs` before the passes; a stateful layer's `GlowState::states` entry, looked
-   up after evicting unpainted ones, feeds its state input), grow its state targets keeping their
+   up after evicting unpainted ones, where the job's reset ticket is claimed (`LayerJob::claim_reset`),
+   feeds its state input), grow its state targets keeping their
    content (`RenderTarget::ensure_kept`: new texture + blit) and clear the one the plan names,
    grow the ping-pong targets to the plan's
    `target_px`, and run its pass steps into them at `(0, 0, used_px)` (smaller for scaled

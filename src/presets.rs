@@ -709,6 +709,7 @@ pub const WAVE_OBSTACLES: usize = 8;
 /// in the layer rect's uv (`(0, 0)` = its top-left corner, `(1, 1)` = its bottom-right), like
 /// [`Impulses`]; its corner radius in points.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct WaveObstacle {
     /// Top-left corner in layer-rect uv.
     pub min: [f32; 2],
@@ -719,6 +720,14 @@ pub struct WaveObstacle {
 }
 
 impl WaveObstacle {
+    /// The obstacle spanning `min..max` (top-left and bottom-right corners in layer-rect uv) with
+    /// corners rounded by `corner_radius` points (a negative radius means 0). The corners are
+    /// taken as given; [`WaveObstacle::from_rect`] converts a rect in points instead.
+    #[must_use]
+    pub fn new(min: [f32; 2], max: [f32; 2], corner_radius: f32) -> Self {
+        Self { min, max, corner_radius: corner_radius.max(0.0) }
+    }
+
     /// The obstacle covering `obstacle` (points, the space `layer_rect` is in) of a layer painted
     /// over `layer_rect`; `None` for a layer rect without area or non-finite input.
     #[must_use]
@@ -889,7 +898,7 @@ mod tests {
         let layer = Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(200.0, 100.0));
         let menu = Rect::from_min_size(egui::pos2(150.0, 75.0), egui::vec2(100.0, 50.0));
         let Some(obstacle) = WaveObstacle::from_rect(menu, layer, 12.0) else { panic!("valid rects") };
-        assert_eq!(obstacle, WaveObstacle { min: [0.25, 0.25], max: [0.75, 0.75], corner_radius: 12.0 });
+        assert_eq!(obstacle, WaveObstacle::new([0.25, 0.25], [0.75, 0.75], 12.0));
         assert_eq!(WaveObstacle::from_rect(menu, Rect::NOTHING, 1.0), None);
         let sim = wave_sim(&impulses, 1.25, &[obstacle; 10]);
         assert!(sim.effect().is_state() && !sim.effect().is_animated());

@@ -51,6 +51,7 @@ use egui::{CornerRadius, Rect, Shape, TextureId};
 /// # }
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Mask {
     /// The layer rect with rounded corners (layer points), anti-aliased over one pixel. The
     /// default ([`CornerRadius::ZERO`]: the plain rect); what `FilterLayer::corner_radius` sets.
@@ -77,6 +78,15 @@ pub enum MaskError {
     /// The shape contains a paint callback, which has no tessellated geometry.
     #[error("a mask shape cannot contain a paint callback (it has no geometry to rasterize)")]
     Callback,
+    /// A `Shape::Mesh` is malformed: an index past its vertices (`Mesh::is_valid` is false) or an
+    /// index count that is not a multiple of 3. Drawing it would address vertices it does not own.
+    #[error("a mask mesh is invalid: {indices} indices (must be a multiple of 3, each below the vertex count) over {vertices} vertices")]
+    InvalidMesh {
+        /// The mesh's vertex count.
+        vertices: usize,
+        /// The mesh's index count.
+        indices: usize,
+    },
     /// Offline: the shape contains text. Text needs egui's font atlas, which an offline run does
     /// not have (a documented 0.2 limitation; the UI supports text masks).
     #[error("text masks are not supported offline (they need egui's font atlas); convert the text to a path or mesh first")]
@@ -91,15 +101,17 @@ pub enum MaskError {
 }
 
 impl Mask {
-    /// Whether the UI can rasterize this mask: a shape must contain no paint callback.
+    /// Whether the UI can rasterize this mask: a shape must contain no paint callback and no
+    /// malformed mesh.
     ///
     /// # Errors
-    /// [`MaskError::Callback`].
+    /// [`MaskError::Callback`] or [`MaskError::InvalidMesh`].
     pub fn check(&self) -> Result<(), MaskError> {
         match self {
             Self::RoundedRect(_) => Ok(()),
             Self::Shape(shape) => visit(shape, &mut |shape| match shape {
                 Shape::Callback(_) => Err(MaskError::Callback),
+                Shape::Mesh(mesh) if !mesh_is_drawable(mesh) => Err(MaskError::InvalidMesh { vertices: mesh.vertices.len(), indices: mesh.indices.len() }),
                 _ => Ok(()),
             }),
         }
@@ -109,7 +121,8 @@ impl Mask {
     /// untextured meshes (offline runs have no font atlas).
     ///
     /// # Errors
-    /// [`MaskError::Callback`], [`MaskError::Text`] or [`MaskError::TexturedMesh`].
+    /// [`MaskError::Callback`], [`MaskError::InvalidMesh`], [`MaskError::Text`] or
+    /// [`MaskError::TexturedMesh`].
     pub fn check_offline(&self) -> Result<(), MaskError> {
         self.check()?;
         match self {
@@ -123,6 +136,12 @@ impl Mask {
             }),
         }
     }
+}
+
+/// Whether every index of `mesh` addresses one of its own vertices and the indices form whole
+/// triangles (a draw of it, or of meshes merged after it, then never reads a foreign vertex).
+fn mesh_is_drawable(mesh: &Mesh) -> bool {
+    mesh.indices.len().is_multiple_of(3) && mesh.is_valid()
 }
 
 /// Calls `check` on `shape` and, for a `Shape::Vec`, on every nested shape (depth first).
@@ -234,12 +253,18 @@ impl CoverageMeshes {
     }
 
     /// Packs the meshes for upload. A mesh whose vertices or indices would overflow `u32`
-    /// addressing is skipped (never reached by real masks: 4 G vertices).
+    /// addressing is skipped (never reached by real masks: 4 G vertices), and so is a malformed
+    /// or empty one (an index past its vertices, a partial triangle, no triangles), so no index
+    /// outside the upload ever reaches a GPU draw ([`Mask::check`] rejects malformed user meshes
+    /// before this; the skip is the defensive half).
     #[must_use]
     pub(crate) fn pack(&self) -> PackedCoverage {
         let mut packed = PackedCoverage::default();
         let (mut vertex_count, mut index_count) = (0_u32, 0_u32);
         for mesh in &self.meshes {
+            if mesh.indices.is_empty() || !mesh_is_drawable(mesh) {
+                continue;
+            }
             let (Ok(mesh_vertices), Ok(mesh_indices)) = (u32::try_from(mesh.vertices.len()), u32::try_from(mesh.indices.len())) else {
                 continue;
             };
@@ -252,11 +277,10 @@ impl CoverageMeshes {
                 }
                 packed.vertices.extend_from_slice(&vertex.color.to_array());
             }
-            // An index past the mesh's own vertices would be an invalid mesh; it is clamped into
-            // the mesh so it can never address another mesh's vertices.
-            let last = mesh_vertices.saturating_sub(1);
+            // `mesh_is_drawable`: every index is below `mesh_vertices`, so the sum stays below
+            // `next_vertices` (checked above) and inside this mesh's own vertices.
             for &index in &mesh.indices {
-                packed.indices.extend_from_slice(&(vertex_count + index.min(last)).to_ne_bytes());
+                packed.indices.extend_from_slice(&(vertex_count + index).to_ne_bytes());
             }
             match packed.draws.last_mut() {
                 Some(draw) if draw.texture == mesh.texture_id => draw.index_count += mesh_indices,
@@ -316,6 +340,39 @@ mod tests {
         assert!(alphas.contains(&255) && alphas.contains(&0), "opaque interior and a transparent feather: {alphas:?}");
         let outside = tessellate(Shape::circle_filled(pos2(500.0, 500.0), 5.0, Color32::WHITE), rect(), 1.0, TessellationOptions::default(), [1, 1]);
         assert!(outside.meshes.is_empty(), "culled outside the layer rect");
+    }
+
+    /// Malformed user meshes are rejected by both checks and skipped by the packer, so no index
+    /// past the vertex upload reaches a draw.
+    #[test]
+    fn malformed_meshes_are_rejected_and_never_packed() {
+        let no_vertices = Mesh { indices: vec![0, 1, 2], ..Mesh::default() };
+        let out_of_range = {
+            let mut mesh = Mesh::default();
+            mesh.add_colored_rect(rect(), Color32::WHITE);
+            mesh.indices.push(7);
+            mesh.indices.extend([0, 1]);
+            mesh
+        };
+        let partial = {
+            let mut mesh = Mesh::default();
+            mesh.add_colored_rect(rect(), Color32::WHITE);
+            mesh.indices.push(0);
+            mesh
+        };
+        // Built as `Shape::Mesh` directly: `Shape::mesh` debug-asserts validity itself.
+        for mesh in [&no_vertices, &out_of_range, &partial] {
+            let error = MaskError::InvalidMesh { vertices: mesh.vertices.len(), indices: mesh.indices.len() };
+            let shape = Shape::Vec(vec![Shape::circle_filled(pos2(50.0, 50.0), 5.0, Color32::WHITE), Shape::Mesh(Arc::new(mesh.clone()))]);
+            assert_eq!(Mask::Shape(shape.clone()).check(), Err(error.clone()));
+            assert_eq!(Mask::Shape(shape).check_offline(), Err(error));
+        }
+        let mut valid = Mesh::default();
+        valid.add_colored_rect(rect(), Color32::WHITE);
+        let packed = CoverageMeshes { meshes: vec![no_vertices, valid, out_of_range, partial, Mesh::default()] }.pack();
+        assert_eq!(packed.vertices.len(), 4 * VERTEX_BYTES, "only the valid mesh is uploaded");
+        assert_eq!(packed.draws, [CoverageDraw { texture: TextureId::default(), first_index: 0, index_count: 6 }]);
+        assert!(packed.indices.chunks_exact(4).all(|bytes| u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) < 4));
     }
 
     #[test]

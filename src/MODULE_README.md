@@ -10,7 +10,7 @@ user code ──► FilterLayer::paint (layer.rs)
                  │  checks user textures (plan::check_textures), the state id (check_state) and
                  │  the mask (check_mask); tessellates a shape mask (mask.rs, GUI thread);
                  │  resolves FilterChain -> LayerJob (rect, mask, passes, padding, time,
-                 │  frame_input, textures, id / viewport / state options / consumed reset)
+                 │  frame_input, textures, id / viewport / state options / reset ticket)
                  ▼
           backend registry plugin (backend.rs)       ──►  Arc<dyn Backend>
                  │                                         ├─ glow_backend/  (feature "glow")
@@ -52,7 +52,8 @@ user code ──► FilterLayer::paint (layer.rs)
   `FrameUniforms::for_layer` (the per-layer uniform values every backend uploads).
 - `state.rs`: persistent state (F7), the backend-neutral half: public `StateOptions`,
   `StateFormat`, `StateError`, `StateFailure`, `reset_state` / `state_count` / `failed_states`;
-  per-context reset requests (`take_reset`, consumed by `FilterLayer::paint`); `StateRegistry<T>`
+  per-context reset requests (`pending_reset` hands a `ResetTicket` to the job; the backend claims it
+  where the registry's `begin` runs, so an unrun paint keeps it); `StateRegistry<T>`
   (per `(viewport, id)` entry: the backend's targets `T`, which one holds the latest state and its
   size, one step per frame, eviction), used by both UI backends.
 - `plan.rs`: backend-neutral wiring of one chain run — `plan()` (steps: bindings by `Slot`,
@@ -163,7 +164,8 @@ user code ──► FilterLayer::paint (layer.rs)
   renderer's one state). The first paint of a key in a frame steps it; a repeat skips the state
   steps. A new / reset state is cleared before use; growth keeps the content (backends copy); the
   read mapping uses the stored content's size, so a resized layer reads it stretched. Unpainted
-  for > 120 frames AND > 2 s: evicted. RGBA16F state requires renderable + filterable RGBA16F
+  for > 120 frames of the entry's OWN viewport (the registry keeps each viewport's latest frame)
+  AND > 2 s: evicted. RGBA16F state requires renderable + filterable RGBA16F
   (else refused, `failed_states`; never downgraded); RGBA8 is opt-in. Stateful runs are never
   windowed (offline: `NotTileable`).
 - Shape masks (F9): a `Mask::Shape` is in LAYER points, tessellated where the job is built
@@ -174,8 +176,9 @@ user code ──► FilterLayer::paint (layer.rs)
   `shaders/mesh.wgsl` on every backend (glow: naga-translated); the layer transform maps it at
   paint time (`geometry::mask_transform`), so the feather scales with a zoom. The composite alone
   binds it (`plan::ChainPlan::with_coverage`, `params[3].x = 1`); uncovered pixels keep the screen
-  on every backend (wgpu: discard). Paint callbacks in a mask are refused (`MaskError`, logged
-  once per message); offline also text and textured meshes (`OfflineError::Mask`). A mask texture
+  on every backend (wgpu: discard). Paint callbacks and malformed meshes (an index past the
+  vertices, a partial triangle) in a mask are refused (`MaskError`, logged once per message; the
+  packer skips such meshes too, so no out-of-range index reaches a draw); offline also text and textured meshes (`OfflineError::Mask`). A mask texture
   the renderer cannot resolve skips the layer (`failed_textures`; wgpu: a stale font atlas skips
   only the frame).
 - Chain padding is the SUM of pass sample radii; a preset whose passes reach along different axes

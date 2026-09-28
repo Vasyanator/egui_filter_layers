@@ -234,8 +234,10 @@ module names a backend type.
 //!   renderable and filterable on the device, else stateful layers are refused and listed by
 //!   [`failed_states`] (WebGL2 / GLES without `EXT_color_buffer_float`); never silently downgraded.
 //!   [`StateFormat::Rgba8Unorm`] is an explicit opt-in for effects that pack their state in 8 bits.
-//! * **Lifetime.** A state starts at zero; [`reset_state`] zeroes it at the id's next paint; a state
-//!   not painted for 120 frames and 2 seconds is freed ([`state_count`] for debugging); a
+//! * **Lifetime.** A state starts at zero; [`reset_state`] zeroes it at the id's next paint that
+//!   actually runs (a paint that draws nothing, e.g. off screen, keeps the request pending); a
+//!   state not painted for 120 frames OF ITS OWN VIEWPORT and 2 seconds is freed (so an idle
+//!   viewport keeps its states while another animates; [`state_count`] for debugging); a
 //!   re-install (or `destroy_glow`) drops all. It advances only on painted frames: the effect is
 //!   not animated by itself — repaint while it should move.
 //! * **Offline**, the renderer carries the state from one `process` call to the next

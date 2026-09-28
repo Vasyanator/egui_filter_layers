@@ -312,7 +312,7 @@ impl FilterCallback {
         let format = self.job.state.format();
         // The entry's replaced targets (a format change) are simply dropped (wgpu frees them
         // once no recorded command uses them).
-        let mut state = state_key.map(|key| resources.states.begin(key, format, frame, time, self.job.reset_state, || [None, None]));
+        let mut state = state_key.map(|key| resources.states.begin(key, format, frame, time, self.job.claim_reset(), || [None, None]));
         let state_input = state.as_ref().map(|(_, run, _)| StatePlanInput { scale: self.job.state.scale(), current: run.current, previous_px: run.previous, step: run.step });
         // A shape mask (F9): its meshes in layer points, mapped through the layer transform the
         // callback rect reveals; every texture they sample was resolved by the plugin.
