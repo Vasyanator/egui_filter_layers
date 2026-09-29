@@ -21,7 +21,7 @@
 //! frame when the id is painted twice, stretched (not reset) when the layer grows past its
 //! allocation, dropped by a re-install; a stateful layer without an id is refused.
 //! Shape masks (F9): a circle filters inside and leaves everything outside untouched, incl. a lower
-//! filter layer; the AA edge is monotonic; star, transformed-layer and text-galley masks; abutting
+//! shader layer; the AA edge is monotonic; star, transformed-layer and text-galley masks; abutting
 //! mask pieces leave no seam (additive coverage). Regions (R1): a 2x2 grid of abutting regions
 //! tinted per `region()` fills its cells, switches tint within a pixel of every shared edge with
 //! full coverage there and no `REGION_NONE` fringe; overlapping regions: the later one wins;
@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use egui::{Align2, Color32, ColorImage, FontId, Pos2, Rect, TextureOptions, pos2, vec2};
 use egui::emath::TSTransform;
-use egui_filter_layers::{BackendStatus, Effect, FilterChain, FilterLayer, Pass, Region, StateFormat, StateOptions, WgpuOptions, install_wgpu, presets};
+use egui_shader_layers::{BackendStatus, Effect, FilterChain, ShaderLayer, Pass, Region, StateFormat, StateOptions, WgpuOptions, install_wgpu, presets};
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 128;
@@ -83,11 +83,11 @@ fn scene(ui: &egui::Ui, texture: &egui::TextureHandle) {
     painter.rect_filled(Rect::from_min_max(pos2(128.0, 0.0), pos2(256.0, 128.0)), 0.0, Color32::BLUE);
     painter.rect_filled(Rect::from_min_max(pos2(60.0, 60.0), pos2(80.0, 80.0)), 0.0, Color32::from_rgb(128, 64, 32));
     painter.image(texture.id(), Rect::from_min_max(pos2(8.0, 8.0), pos2(40.0, 40.0)), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-    FilterLayer::new(Rect::from_min_max(pos2(4.0, 4.0), pos2(200.0, 100.0)), presets::invert(1.0)).paint(painter);
+    ShaderLayer::new(Rect::from_min_max(pos2(4.0, 4.0), pos2(200.0, 100.0)), presets::invert(1.0)).paint(painter);
     // Painted after the filter: must stay untouched.
     painter.rect_filled(Rect::from_min_max(pos2(160.0, 60.0), pos2(180.0, 80.0)), 0.0, Color32::WHITE);
     // A second layer overlapping the first: on wgpu it sees the first one's UNFILTERED backdrop.
-    FilterLayer::new(Rect::from_min_max(pos2(150.0, 90.0), pos2(250.0, 125.0)), presets::invert(1.0)).paint(painter);
+    ShaderLayer::new(Rect::from_min_max(pos2(150.0, 90.0), pos2(250.0, 125.0)), presets::invert(1.0)).paint(painter);
 }
 
 /// The attachments of the test's egui render pass: what egui-wgpu was configured for.
@@ -257,7 +257,7 @@ fn run_scene(format: wgpu::TextureFormat) {
     assert_near(&first, 100, 50, [0, 255, 255], "frame 1, red under the filter");
     assert_near(&first, 20, 20, [255, 0, 255], "frame 1, user texture under the filter");
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| scene(ui, &texture));
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
 
     assert_near(&pixels, 100, 50, [0, 255, 255], "red under the filter");
     assert_near(&pixels, 150, 50, [255, 255, 0], "blue under the filter");
@@ -294,7 +294,7 @@ fn a_multi_pass_first_frame_keeps_solids_textures_and_text() {
         if second_pass {
             painter.text(text_rect.min, Align2::LEFT_TOP, "WWW", FontId::proportional(40.0), Color32::WHITE);
         }
-        FilterLayer::new(Rect::from_min_max(pos2(4.0, 4.0), pos2(200.0, 100.0)), presets::invert(1.0)).paint(painter);
+        ShaderLayer::new(Rect::from_min_max(pos2(4.0, 4.0), pos2(200.0, 100.0)), presets::invert(1.0)).paint(painter);
     });
     assert_eq!(passes, 2, "the frame must have been multi-pass");
     assert_near(&pixels, 100, 50, [0, 255, 255], "red solid under the filter");
@@ -327,7 +327,7 @@ fn effect_distances_follow_the_layer_zoom() {
         Err(error) => panic!("{error}"),
     };
     let Ok(pass) = Pass::new(&shift).with_param(0, [8.0, 0.0, 0.0, 0.0]) else { panic!("slot 0 exists") };
-    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("zoomed filter layer"));
+    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("zoomed shader layer"));
     for zoom in [2.0_f32, 0.5] {
         let mut paint = |ui: &mut egui::Ui| {
             ui.ctx().set_transform_layer(layer, TSTransform::from_scaling(zoom));
@@ -336,7 +336,7 @@ fn effect_distances_follow_the_layer_zoom() {
             let at = |x: f32, y: f32| pos2(x / zoom, y / zoom);
             painter.rect_filled(Rect::from_min_max(at(0.0, 0.0), at(128.0, 128.0)), 0.0, Color32::RED);
             painter.rect_filled(Rect::from_min_max(at(128.0, 0.0), at(256.0, 128.0)), 0.0, Color32::BLUE);
-            FilterLayer::new(Rect::from_min_max(at(16.0, 16.0), at(240.0, 112.0)), pass.clone()).paint(&painter);
+            ShaderLayer::new(Rect::from_min_max(at(16.0, 16.0), at(240.0, 112.0)), pass.clone()).paint(&painter);
         };
         render_frame(&ctx, &state, &target, &mut paint);
         let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
@@ -357,7 +357,7 @@ fn identity() -> Pass {
     }
 }
 
-/// An upper rounded layer over a lower filter layer: outside its rounded mask (the corners of its
+/// An upper rounded layer over a lower shader layer: outside its rounded mask (the corners of its
 /// region) the screen must keep what is already there — the lower filter's output — and not the
 /// upper layer's re-rendered backdrop, which lacks the lower filter (a skipped paint callback).
 fn run_rounded_corner(format: wgpu::TextureFormat) {
@@ -372,8 +372,8 @@ fn run_rounded_corner_with(format: wgpu::TextureFormat, renderer_options: egui_w
         let painter = ui.painter();
         painter.rect_filled(Rect::from_min_max(pos2(0.0, 0.0), pos2(128.0, 128.0)), 0.0, Color32::RED);
         painter.rect_filled(Rect::from_min_max(pos2(128.0, 0.0), pos2(256.0, 128.0)), 0.0, Color32::BLUE);
-        FilterLayer::new(Rect::from_min_max(pos2(4.0, 4.0), pos2(200.0, 100.0)), presets::invert(1.0)).paint(painter);
-        FilterLayer::new(Rect::from_min_max(pos2(150.0, 60.0), pos2(250.0, 125.0)), identity()).corner_radius(16.0).paint(painter);
+        ShaderLayer::new(Rect::from_min_max(pos2(4.0, 4.0), pos2(200.0, 100.0)), presets::invert(1.0)).paint(painter);
+        ShaderLayer::new(Rect::from_min_max(pos2(150.0, 60.0), pos2(250.0, 125.0)), identity()).corner_radius(16.0).paint(painter);
     };
     render_frame(&ctx, &state, &target, &mut paint);
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
@@ -382,7 +382,7 @@ fn run_rounded_corner_with(format: wgpu::TextureFormat, renderer_options: egui_w
     // Fully inside the mask the composite is exactly the filtered value (erase to 0, add 1 * f).
     assert_eq!(rgb(&pixels, 200, 110), [0, 0, 255], "inside the upper layer's mask");
     assert_near(&pixels, 100, 50, [0, 255, 255], "lower filter away from the upper layer");
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
 }
 
 #[test]
@@ -406,7 +406,7 @@ fn run_semi_transparent(format: wgpu::TextureFormat) {
         let painter = ui.painter();
         painter.rect_filled(Rect::from_min_max(pos2(0.0, 0.0), pos2(256.0, 128.0)), 0.0, Color32::from_gray(64));
         painter.rect_filled(Rect::from_min_max(pos2(0.0, 40.0), pos2(256.0, 90.0)), 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, 128));
-        FilterLayer::new(Rect::from_min_max(pos2(0.0, 0.0), pos2(128.0, 128.0)), identity()).paint(painter);
+        ShaderLayer::new(Rect::from_min_max(pos2(0.0, 0.0), pos2(128.0, 128.0)), identity()).paint(painter);
     };
     render_frame(&ctx, &state, &target, &mut paint);
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
@@ -474,7 +474,7 @@ fn run_alpha(format: wgpu::TextureFormat) {
     let mut paint = |ui: &mut egui::Ui| {
         let painter = ui.painter();
         painter.rect_filled(Rect::from_min_max(pos2(0.0, 0.0), pos2(256.0, 128.0)), 0.0, Color32::from_rgba_unmultiplied(255, 255, 255, 128));
-        FilterLayer::new(Rect::from_min_max(pos2(100.25, 20.0), pos2(200.0, 100.0)), half.clone()).paint(painter);
+        ShaderLayer::new(Rect::from_min_max(pos2(100.25, 20.0), pos2(200.0, 100.0)), half.clone()).paint(painter);
     };
     render_frame(&ctx, &state, &target, &mut paint);
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
@@ -542,11 +542,11 @@ fn original_reads_the_backdrop_in_every_pass() {
                 painter.rect_filled(Rect::from_min_max(pos2(128.0, 0.0), pos2(256.0, 128.0)), 0.0, Color32::BLUE);
                 painter.rect_filled(Rect::from_min_max(pos2(60.0, 60.0), pos2(80.0, 80.0)), 0.0, Color32::from_rgb(128, 64, 32));
                 painter.image(texture.id(), Rect::from_min_max(pos2(24.0, 24.0), pos2(40.0, 40.0)), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
-                FilterLayer::new(rect, chain.clone()).paint(painter);
+                ShaderLayer::new(rect, chain.clone()).paint(painter);
             };
             render_frame(&ctx, &state, &target, &mut paint);
             let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
-            assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+            assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
             let what = |point: &str| format!("{name}, layer {rect:?}: {point}");
             let expect = |colour: [u8; 3]| if *black { [0, 0, 0] } else { colour };
             assert_near(&pixels, 100, 50, expect([255, 0, 0]), &what("red"));
@@ -586,10 +586,10 @@ fn effects_see_the_pointer_and_the_frame_counters() {
     let pointer = pass_of("pointer", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(fl.pointer.x, fl.pointer.y, fl.pointer.z, 1.0) * fl.pointer.w + vec4<f32>(0.0, 0.0, 0.0, 1.0 - fl.pointer.w); }");
     // Capture = region = (32, 16) .. (160, 80) pixels at 1 pixel per point (no padding).
     let rect = Rect::from_min_max(pos2(32.0, 16.0), pos2(160.0, 80.0));
-    let mut paint_pointer = |ui: &mut egui::Ui| FilterLayer::new(rect, pointer.clone()).paint(ui.painter());
+    let mut paint_pointer = |ui: &mut egui::Ui| ShaderLayer::new(rect, pointer.clone()).paint(ui.painter());
     render_frame(&ctx, &state, &target, &mut paint_pointer);
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint_pointer);
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
     assert_near(&pixels, 64, 40, [0, 0, 0], "no pointer yet: w = 0");
 
     // Screen point (64, 32) = capture uv ((64 - 32) / 128, (32 - 16) / 64) = (0.25, 0.25).
@@ -602,7 +602,7 @@ fn effects_see_the_pointer_and_the_frame_counters() {
 
     // `fl.delta_time * 60` = 1 for egui's default 1/60 s step; `fl.frame` mod 2 alternates.
     let counters = pass_of("counters", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(fl.delta_time * 60.0, f32(fl.frame % 2u), 0.0, 1.0); }");
-    let mut paint_counters = |ui: &mut egui::Ui| FilterLayer::new(rect, counters.clone()).paint(ui.painter());
+    let mut paint_counters = |ui: &mut egui::Ui| ShaderLayer::new(rect, counters.clone()).paint(ui.painter());
     let (first, _) = render_frame(&ctx, &state, &target, &mut paint_counters);
     let (second, _) = render_frame(&ctx, &state, &target, &mut paint_counters);
     let [first, second] = [rgb(&first, 64, 40), rgb(&second, 64, 40)];
@@ -648,12 +648,12 @@ fn named_params_reach_each_pass() {
         let painter = ui.painter();
         painter.rect_filled(Rect::from_min_max(pos2(0.0, 0.0), pos2(128.0, 128.0)), 0.0, Color32::RED);
         painter.rect_filled(Rect::from_min_max(pos2(128.0, 0.0), pos2(256.0, 128.0)), 0.0, Color32::BLUE);
-        FilterLayer::new(Rect::from_min_max(pos2(20.0, 20.0), pos2(236.0, 108.0)), chain.clone()).paint(painter);
+        ShaderLayer::new(Rect::from_min_max(pos2(20.0, 20.0), pos2(236.0, 108.0)), chain.clone()).paint(painter);
     };
     render_frame(&ctx, &state, &target, &mut paint);
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
-    assert!(egui_filter_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&ctx));
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
+    assert!(egui_shader_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_shader_layers::failed_effects(&ctx));
     assert_near(&pixels, 60, 60, [64, 96, 64], "named params over red");
     assert_near(&pixels, 200, 60, [128, 96, 0], "named params over blue");
     assert_near(&pixels, 10, 10, [255, 0, 0], "outside the layer");
@@ -700,21 +700,21 @@ fn check_click_ripples(rippled: &[u8], still: &[u8]) {
 fn click_ripples_displace_the_ring_only() {
     let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
     let rect = Rect::from_min_max(pos2(40.0, 4.0), pos2(216.0, 124.0));
-    let mut impulses = egui_filter_layers::Impulses::new(4.0);
+    let mut impulses = egui_shader_layers::Impulses::new(4.0);
     assert!(impulses.push_point(pos2(128.0, 64.0), rect, 1.0, 0.0));
     let rippled = presets::click_ripples(&impulses, 1.0, 6.0, 8.0, 40.0);
-    let still = presets::click_ripples(&egui_filter_layers::Impulses::new(4.0), 1.0, 6.0, 8.0, 40.0);
+    let still = presets::click_ripples(&egui_shader_layers::Impulses::new(4.0), 1.0, 6.0, 8.0, 40.0);
     let frame = |pass: &Pass| {
         let mut paint = |ui: &mut egui::Ui| {
             ripple_stripes(ui.painter());
-            FilterLayer::new(rect, pass.clone()).paint(ui.painter());
+            ShaderLayer::new(rect, pass.clone()).paint(ui.painter());
         };
         render_frame(&ctx, &state, &target, &mut paint);
         render_frame(&ctx, &state, &target, &mut paint).0
     };
     let (rippled, still) = (frame(&rippled), frame(&still));
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
-    assert!(egui_filter_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&ctx));
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
+    assert!(egui_shader_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_shader_layers::failed_effects(&ctx));
     assert_near(&still, 130, 64, [255, 0, 0], "no impulses: the stripes pass through");
     check_click_ripples(&rippled, &still);
 }
@@ -778,7 +778,7 @@ fn check_blurred_dot(pixels: &[u8], reach: u32, what: &str) {
 fn dot_scene(painter: &egui::Painter, chain: &FilterChain, background: Color32) {
     painter.rect_filled(Rect::from_min_max(pos2(0.0, 0.0), pos2(256.0, 128.0)), 0.0, background);
     painter.rect_filled(Rect::from_min_max(pos2(124.0, 60.0), pos2(132.0, 68.0)), 0.0, Color32::WHITE);
-    FilterLayer::new(Rect::from_min_max(pos2(32.0, 4.0), pos2(224.0, 124.0)), chain.clone()).paint(painter);
+    ShaderLayer::new(Rect::from_min_max(pos2(32.0, 4.0), pos2(224.0, 124.0)), chain.clone()).paint(painter);
 }
 
 /// F6: an identity pass at half resolution (upsampled by the composite) over a smooth backdrop
@@ -794,7 +794,7 @@ fn a_scaled_identity_chain_matches_the_unscaled_one() {
     let frame = |chain: &FilterChain| {
         let mut paint = |ui: &mut egui::Ui| {
             smooth_ramp(ui.painter());
-            FilterLayer::new(rect, chain.clone()).paint(ui.painter());
+            ShaderLayer::new(rect, chain.clone()).paint(ui.painter());
         };
         render_frame(&ctx, &state, &target, &mut paint);
         render_frame(&ctx, &state, &target, &mut paint).0
@@ -802,8 +802,8 @@ fn a_scaled_identity_chain_matches_the_unscaled_one() {
     let full = frame(&FilterChain::from(identity.clone()));
     let half = frame(&FilterChain::from(identity.clone().with_scale(0.5)));
     let pyramid = frame(&FilterChain::from(vec![identity.clone().with_scale(0.5), identity.clone().with_scale(0.25), identity.clone()]));
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
-    assert!(egui_filter_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&ctx));
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
+    assert!(egui_shader_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_shader_layers::failed_effects(&ctx));
     let inside = [19, 11, 232, 116];
     let (worst, at) = max_diff_in(&full, &half, inside);
     assert!(worst <= 3, "half resolution: max diff {worst} at {at:?}");
@@ -821,8 +821,8 @@ fn a_kawase_blur_spreads_a_dot_symmetrically() {
     let mut paint = |ui: &mut egui::Ui| dot_scene(ui.painter(), &chain, Color32::BLACK);
     render_frame(&ctx, &state, &target, &mut paint);
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
-    assert!(egui_filter_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&ctx));
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
+    assert!(egui_shader_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_shader_layers::failed_effects(&ctx));
     check_blurred_dot(&pixels, 16, "kawase_blur(16)");
 }
 
@@ -837,8 +837,8 @@ fn bloom_brightens_around_a_bright_spot_only() {
     let mut paint = |ui: &mut egui::Ui| dot_scene(ui.painter(), &chain, dark);
     render_frame(&ctx, &state, &target, &mut paint);
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
-    assert!(egui_filter_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&ctx));
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
+    assert!(egui_shader_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_shader_layers::failed_effects(&ctx));
     assert_near(&pixels, 128, 64, [255, 255, 255], "the spot stays white");
     let (row, _) = profiles(&pixels, 128, 64, 30);
     eprintln!("bloom row through the spot: {row:?}");
@@ -908,7 +908,7 @@ fn user_textures_are_sampled_exactly_and_linearly() {
         let effect = pass_of("textured", snippet);
         let mut paint = |ui: &mut egui::Ui| {
             halves(ui.painter());
-            FilterLayer::new(screen, effect.clone()).texture(0, nearest_id).texture(1, linear_id).paint(ui.painter());
+            ShaderLayer::new(screen, effect.clone()).texture(0, nearest_id).texture(1, linear_id).paint(ui.painter());
         };
         (1..count).for_each(|_| drop(render_frame(&ctx, &state, &target, &mut paint)));
         render_frame(&ctx, &state, &target, &mut paint).0
@@ -918,8 +918,8 @@ fn user_textures_are_sampled_exactly_and_linearly() {
     check_checker_quadrants(&frames(TEX_EXACT, 2), "exact");
     check_checker_quadrants(&frames(TEX_SAMPLED, 2), "nearest sampler");
     check_checker_linear(&frames(TEX_SLOT1, 2), "linear sampler");
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
-    assert!(egui_filter_layers::failed_textures(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_textures(&ctx));
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
+    assert!(egui_shader_layers::failed_textures(&ctx).is_empty(), "{:?}", egui_shader_layers::failed_textures(&ctx));
 
     nearest.set(ColorImage::new([2, 2], vec![Color32::YELLOW; 4]), TextureOptions::NEAREST);
     let pixels = frames(TEX_EXACT, 1);
@@ -942,13 +942,13 @@ fn three_texture_slots_at_once() {
     let sizes = pass_of("sizes", "fn effect(uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(vec3<f32>(tex_size(0u).x, tex_size(1u).y, tex_size(2u).x) * 32.0 / 255.0, 1.0); }");
     let mut paint = |ui: &mut egui::Ui| {
         halves(ui.painter());
-        let attach = |layer: FilterLayer| ids.iter().enumerate().fold(layer, |layer, (slot, id)| layer.texture(slot, *id));
-        attach(FilterLayer::new(Rect::from_min_max(pos2(0.0, 0.0), pos2(128.0, 128.0)), channels.clone())).paint(ui.painter());
-        attach(FilterLayer::new(Rect::from_min_max(pos2(128.0, 0.0), pos2(256.0, 128.0)), sizes.clone())).paint(ui.painter());
+        let attach = |layer: ShaderLayer| ids.iter().enumerate().fold(layer, |layer, (slot, id)| layer.texture(slot, *id));
+        attach(ShaderLayer::new(Rect::from_min_max(pos2(0.0, 0.0), pos2(128.0, 128.0)), channels.clone())).paint(ui.painter());
+        attach(ShaderLayer::new(Rect::from_min_max(pos2(128.0, 0.0), pos2(256.0, 128.0)), sizes.clone())).paint(ui.painter());
     };
     render_frame(&ctx, &state, &target, &mut paint);
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
     assert_near(&pixels, 64, 64, [255, 255, 100], "one channel from each slot");
     assert_near(&pixels, 192, 64, [64, 128, 96], "each slot's own size");
 }
@@ -969,11 +969,11 @@ fn unknown_freed_and_missing_textures_skip_their_layer_only() {
     let mut paint = |ui: &mut egui::Ui| {
         let painter = ui.painter();
         halves(painter);
-        FilterLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(56.0, 120.0)), sampled.clone()).texture(0, unknown).paint(painter);
-        FilterLayer::new(Rect::from_min_max(pos2(72.0, 8.0), pos2(120.0, 120.0)), sampled.clone()).texture(0, freed).paint(painter);
+        ShaderLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(56.0, 120.0)), sampled.clone()).texture(0, unknown).paint(painter);
+        ShaderLayer::new(Rect::from_min_max(pos2(72.0, 8.0), pos2(120.0, 120.0)), sampled.clone()).texture(0, freed).paint(painter);
         // Nothing attached although the effect reads slot 0.
-        FilterLayer::new(Rect::from_min_max(pos2(136.0, 8.0), pos2(184.0, 120.0)), sampled.clone()).paint(painter);
-        FilterLayer::new(Rect::from_min_max(pos2(200.0, 8.0), pos2(248.0, 120.0)), presets::invert(1.0)).paint(painter);
+        ShaderLayer::new(Rect::from_min_max(pos2(136.0, 8.0), pos2(184.0, 120.0)), sampled.clone()).paint(painter);
+        ShaderLayer::new(Rect::from_min_max(pos2(200.0, 8.0), pos2(248.0, 120.0)), presets::invert(1.0)).paint(painter);
     };
     render_frame(&ctx, &state, &target, &mut paint);
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
@@ -986,9 +986,9 @@ fn unknown_freed_and_missing_textures_skip_their_layer_only() {
     assert_near(&pixels, 96, 60, [255, 0, 0], "freed id: the backdrop stays");
     assert_near(&pixels, 160, 60, [0, 0, 255], "missing attachment: the backdrop stays");
     assert_near(&pixels, 220, 60, [255, 255, 0], "a healthy layer still filters");
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
-    assert!(egui_filter_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_effects(&ctx));
-    let mut failed: Vec<egui::TextureId> = egui_filter_layers::failed_textures(&ctx).into_iter().map(|failure| failure.id).collect();
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
+    assert!(egui_shader_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_shader_layers::failed_effects(&ctx));
+    let mut failed: Vec<egui::TextureId> = egui_shader_layers::failed_textures(&ctx).into_iter().map(|failure| failure.id).collect();
     failed.sort_by_key(|id| format!("{id:?}"));
     let mut expected = vec![unknown, freed];
     expected.sort_by_key(|id| format!("{id:?}"));
@@ -1032,10 +1032,10 @@ fn state_accumulates_resets_and_steps_once_per_frame() {
     let mut paint = |ui: &mut egui::Ui| {
         let painter = ui.painter();
         halves(painter);
-        FilterLayer::new(left, chain.clone()).id(id).paint(painter);
+        ShaderLayer::new(left, chain.clone()).id(id).paint(painter);
         // The same id again in the same frame: shows the state, does not step it.
-        FilterLayer::new(right, chain.clone()).id(id).paint(painter);
-        FilterLayer::new(unnamed, chain.clone()).paint(painter);
+        ShaderLayer::new(right, chain.clone()).id(id).paint(painter);
+        ShaderLayer::new(unnamed, chain.clone()).paint(painter);
     };
     for frame in 1..=4 {
         let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
@@ -1043,15 +1043,15 @@ fn state_accumulates_resets_and_steps_once_per_frame() {
         assert_grey(&pixels, 190, 30, accumulated(frame), &format!("frame {frame}, second paint of the id"));
         assert_near(&pixels, 190, 100, [0, 0, 255], &format!("frame {frame}: no id, refused"));
     }
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
-    assert_eq!(egui_filter_layers::state_count(&ctx), 1);
-    egui_filter_layers::reset_state(&ctx, id);
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
+    assert_eq!(egui_shader_layers::state_count(&ctx), 1);
+    egui_shader_layers::reset_state(&ctx, id);
     // A paint that never runs (the layer off screen, no plan) must leave the request pending.
     let offscreen = Rect::from_min_max(pos2(1000.0, 1000.0), pos2(1100.0, 1100.0));
-    render_frame(&ctx, &state, &target, &mut |ui: &mut egui::Ui| FilterLayer::new(offscreen, chain.clone()).id(id).paint(ui.painter()));
+    render_frame(&ctx, &state, &target, &mut |ui: &mut egui::Ui| ShaderLayer::new(offscreen, chain.clone()).id(id).paint(ui.painter()));
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
     assert_grey(&pixels, 60, 60, accumulated(1), "after reset_state (requested before an off-screen paint)");
-    assert!(egui_filter_layers::failed_states(&ctx).is_empty() && egui_filter_layers::failed_effects(&ctx).is_empty());
+    assert!(egui_shader_layers::failed_states(&ctx).is_empty() && egui_shader_layers::failed_effects(&ctx).is_empty());
 }
 
 /// F7: an explicit RGBA8 state accumulates the same way (0.25 steps are exact enough in 8 bits).
@@ -1062,7 +1062,7 @@ fn an_rgba8_state_accumulates_too() {
     let chain = accumulator();
     let mut paint = |ui: &mut egui::Ui| {
         halves(ui.painter());
-        FilterLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(120.0, 120.0)), chain.clone()).id(egui::Id::new("rgba8")).state(StateOptions::default().with_format(StateFormat::Rgba8Unorm)).paint(ui.painter());
+        ShaderLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(120.0, 120.0)), chain.clone()).id(egui::Id::new("rgba8")).state(StateOptions::default().with_format(StateFormat::Rgba8Unorm)).paint(ui.painter());
     };
     for frame in 1..=4 {
         let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
@@ -1083,7 +1083,7 @@ fn a_growing_layer_keeps_its_state_and_a_reinstall_drops_it() {
         let mut rect = Rect::from_min_max(pos2(8.0, 8.0), pos2(40.0, 24.0));
         let paint = |ui: &mut egui::Ui, rect: Rect| {
             halves(ui.painter());
-            FilterLayer::new(rect, chain.clone()).id(id).state(options).paint(ui.painter());
+            ShaderLayer::new(rect, chain.clone()).id(id).state(options).paint(ui.painter());
         };
         for frame in 1..=3 {
             if frame == 3 {
@@ -1097,16 +1097,16 @@ fn a_growing_layer_keeps_its_state_and_a_reinstall_drops_it() {
             }
         }
     }
-    assert_eq!(egui_filter_layers::state_count(&ctx), 2);
+    assert_eq!(egui_shader_layers::state_count(&ctx), 2);
     let installed = install_wgpu(&ctx, &state, WgpuOptions::from(&egui_wgpu::RendererOptions { dithering: false, ..Default::default() }).with_clear_color([0.0, 0.0, 0.0, 1.0]));
     assert!(installed.is_ok(), "{installed:?}");
     let id = egui::Id::new(("growing", 1.0_f32.to_bits()));
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| {
         halves(ui.painter());
-        FilterLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(40.0, 24.0)), chain.clone()).id(id).paint(ui.painter());
+        ShaderLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(40.0, 24.0)), chain.clone()).id(id).paint(ui.painter());
     });
     assert_grey(&pixels, 20, 15, accumulated(1), "a re-install starts every state over");
-    assert_eq!(egui_filter_layers::state_count(&ctx), 1);
+    assert_eq!(egui_shader_layers::state_count(&ctx), 1);
 }
 
 // ---- F9: shape masks ----
@@ -1132,9 +1132,9 @@ fn star(center: Pos2, outer: f32, inner: f32) -> egui::Shape {
 /// a circle (centre (215.3, 100.5), radius 20) that overlaps the lower layer's corner region.
 fn circle_mask_scene(painter: &egui::Painter, green: &Pass) {
     halves(painter);
-    FilterLayer::new(Rect::from_min_max(pos2(4.0, 4.0), pos2(200.0, 100.0)), presets::invert(1.0)).paint(painter);
+    ShaderLayer::new(Rect::from_min_max(pos2(4.0, 4.0), pos2(200.0, 100.0)), presets::invert(1.0)).paint(painter);
     let circle = egui::Shape::circle_filled(pos2(215.3, 100.5), 20.0, Color32::WHITE);
-    FilterLayer::new(Rect::from_min_max(pos2(150.0, 60.0), pos2(250.0, 125.0)), green.clone()).mask(egui_filter_layers::Mask::Shape(circle)).paint(painter);
+    ShaderLayer::new(Rect::from_min_max(pos2(150.0, 60.0), pos2(250.0, 125.0)), green.clone()).mask(egui_shader_layers::Mask::Shape(circle)).paint(painter);
 }
 
 /// Inside the circle: green; outside it (also inside the layer rect): exactly what the screen
@@ -1156,7 +1156,7 @@ fn check_circle_mask(pixels: &[u8], what: &str) {
 /// The star scene: red | blue halves and a green layer over the left half masked by a star.
 fn star_mask_scene(painter: &egui::Painter, green: &Pass) {
     halves(painter);
-    FilterLayer::new(Rect::from_min_max(pos2(4.0, 4.0), pos2(124.0, 124.0)), green.clone()).mask(egui_filter_layers::Mask::Shape(star(pos2(64.0, 64.0), 56.0, 22.0))).paint(painter);
+    ShaderLayer::new(Rect::from_min_max(pos2(4.0, 4.0), pos2(124.0, 124.0)), green.clone()).mask(egui_shader_layers::Mask::Shape(star(pos2(64.0, 64.0), 56.0, 22.0))).paint(painter);
 }
 
 /// Green at the centre and along a tip, red in a notch and outside the layer.
@@ -1179,7 +1179,7 @@ fn transformed_mask_scene(ui: &egui::Ui, green: &Pass) {
     ui.ctx().set_transform_layer(layer, TSTransform::new(vec2(20.0, 10.0), 2.0));
     let painter = egui::Painter::new(ui.ctx().clone(), layer, Rect::EVERYTHING);
     let circle = egui::Shape::circle_filled(pos2(55.0, 30.0), 15.0, Color32::WHITE);
-    FilterLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(100.0, 50.0)), green.clone()).mask(egui_filter_layers::Mask::Shape(circle)).paint(&painter);
+    ShaderLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(100.0, 50.0)), green.clone()).mask(egui_shader_layers::Mask::Shape(circle)).paint(&painter);
 }
 
 fn check_transformed_mask(pixels: &[u8], what: &str) {
@@ -1198,7 +1198,7 @@ fn text_mask_scene(ui: &egui::Ui, green: &Pass) -> Rect {
     let galley = painter.layout_no_wrap("MASK".to_owned(), egui::FontId::monospace(64.0), Color32::WHITE);
     let origin = pos2(24.0, 24.0);
     let text_rect = galley.rect.translate(origin.to_vec2());
-    FilterLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(248.0, 120.0)), green.clone()).mask(egui_filter_layers::Mask::Shape(egui::Shape::galley(origin, galley, Color32::WHITE))).paint(painter);
+    ShaderLayer::new(Rect::from_min_max(pos2(8.0, 8.0), pos2(248.0, 120.0)), green.clone()).mask(egui_shader_layers::Mask::Shape(egui::Shape::galley(origin, galley, Color32::WHITE))).paint(painter);
     text_rect
 }
 
@@ -1225,7 +1225,7 @@ fn abutting_pieces_scene(painter: &egui::Painter, green: &Pass) {
     halves(painter);
     let piece = |x0: f32, x1: f32| egui::Shape::convex_polygon(vec![pos2(x0, 20.0), pos2(x1, 20.0), pos2(x1, 100.0), pos2(x0, 100.0)], Color32::WHITE, egui::Stroke::NONE);
     let pieces = egui::Shape::Vec(vec![piece(20.0, 60.5), piece(60.5, 100.0)]);
-    FilterLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), green.clone()).mask(egui_filter_layers::Mask::Shape(pieces)).paint(painter);
+    ShaderLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), green.clone()).mask(egui_shader_layers::Mask::Shape(pieces)).paint(painter);
 }
 
 /// No seam on the shared edge (egui's "over" union would leave 0.75 coverage: about
@@ -1241,7 +1241,7 @@ fn check_abutting_pieces(pixels: &[u8], what: &str) {
 }
 
 /// F9 on wgpu: a circle mask filters inside only; outside it the BLENDED composite discards, so
-/// the screen keeps what egui drew there — including a lower filter layer's output in the upper
+/// the screen keeps what egui drew there — including a lower shader layer's output in the upper
 /// layer's corner, which the re-rendered backdrop lacks; the anti-aliased edge is monotonic.
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
@@ -1252,7 +1252,7 @@ fn a_circle_mask_filters_inside_and_keeps_the_screen_outside() {
         render_frame(&ctx, &state, &target, &mut |ui| circle_mask_scene(ui.painter(), &green));
         let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| circle_mask_scene(ui.painter(), &green));
         check_circle_mask(&pixels, &format!("{format:?}"));
-        assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+        assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
     }
 }
 
@@ -1274,8 +1274,8 @@ fn star_transformed_and_text_masks() {
         let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| text_rect = text_mask_scene(ui, &green));
         check_text_mask(&pixels, text_rect, "text");
     }
-    assert!(egui_filter_layers::failed_textures(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_textures(&ctx));
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(egui_shader_layers::failed_textures(&ctx).is_empty(), "{:?}", egui_shader_layers::failed_textures(&ctx));
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
 }
 
 /// D1 on wgpu: abutting mask pieces leave no seam (additive coverage union).
@@ -1326,7 +1326,7 @@ fn region_grid_scene(painter: &egui::Painter, pass: &Pass) {
     halves(painter);
     let (a, b, c) = (20.5, 60.5, 100.5);
     let cells = [quad_region(a, a, b, b), quad_region(b, a, c, b), quad_region(a, b, b, c), quad_region(b, b, c, c)];
-    FilterLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), pass.clone()).regions(cells).paint(painter);
+    ShaderLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), pass.clone()).regions(cells).paint(painter);
 }
 
 /// Each cell holds its tint; on a shared edge (mid-pixel: both feathers 0.5, coverage 1 by the
@@ -1390,7 +1390,7 @@ fn regions_tint_each_cell_and_own_their_edges() {
         } else {
             check_region_grid(&pixels, &format!("{format:?}"));
         }
-        assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+        assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
     }
 }
 
@@ -1408,7 +1408,7 @@ fn region_none_outside_regions() {
     let rect = Rect::from_min_max(pos2(140.0, 20.0), pos2(240.0, 100.0));
     let scene = |painter: &egui::Painter| {
         halves(painter);
-        FilterLayer::new(rect, pass.clone()).regions([Region::shape(egui::Shape::circle_filled(pos2(190.3, 60.3), 30.0, Color32::WHITE))]).paint(painter);
+        ShaderLayer::new(rect, pass.clone()).regions([Region::shape(egui::Shape::circle_filled(pos2(190.3, 60.3), 30.0, Color32::WHITE))]).paint(painter);
     };
     render_frame(&ctx, &state, &target, &mut |ui| scene(ui.painter()));
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| scene(ui.painter()));
@@ -1425,14 +1425,14 @@ fn region_none_outside_regions() {
 
     let plain = |painter: &egui::Painter| {
         halves(painter);
-        FilterLayer::new(rect, pass.clone()).paint(painter);
+        ShaderLayer::new(rect, pass.clone()).paint(painter);
     };
     render_frame(&ctx, &state, &target, &mut |ui| plain(ui.painter()));
     let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| plain(ui.painter()));
     for (x, y) in [(145, 25), (190, 60), (235, 95)] {
         assert_near(&pixels, x, y, [255, 0, 0], "a layer without regions reads REGION_NONE everywhere");
     }
-    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
 }
 
 /// R1 on wgpu: where regions overlap, the LATER one owns the pixels: a small region after a big
@@ -1447,7 +1447,7 @@ fn overlapping_regions_later_wins() {
     for (regions, centre, what) in [([big.clone(), small.clone()], REGION_TINTS[1], "small after big"), ([small, big], REGION_TINTS[1], "small before big")] {
         let scene = |painter: &egui::Painter| {
             halves(painter);
-            FilterLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), pass.clone()).regions(regions.clone()).paint(painter);
+            ShaderLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), pass.clone()).regions(regions.clone()).paint(painter);
         };
         render_frame(&ctx, &state, &target, &mut |ui| scene(ui.painter()));
         let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| scene(ui.painter()));

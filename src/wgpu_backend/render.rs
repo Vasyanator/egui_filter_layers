@@ -2,7 +2,7 @@
 File: wgpu_backend/render.rs
 
 Purpose:
-The `egui_wgpu::CallbackTrait` of one filter layer: `prepare` re-renders the beneath content
+The `egui_wgpu::CallbackTrait` of one shader layer: `prepare` re-renders the beneath content
 offscreen and hands it to the chain executor (`chain.rs`) on egui's command encoder; `paint`
 draws the chain's composite into egui's render pass.
 
@@ -28,7 +28,7 @@ plugin resolved and the regions' draw ranges; the executor rasterizes it into th
 (and region-id) texture.
 The composite BLENDS over egui's pass (`chain::draw_composite_over`): pixels outside the
 mask keep what the pass holds, since the re-rendered backdrop lacks paint callbacks and lower
-filter layers. On `*Srgb` targets the meshes are rendered through an sRGB view of the capture
+shader layers. On `*Srgb` targets the meshes are rendered through an sRGB view of the capture
 (`WgpuResources::srgb_capture`) so they blend in linear like egui's own draws.
 */
 
@@ -47,7 +47,7 @@ use crate::geometry::{LayerGeometry, PxRect, layer_geometry, mask_transform, px_
 use crate::plan::{MESH_LOCALS_SIZE, StatePlanInput, mesh_locals};
 use crate::state::StateKey;
 
-/// One painted filter layer, as egui-wgpu sees it.
+/// One painted shader layer, as egui-wgpu sees it.
 pub(super) struct FilterCallback {
     /// Install-wide state (options, health latches).
     shared: Arc<Shared>,
@@ -151,7 +151,7 @@ impl FilterCallback {
             match WgpuResources::create(device, queue, &state.adapter, state.target_format, &self.shared.options, generation) {
                 Ok(created) => {
                     log::info!(
-                        "egui_filter_layers (wgpu): resources created (target {:?}, MSAA {}, intermediates {:?})",
+                        "egui_shader_layers (wgpu): resources created (target {:?}, MSAA {}, intermediates {:?})",
                         state.target_format,
                         self.shared.options.msaa_samples(),
                         created.chain.intermediate_format()
@@ -210,7 +210,7 @@ impl egui_wgpu::CallbackTrait for FilterCallback {
         let Some(plan) = plan else {
             if LoggedOnce::first(&self.shared.logged.missing_plan) {
                 log::debug!(
-                    "egui_filter_layers (wgpu): a filter layer reached the renderer without its backdrop plan (invisible, an attached \
+                    "egui_shader_layers (wgpu): a shader layer reached the renderer without its backdrop plan (invisible, an attached \
                      texture that cannot be resolved (see failed_textures), or painted outside an egui pass that ended with \
                      Context::end_pass); it draws nothing this frame. Logged once."
                 );
@@ -274,7 +274,7 @@ impl egui_wgpu::CallbackTrait for FilterCallback {
         let transform_scale = transform_scale(self.job.rect, info.viewport);
         let region = layer_geometry(info.viewport, info.clip_rect, info.pixels_per_point, info.screen_size_px, self.job.padding_points, self.job.mask.corner_radius(), transform_scale).map(|geometry| geometry.region);
         if region != Some(drawn.region) {
-            log::debug!("egui_filter_layers (wgpu): paint region {region:?} differs from the prepared {:?}; layer skipped this frame", drawn.region);
+            log::debug!("egui_shader_layers (wgpu): paint region {region:?} differs from the prepared {:?}; layer skipped this frame", drawn.region);
             return;
         }
         draw_composite_over(render_pass, &resources.composite, bind_group, drawn.region);
@@ -292,11 +292,11 @@ impl FilterCallback {
             return;
         };
         let render_view_format = resources.srgb_capture.then_some(CAPTURE_SRGB_VIEW_FORMAT);
-        let capture_target = Target::ensure(&mut targets.capture, rec.device, CAPTURE_FORMAT, render_view_format, "egui_filter_layers capture", size);
+        let capture_target = Target::ensure(&mut targets.capture, rec.device, CAPTURE_FORMAT, render_view_format, "egui_shader_layers capture", size);
 
         let locals_buffer = targets.mesh_locals.write(rec.device, rec.queue, &backdrop_locals(rec.pixels_per_point, self.shared.options.dithering(), capture));
         let locals = rec.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("egui_filter_layers mesh locals"),
+            label: Some("egui_shader_layers mesh locals"),
             layout: &resources.mesh_locals_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -364,7 +364,7 @@ impl FilterCallback {
         let through_srgb_view = capture.render_view_format().is_some_and(|format| format.is_srgb());
         let encode = self.shared.render_state.target_format.is_srgb() && !through_srgb_view;
         let clear = capture_clear_color(plan.clear_color, encode);
-        let mut pass = begin_pass(rec.encoder, capture.render_view(), "egui_filter_layers backdrop", clear);
+        let mut pass = begin_pass(rec.encoder, capture.render_view(), "egui_shader_layers backdrop", clear);
         pass.set_viewport(0.0, 0.0, px_f32(rec.geometry.capture.w), px_f32(rec.geometry.capture.h), 0.0, 1.0);
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, locals, &[]);

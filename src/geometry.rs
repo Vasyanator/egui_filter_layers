@@ -2,7 +2,7 @@
 File: geometry.rs
 
 Purpose:
-Backend-independent pixel math of one filter layer at paint time: which physical-pixel region is
+Backend-independent pixel math of one shader layer at paint time: which physical-pixel region is
 processed, how far the capture is padded, and the UV/pixel values the shaders receive.
 
 Key structures:

@@ -3,7 +3,7 @@ File: offline/mod.rs
 
 Purpose:
 Offline processing: run a `FilterChain` over an ordinary RGBA8 frame (an image, a video frame)
-on wgpu and read the result back, computing exactly what a `FilterLayer` covering that frame
+on wgpu and read the result back, computing exactly what a `ShaderLayer` covering that frame
 shows in the UI (conditions in the crate docs / README). Chain execution is NOT implemented
 here: every GPU pass is recorded by `wgpu_backend::chain` (`ChainResources::record`,
 `draw_composite`), the same code the UI callback uses.
@@ -38,12 +38,12 @@ two state textures) from one run to the next (a video processor's frames), confi
 */
 
 //! Offline processing: apply a [`FilterChain`] to an ordinary image or video frame on wgpu and
-//! get the pixels back — the same result a [`FilterLayer`](crate::FilterLayer) covering that
+//! get the pixels back — the same result a [`ShaderLayer`](crate::ShaderLayer) covering that
 //! frame shows in the UI.
 //!
 //! ```no_run
-//! # fn main() -> Result<(), egui_filter_layers::OfflineError> {
-//! use egui_filter_layers::{AlphaMode, FrameRef, OfflineOptions, OfflineRenderer, presets};
+//! # fn main() -> Result<(), egui_shader_layers::OfflineError> {
+//! use egui_shader_layers::{AlphaMode, FrameRef, OfflineOptions, OfflineRenderer, presets};
 //! let (width, height) = (640, 480);
 //! let pixels = vec![255_u8; 640 * 480 * 4]; // straight-alpha RGBA8, e.g. from a decoder
 //! let mut renderer = OfflineRenderer::headless()?; // or ::from_render_state(&render_state)
@@ -91,7 +91,7 @@ two state textures) from one run to the next (a video processor's frames), confi
 //! state like a resized layer. Stateful chains cannot be tiled ([`OfflineError::NotTileable`]).
 //!
 //! User textures ([`OfflineOptions::with_texture`] with an [`OfflineTexture`]) are what
-//! `FilterLayer::texture` attaches in the UI; [`OfflineTexture::from_color_image`] holds exactly
+//! `ShaderLayer::texture` attaches in the UI; [`OfflineTexture::from_color_image`] holds exactly
 //! the bytes egui uploads for that image, so an effect reading them agrees with the UI.
 //!
 //! Video (feature `video`): see the `video` module — frame streams, source / sink traits and
@@ -230,7 +230,7 @@ impl OfflineRenderer {
         let limits = device.limits();
         let max_readback_side = readback_side_limit(limits.max_buffer_size);
         log::info!(
-            "egui_filter_layers (offline): renderer created (intermediates {:?}, max texture side {}, max readback side {max_readback_side})",
+            "egui_shader_layers (offline): renderer created (intermediates {:?}, max texture side {}, max readback side {max_readback_side})",
             chain.intermediate_format(),
             limits.max_texture_dimension_2d
         );
@@ -259,7 +259,7 @@ impl OfflineRenderer {
     }
 
     /// A renderer on egui-wgpu's device: the same adapter, device and shader compiler as the
-    /// UI's filter layers, the precondition for bit-identical results.
+    /// UI's shader layers, the precondition for bit-identical results.
     ///
     /// # Errors
     /// As [`OfflineRenderer::new`].
@@ -275,9 +275,9 @@ impl OfflineRenderer {
     pub async fn headless_async() -> Result<Self, OfflineError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await.map_err(|error| OfflineError::NoAdapter(error.to_string()))?;
-        let descriptor = wgpu::DeviceDescriptor { label: Some("egui_filter_layers offline"), required_limits: adapter.limits(), ..Default::default() };
+        let descriptor = wgpu::DeviceDescriptor { label: Some("egui_shader_layers offline"), required_limits: adapter.limits(), ..Default::default() };
         let (device, queue) = adapter.request_device(&descriptor).await.map_err(|error| OfflineError::RequestDevice(error.to_string()))?;
-        log::info!("egui_filter_layers (offline): headless device on {:?}", adapter.get_info());
+        log::info!("egui_shader_layers (offline): headless device on {:?}", adapter.get_info());
         Self::new(&adapter, &device, &queue)
     }
 
@@ -391,7 +391,7 @@ impl OfflineRenderer {
         }
         let state_input = self.state.as_ref().filter(|_| stateful).map(|state| StatePlanInput { scale: options.state.scale(), current: state.current, previous_px: state.used, step: true });
         if plan.tiles.len() > 1 {
-            log::debug!("egui_filter_layers (offline): {}x{} processed in {} tiles of {:?}", size[0], size[1], plan.tiles.len(), plan.alloc);
+            log::debug!("egui_shader_layers (offline): {}x{} processed in {} tiles of {:?}", size[0], size[1], plan.tiles.len(), plan.alloc);
         }
         self.ensure_allocations(&plan).await?;
         self.ensure_user_textures(options).await?;
@@ -466,12 +466,12 @@ impl OfflineRenderer {
         if self.readback.as_ref().is_none_or(|(_, size)| *size != needed) {
             // Release the old buffer first so both never exist at once.
             self.readback = None;
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("egui_filter_layers offline readback"), size: needed, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("egui_shader_layers offline readback"), size: needed, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             self.readback = Some((buffer, needed));
         }
         if let Some(error) = scopes.pop().await {
             self.drop_allocations();
-            log::warn!("egui_filter_layers (offline): allocating {:?} textures / a {needed}-byte readback failed: {error}", plan.alloc);
+            log::warn!("egui_shader_layers (offline): allocating {:?} textures / a {needed}-byte readback failed: {error}", plan.alloc);
             return Err(offline_gpu_error(&error));
         }
         Ok(())
@@ -512,7 +512,7 @@ impl OfflineRenderer {
         }
         if let Some(error) = scopes.pop().await {
             self.user_textures = [const { None }; TEXTURE_SLOTS];
-            log::warn!("egui_filter_layers (offline): uploading a user texture failed: {error}");
+            log::warn!("egui_shader_layers (offline): uploading a user texture failed: {error}");
             return Err(offline_gpu_error(&error));
         }
         Ok(())
@@ -524,7 +524,7 @@ impl OfflineRenderer {
         let [width, height] = texture.size();
         let extent = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
         let gpu = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("egui_filter_layers offline user texture"),
+            label: Some("egui_shader_layers offline user texture"),
             size: extent,
             mip_level_count: 1,
             sample_count: 1,
@@ -538,7 +538,7 @@ impl OfflineRenderer {
         let sampler = self.samplers.entry(texture.options()).or_insert_with(|| device.create_sampler(&egui_sampler_descriptor(texture.options())));
         let view = gpu.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("egui_filter_layers offline user texture"),
+            label: Some("egui_shader_layers offline user texture"),
             layout: self.chain.user_layout(),
             entries: &[wgpu::BindGroupEntry { binding: USER_TEXTURE_BINDING, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: USER_SAMPLER_BINDING, resource: wgpu::BindingResource::Sampler(sampler) }],
         });
@@ -565,8 +565,8 @@ impl OfflineRenderer {
                 view_formats: &[],
             })
         };
-        let source = texture("egui_filter_layers offline source", wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
-        let output = texture("egui_filter_layers offline output", wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+        let source = texture("egui_shader_layers offline source", wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let output = texture("egui_shader_layers offline output", wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
         let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
         let output_view = output.create_view(&wgpu::TextureViewDescriptor::default());
         self.targets = Some(FrameTargets { alloc: plan.alloc, source, source_view, output, output_view, chain: ChainTargets::new() });
@@ -598,7 +598,7 @@ impl OfflineRenderer {
                 wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(upload.bytes_per_row), rows_per_image: Some(upload.extent.height) },
                 upload.extent,
             );
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("egui_filter_layers offline") });
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("egui_shader_layers offline") });
             let job = ChainJob {
                 source: ChainSource { view: &targets.source_view, allocated: targets.alloc },
                 geometry: run.geometry,
@@ -621,7 +621,7 @@ impl OfflineRenderer {
             };
             state_plan = planned_state;
             {
-                let mut pass = begin_pass(&mut encoder, &targets.output_view, "egui_filter_layers offline composite", wgpu::Color::TRANSPARENT);
+                let mut pass = begin_pass(&mut encoder, &targets.output_view, "egui_shader_layers offline composite", wgpu::Color::TRANSPARENT);
                 draw_composite(&mut pass, composite, &bind_group, PxRect { x: 0, y: 0, w: out.w, h: out.h });
             }
             encoder.copy_texture_to_buffer(

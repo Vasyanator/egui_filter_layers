@@ -69,7 +69,7 @@ struct Kept {
     /// The last full delta and every partial delta after it, in upload order (images are shared
     /// `Arc`s, so keeping them is cheap).
     deltas: Vec<ImageDelta>,
-    /// Created on first use by a filter layer.
+    /// Created on first use by a shader layer.
     gpu: Option<KeptGpu>,
 }
 
@@ -160,7 +160,7 @@ impl TextureCopies {
                 return None;
             }
             let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("egui_filter_layers texture copy"),
+                label: Some("egui_shader_layers texture copy"),
                 size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: 1,
@@ -169,12 +169,12 @@ impl TextureCopies {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            let layout = self.layout.get_or_insert_with(|| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers egui texture"), entries: &egui_texture_entries() }));
+            let layout = self.layout.get_or_insert_with(|| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_shader_layers egui texture"), entries: &egui_texture_entries() }));
             // Like egui-wgpu, the sampler follows the full upload's options.
             let sampler = self.samplers.entry(full.options).or_insert_with(|| device.create_sampler(&egui_sampler_descriptor(full.options)));
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("egui_filter_layers texture copy"),
+                label: Some("egui_shader_layers texture copy"),
                 layout,
                 entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) }],
             });
@@ -229,7 +229,7 @@ pub(super) fn snapshot_textures(shared: &Shared, used: HashSet<TextureId>, font_
     drop(renderer);
     if !skipped.is_empty() && LoggedOnce::first(&shared.logged.skipped_texture) {
         log::debug!(
-            "egui_filter_layers (wgpu): texture(s) {skipped:?} cannot be resolved this frame (unknown to the renderer, or a font \
+            "egui_shader_layers (wgpu): texture(s) {skipped:?} cannot be resolved this frame (unknown to the renderer, or a font \
              atlas whose size does not match the CPU atlas); meshes using them are left out of the filter backdrop for this frame. Logged once."
         );
     }

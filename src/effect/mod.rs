@@ -80,7 +80,7 @@ pub(crate) const BINDING_COVERAGE_TEXTURE: u32 = 6;
 /// white dummy, i.e. `REGION_NONE`, without regions).
 pub(crate) const BINDING_REGION_TEXTURE: u32 = 7;
 
-/// How many user textures a layer can attach (`FilterLayer::texture`, offline
+/// How many user textures a layer can attach (`ShaderLayer::texture`, offline
 /// `OfflineOptions::with_texture`); effects read slot `i` with `tex(i, uv)`, `tex_size(i)` and
 /// `tex_load(i, px)`. Three on every backend: WebGL2 allows four bind groups and `@group(0)` is
 /// the crate's.
@@ -275,9 +275,9 @@ impl Effect {
     /// what the pass before it read. Inside a state pass `src(uv)` is that display input,
     /// `original(uv)` the backdrop, `fl.pass_index` its index among the chain's state passes
     /// (N consecutive copies = N substeps per frame). It renders `state_size()` texels over the
-    /// whole capture (`uv` space, `FilterLayer::state` scale); `fl.pass_scale` is that scale.
+    /// whole capture (`uv` space, `ShaderLayer::state` scale); `fl.pass_scale` is that scale.
     ///
-    /// A layer whose chain has a state pass needs an identity (`FilterLayer::id`), otherwise it is
+    /// A layer whose chain has a state pass needs an identity (`ShaderLayer::id`), otherwise it is
     /// refused (`StateError::MissingId`). The state is RGBA16F unless opted into RGBA8
     /// (`StateOptions::with_format`), starts at zero, and is kept per layer id between frames.
     ///
@@ -364,7 +364,7 @@ impl Effect {
     /// Whether the effect may read user texture `slot` (`tex`, `tex_size`, `tex_load` or the
     /// slot's `fl_user*` globals, found in naga's IR). A slot index that is not a constant
     /// expression (a parameter, a computed value) counts as reading EVERY slot. A layer running
-    /// an effect that reads a slot must attach a texture there ([`crate::FilterLayer::texture`]),
+    /// an effect that reads a slot must attach a texture there ([`crate::ShaderLayer::texture`]),
     /// otherwise the layer is refused ([`crate::TextureError::NotAttached`]). `false` for
     /// `slot >= TEXTURE_SLOTS`.
     #[must_use]
@@ -434,7 +434,7 @@ fn compile(label: &str, snippet: &str) -> Result<CompiledModule, EffectError> {
     let texture_slots = texture_slots(&module);
     let reads_regions = reads_regions(&module);
     let id = NEXT_MODULE_ID.fetch_add(1, Ordering::Relaxed);
-    log::debug!("egui_filter_layers: compiled effect `{label}` (module id {id}, user texture slots {texture_slots:?})");
+    log::debug!("egui_shader_layers: compiled effect `{label}` (module id {id}, user texture slots {texture_slots:?})");
     Ok(CompiledModule { id, label: Arc::from(label), source: assembled.source, module, info, params, texture_slots, reads_regions })
 }
 
@@ -479,7 +479,7 @@ fn compile_composite(label: &str, tail: &str) -> Result<Arc<CompiledModule>, Eff
 /// backends latch it as a backend failure rather than panicking.
 pub(crate) fn composite_module() -> Result<Arc<CompiledModule>, EffectError> {
     static COMPOSITE: OnceLock<Result<Arc<CompiledModule>, EffectError>> = OnceLock::new();
-    COMPOSITE.get_or_init(|| compile_composite("egui_filter_layers::composite", COMPOSITE_GAMMA_TAIL)).clone()
+    COMPOSITE.get_or_init(|| compile_composite("egui_shader_layers::composite", COMPOSITE_GAMMA_TAIL)).clone()
 }
 
 /// The composite pass for `*Srgb` render targets (linear output), compiled once per process.
@@ -489,7 +489,7 @@ pub(crate) fn composite_module() -> Result<Arc<CompiledModule>, EffectError> {
 #[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Only the wgpu backend can face an sRGB target.
 pub(crate) fn composite_linear_module() -> Result<Arc<CompiledModule>, EffectError> {
     static COMPOSITE: OnceLock<Result<Arc<CompiledModule>, EffectError>> = OnceLock::new();
-    COMPOSITE.get_or_init(|| compile_composite("egui_filter_layers::composite_linear", COMPOSITE_LINEAR_TAIL)).clone()
+    COMPOSITE.get_or_init(|| compile_composite("egui_shader_layers::composite_linear", COMPOSITE_LINEAR_TAIL)).clone()
 }
 
 /// The ERASE draw of the blended composite (see [`COMPOSITE_ERASE_TAIL`]), compiled once per
@@ -500,7 +500,7 @@ pub(crate) fn composite_linear_module() -> Result<Arc<CompiledModule>, EffectErr
 #[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Only the wgpu UI backend blends its composite.
 pub(crate) fn composite_erase_module() -> Result<Arc<CompiledModule>, EffectError> {
     static COMPOSITE: OnceLock<Result<Arc<CompiledModule>, EffectError>> = OnceLock::new();
-    COMPOSITE.get_or_init(|| compile_composite("egui_filter_layers::composite_erase", COMPOSITE_ERASE_TAIL)).clone()
+    COMPOSITE.get_or_init(|| compile_composite("egui_shader_layers::composite_erase", COMPOSITE_ERASE_TAIL)).clone()
 }
 
 /// The ADD draw of the blended composite for gamma targets, compiled once per process.
@@ -510,7 +510,7 @@ pub(crate) fn composite_erase_module() -> Result<Arc<CompiledModule>, EffectErro
 #[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Only the wgpu UI backend blends its composite.
 pub(crate) fn composite_add_module() -> Result<Arc<CompiledModule>, EffectError> {
     static COMPOSITE: OnceLock<Result<Arc<CompiledModule>, EffectError>> = OnceLock::new();
-    COMPOSITE.get_or_init(|| compile_composite("egui_filter_layers::composite_add", COMPOSITE_ADD_GAMMA_TAIL)).clone()
+    COMPOSITE.get_or_init(|| compile_composite("egui_shader_layers::composite_add", COMPOSITE_ADD_GAMMA_TAIL)).clone()
 }
 
 /// The ADD draw of the blended composite for `*Srgb` targets (linear output), compiled once per
@@ -521,7 +521,7 @@ pub(crate) fn composite_add_module() -> Result<Arc<CompiledModule>, EffectError>
 #[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Only the wgpu UI backend blends its composite.
 pub(crate) fn composite_add_linear_module() -> Result<Arc<CompiledModule>, EffectError> {
     static COMPOSITE: OnceLock<Result<Arc<CompiledModule>, EffectError>> = OnceLock::new();
-    COMPOSITE.get_or_init(|| compile_composite("egui_filter_layers::composite_add_linear", COMPOSITE_ADD_LINEAR_TAIL)).clone()
+    COMPOSITE.get_or_init(|| compile_composite("egui_shader_layers::composite_add_linear", COMPOSITE_ADD_LINEAR_TAIL)).clone()
 }
 
 #[cfg(test)]

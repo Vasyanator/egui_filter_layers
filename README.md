@@ -1,6 +1,6 @@
-# egui_filter_layers
+# egui-shader-layers
 
-GPU **filter layers** for [egui](https://github.com/emilk/egui): a shape that takes everything
+GPU **shader layers** for [egui](https://github.com/emilk/egui): a shape that takes everything
 already painted beneath a rect and redraws that region through a chain of filter passes —
 blur, colour adjustments, refraction, or your own WGSL shader.
 
@@ -34,14 +34,14 @@ blur, colour adjustments, refraction, or your own WGSL shader.
 
 | Brightness / contrast | Invert | Ripple (animated) |
 |---|---|---|
-| ![brightness_contrast(0.15, 1.8)](https://raw.githubusercontent.com/Vasyanator/egui_filter_layers/master/assets/contrast.gif) | ![invert(1.0)](https://raw.githubusercontent.com/Vasyanator/egui_filter_layers/master/assets/invert.gif) | ![ripple(6.0, 40.0, 0.5)](https://raw.githubusercontent.com/Vasyanator/egui_filter_layers/master/assets/waves.gif) |
+| ![brightness_contrast(0.15, 1.8)](https://raw.githubusercontent.com/Vasyanator/egui-shader-layers/master/assets/contrast.gif) | ![invert(1.0)](https://raw.githubusercontent.com/Vasyanator/egui-shader-layers/master/assets/invert.gif) | ![ripple(6.0, 40.0, 0.5)](https://raw.githubusercontent.com/Vasyanator/egui-shader-layers/master/assets/waves.gif) |
 
 > [!WARNING]
 > **wgpu: the content under a filter is rendered twice per frame.** egui-wgpu renders into a
 > surface that cannot be read back mid-frame, so the wgpu backend re-renders everything painted
-> beneath each filter layer (clipped to the layer's padded rect) into an offscreen texture, then
+> beneath each shader layer (clipped to the layer's padded rect) into an offscreen texture, then
 > filters it. Budget for that extra tessellation and fill. Paint callbacks beneath a filter
-> (your own 3D views, other filter layers) cannot be re-rendered and are left out of its backdrop.
+> (your own 3D views, other shader layers) cannot be re-rendered and are left out of its backdrop.
 
 ## Backends
 
@@ -55,12 +55,12 @@ blur, colour adjustments, refraction, or your own WGSL shader.
 Both features are on by default. Disable the one you do not use:
 
 ```toml
-egui_filter_layers = { version = "0.2", default-features = false, features = ["glow"] }
+egui-shader-layers = { version = "0.2", default-features = false, features = ["glow"] }
 ```
 
 ## Compatibility
 
-| egui_filter_layers | egui / eframe | wgpu (via egui-wgpu) | glow (via egui_glow) | MSRV |
+| egui-shader-layers | egui / eframe | wgpu (via egui-wgpu) | glow (via egui_glow) | MSRV |
 |---|---|---|---|---|
 | 0.2 | 0.36 | 30 (egui-wgpu 0.36) | 0.17 (egui_glow 0.36) | Rust 1.95 |
 | 0.1 | 0.36 | 30 (egui-wgpu 0.36) | 0.17 (egui_glow 0.36) | Rust 1.95 |
@@ -75,7 +75,7 @@ define functions named like the new prelude helpers (`original`, `tex`, `state`,
 
 ```rust
 use eframe::egui;
-use egui_filter_layers::{FilterLayer, presets};
+use egui_shader_layers::{ShaderLayer, presets};
 
 struct App {
     ctx: egui::Context,
@@ -85,7 +85,7 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         if let Some(gl) = &cc.gl {
             // Logs and returns an error on unsupported contexts (e.g. WebGL1); never panics.
-            if let Err(error) = egui_filter_layers::install_glow(&cc.egui_ctx, gl) {
+            if let Err(error) = egui_shader_layers::install_glow(&cc.egui_ctx, gl) {
                 eprintln!("filters disabled: {error}");
             }
         }
@@ -99,7 +99,7 @@ impl eframe::App for App {
             ui.heading("Everything painted before the layer gets filtered");
             // ... your content ...
             let rect = egui::Rect::from_min_size(egui::pos2(60.0, 60.0), egui::vec2(300.0, 200.0));
-            FilterLayer::new(rect, presets::gaussian_blur(8.0).then(presets::saturation(1.4)))
+            ShaderLayer::new(rect, presets::gaussian_blur(8.0).then(presets::saturation(1.4)))
                 .corner_radius(16)
                 .paint(ui.painter());
         });
@@ -108,7 +108,7 @@ impl eframe::App for App {
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         // OpenGL objects need explicit teardown while the context is current.
         if let Some(gl) = gl {
-            egui_filter_layers::destroy_glow(&self.ctx, gl);
+            egui_shader_layers::destroy_glow(&self.ctx, gl);
         }
     }
 }
@@ -122,8 +122,8 @@ fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // MUST describe egui's render pass: mirror your eframe::NativeOptions
         // (multisampling, depth_buffer, stencil_buffer, dithering). The default IS eframe's
         // default; e.g. `.with_multisampling(4)` if you set `multisampling: 4`.
-        let options = egui_filter_layers::WgpuOptions::default();
-        if let Err(error) = egui_filter_layers::install_wgpu(&cc.egui_ctx, render_state, options) {
+        let options = egui_shader_layers::WgpuOptions::default();
+        if let Err(error) = egui_shader_layers::install_wgpu(&cc.egui_ctx, render_state, options) {
             eprintln!("filters disabled: {error}");
         }
     }
@@ -141,7 +141,7 @@ configuration, so the crate cannot check it: a mismatch is a wgpu validation err
 command encoder — a **panic** natively and on WebGL2 (wgpu's default error handler; eframe
 installs none), a console error and a lost frame on browser WebGPU.
 
-Show `egui_filter_layers::status(ctx)` somewhere during development: apart from a mismatched
+Show `egui_shader_layers::status(ctx)` somewhere during development: apart from a mismatched
 `WgpuOptions`, a missing or failed backend never panics, it just leaves the backdrop unfiltered,
 and `status` tells you why.
 
@@ -152,7 +152,7 @@ captured region (`(0, 0)` top-left, y down); colours are premultiplied-alpha, ga
 exactly what egui drew.
 
 ```rust
-use egui_filter_layers::{Effect, FilterLayer, Pass};
+use egui_shader_layers::{Effect, ShaderLayer, Pass};
 
 let wave = Effect::new("wave", r#"
 fn effect(uv: vec2<f32>) -> vec4<f32> {
@@ -165,7 +165,7 @@ fn effect(uv: vec2<f32>) -> vec4<f32> {
 
 // Build the Effect once and keep it; per frame, only the Pass parameters change.
 let pass = Pass::new(&wave).with_param(0, [6.0, 0.0, 0.0, 0.0])?;
-FilterLayer::new(rect, pass).paint(ui.painter());
+ShaderLayer::new(rect, pass).paint(ui.painter());
 ```
 
 Prelude available to every effect:
@@ -178,7 +178,7 @@ Prelude available to every effect:
 | `original(uv)` | the untouched captured backdrop (before any pass), readable in every pass |
 | `p.<name>` | named parameter: member of the snippet's `struct Params` (below) |
 | `params(i)` | `vec4<f32>` anonymous parameter slot `i` (`0..16`) of the pass (untyped; prefer named) |
-| `tex(i, uv)` | user texture `i` (`0..3`, attached with `FilterLayer::texture`) at `uv` in its own 0..1 coordinates, through its own sampler (its egui `TextureOptions`) |
+| `tex(i, uv)` | user texture `i` (`0..3`, attached with `ShaderLayer::texture`) at `uv` in its own 0..1 coordinates, through its own sampler (its egui `TextureOptions`) |
 | `tex_size(i)`, `tex_load(i, px)` | its size in texels; its exact texel `px` (`vec2<i32>`, clamped, no filtering) |
 | `state(uv)` | the layer's persistent state (below), bilinear; zero without a state pass |
 | `state_load(px)`, `state_px(offset)` | an exact state texel (`vec2<i32>`, clamped) / the one under the current pixel, offset |
@@ -231,7 +231,7 @@ hand it to `presets::click_ripples` (rings expanding from each click) or to your
 `(uv.x, uv.y, age_seconds, strength)` — and `impulse_count: u32`).
 
 ```rust
-use egui_filter_layers::{FilterLayer, Impulses, presets};
+use egui_shader_layers::{ShaderLayer, Impulses, presets};
 
 // App state: `let mut ripples = Impulses::new(1.5);` (each ripple lives 1.5 s)
 let now = ui.input(|input| input.time);
@@ -241,7 +241,7 @@ if let Some(pos) = response.interact_pointer_pos().filter(|_| response.clicked()
 }
 ripples.retire(now);
 ripples.request_repaint_if_alive(ui.ctx(), now); // animates while a ring lives, idle afterwards
-FilterLayer::new(rect, presets::click_ripples(&ripples, now, 6.0, 24.0, 120.0)).paint(ui.painter());
+ShaderLayer::new(rect, presets::click_ripples(&ripples, now, 6.0, 24.0, 120.0)).paint(ui.painter());
 ```
 
 At most 16 impulses are kept (`with_capacity` lowers it); a full collection drops the oldest.
@@ -259,13 +259,13 @@ fn effect(uv: vec2<f32>) -> vec4<f32> {
     return src(uv + n * 8.0 * fl.texel);
 }
 "#)?;
-FilterLayer::new(rect, Pass::new(&displace).with_sample_radius(4.0)).texture(0, noise.id()).paint(ui.painter());
+ShaderLayer::new(rect, Pass::new(&displace).with_sample_radius(4.0)).texture(0, noise.id()).paint(ui.painter());
 ```
 
 `tex(i, uv)` samples in the texture's own uv through the sampler of its egui `TextureOptions`
 (filters, wrap mode); `tex_load(i, px)` reads one texel exactly. Values are premultiplied gamma
 RGBA like `src()`. An effect that reads a slot with nothing attached is refused
-(`FilterLayer::check_textures`; the layer draws nothing and the error is logged once), and a
+(`ShaderLayer::check_textures`; the layer draws nothing and the error is logged once), and a
 texture id the renderer does not know (freed) skips its layer and is listed by
 `failed_textures(ctx)`. Offline, attach an `OfflineTexture` with `OfflineOptions::with_texture`.
 
@@ -278,15 +278,15 @@ it with `state(uv)`, or exactly with `state_load(px)` / `state_px(offset)`; insi
 (`fl.pass_index`). The layer needs an identity:
 
 ```rust
-use egui_filter_layers::{FilterChain, FilterLayer, Impulses, presets};
+use egui_shader_layers::{FilterChain, ShaderLayer, Impulses, presets};
 
 // App state: impulses pushed where the user clicks (`impulses.push_point(pos, rect, 30.0, now)`).
 let sim = presets::wave_sim(&impulses, now, &[menu_obstacle]);
 let water = FilterChain::new().then(sim.clone()).then(sim).then(presets::wave_display(8.0, 0.6));
-FilterLayer::new(rect, water).id(ui.id().with("water")).paint(ui.painter());
+ShaderLayer::new(rect, water).id(ui.id().with("water")).paint(ui.painter());
 ```
 
-A stateful layer without `FilterLayer::id` is refused (`StateError::MissingId`, logged once).
+A stateful layer without `ShaderLayer::id` is refused (`StateError::MissingId`, logged once).
 The state spans the whole capture at `StateOptions::with_scale` resolution, lives in layer uv (a
 moved or resized layer keeps it, stretched), starts at zero, is zeroed by `reset_state(ctx, id)`
 and freed after 120 frames (of its own viewport) and 2 s unpainted; an id painted twice in one
@@ -303,15 +303,15 @@ A layer filters its rect, a rounded rect (`corner_radius`), or any egui shape �
 rects, meshes and text galleys, in the layer's points:
 
 ```rust
-use egui_filter_layers::{FilterLayer, Mask, presets};
+use egui_shader_layers::{ShaderLayer, Mask, presets};
 
 let lens = egui::Shape::circle_filled(rect.center(), 60.0, egui::Color32::WHITE);
-FilterLayer::new(rect, presets::gaussian_blur(8.0)).mask(Mask::Shape(lens)).paint(ui.painter());
+ShaderLayer::new(rect, presets::gaussian_blur(8.0)).mask(Mask::Shape(lens)).paint(ui.painter());
 ```
 
 The shape's alpha is the coverage (paint it opaque; egui's feathered edge anti-aliases it, and a
 translucent fill filters partially); outside it — and outside the rect — the backdrop is untouched,
-on wgpu too (a lower filter layer shows through). The mask follows layer transforms; its feathered
+on wgpu too (a lower shader layer shows through). The mask follows layer transforms; its feathered
 edge scales with a `Scene` zoom (it is tessellated before the zoom is known). The coverage of
 several pieces is the sum of their alphas, capped at 1: pieces meeting edge to edge leave no seam
 (their feathered edges are complementary and add up to full coverage), and overlapping translucent
@@ -319,7 +319,7 @@ pieces add up. egui fills convex paths only: build concave outlines from convex 
 overlapping) or from a mesh. Offline (`OfflineOptions::with_mask`)
 text masks and textured meshes are refused (`OfflineError::Mask`: there is no font atlas offline).
 
-**Regions.** `FilterLayer::regions` splits a layer into up to 255 `Region`s: their union is the
+**Regions.** `ShaderLayer::regions` splits a layer into up to 255 `Region`s: their union is the
 mask (abutting regions leave no seam), and every pass reads the id of the region that owns a
 pixel with `region()` — its index in the list. Per-region values are named-parameter arrays
 indexed by it (scalars packed four to a `vec4`: `p.gain[r / 4u][r % 4u]`). Where regions
@@ -328,14 +328,14 @@ two parameter sets needs two layers). A kernel that must not bleed into a neighb
 `region_at(uv + d) == region()`. One capture and one chain run serve every region.
 
 ```rust
-use egui_filter_layers::{Effect, FilterLayer, Pass, Region};
+use egui_shader_layers::{Effect, ShaderLayer, Pass, Region};
 
 let tint = Effect::new("tint", "struct Params { tint: array<vec4<f32>, 2> }
 fn effect(uv: vec2<f32>) -> vec4<f32> { return mix(src(uv), p.tint[min(region(), 1u)], 0.5); }")?;
 let mut pass = Pass::new(&tint);
 pass.set_slice("tint", &[[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]])?;
 let (left, right) = rect.split_left_right_at_fraction(0.5);
-FilterLayer::new(rect, pass).regions([Region::rounded_rect(left, 8), Region::rounded_rect(right, 8)]).paint(ui.painter());
+ShaderLayer::new(rect, pass).regions([Region::rounded_rect(left, 8), Region::rounded_rect(right, 8)]).paint(ui.painter());
 ```
 
 In this build regions run on the wgpu backend; the glow backend skips region-masked layers (logged
@@ -348,7 +348,7 @@ checked (`ParamError`, no panics), and `Effect::params()` lists every member (`P
 `ParamType`, offset, array length) so a UI can build its controls from the effect alone.
 
 ```rust
-use egui_filter_layers::{Effect, Pass};
+use egui_shader_layers::{Effect, Pass};
 
 let tint = Effect::new("tint", r#"
 struct Params {
@@ -376,7 +376,7 @@ With the `hot-reload` feature (native), a `HotEffect` follows a `.wgsl` file: a 
 polls its modification time and recompiles it off the GUI thread; `poll()` never blocks.
 
 ```rust
-use egui_filter_layers::{HotEffect, HotOptions, HotReloadEvent, Pass, rebind};
+use egui_shader_layers::{HotEffect, HotOptions, HotReloadEvent, Pass, rebind};
 
 // At startup:
 let mut hot = HotEffect::watch_with("water", "shaders/water.wgsl", HotOptions::default().with_repaint(ctx))?;
@@ -396,7 +396,7 @@ if let Some(error) = hot.error() {
 
 - **"Beneath" means earlier in egui's paint order**: lower layers and shapes painted earlier into
   the same layer. Later shapes, higher `egui::Order` areas, popups and tooltips are drawn on top
-  and are not filtered. Paint the filter layer right after the content it should affect.
+  and are not filtered. Paint the shader layer right after the content it should affect.
 - **Padding**: neighbourhood effects (blur, refraction) read beyond the rect. The capture is
   expanded by the chain's total sample radius and clamped to the screen; at the screen edge
   sampling clamps to the last pixel.
@@ -434,7 +434,7 @@ if let Some(error) = hot.error() {
 ## Offline: images and video
 
 The same chains run outside the UI: `OfflineRenderer` filters an ordinary RGBA8 frame (an image,
-a video frame) on wgpu and returns the pixels — what a filter layer covering that frame shows on
+a video frame) on wgpu and returns the pixels — what a shader layer covering that frame shows on
 screen. Use it to export what an editor previews.
 
 | Feature | Default | Adds |
@@ -450,7 +450,7 @@ export then agree within rounding, not bit for bit). More image formats: enable 
 `image` dependency, e.g. `image = { version = "0.25", features = ["webp", "gif"] }`.
 
 ```rust
-use egui_filter_layers::{AlphaMode, FrameRef, OfflineOptions, OfflineRenderer, presets};
+use egui_shader_layers::{AlphaMode, FrameRef, OfflineOptions, OfflineRenderer, presets};
 
 // On a worker thread: processing blocks until the GPU is done.
 let mut renderer = OfflineRenderer::from_render_state(&render_state)?; // or ::headless()?
@@ -540,7 +540,7 @@ clamps at the screen edge.
 3. **The ffmpeg programs** (native): `FfmpegSource` / `FfmpegSink`, or in one call:
 
    ```rust
-   use egui_filter_layers::offline::video::{VideoProcessor, ffmpeg::{AudioMode, FfmpegTranscode, VideoCodec}};
+   use egui_shader_layers::offline::video::{VideoProcessor, ffmpeg::{AudioMode, FfmpegTranscode, VideoCodec}};
 
    let mut processor = VideoProcessor::new(OfflineRenderer::headless()?, chain, OfflineOptions::default());
    FfmpegTranscode::new("in.mp4", "out.mp4")

@@ -3,7 +3,7 @@ File: examples/demo/scenes/mask.rs
 
 Purpose:
 Scene "mask": shape-mask glass (F9). Three draggable pieces of glass over the shared backdrop,
-each its own filter layer masked with `Mask::Shape`: a five-pointed star built from convex pieces
+each its own shader layer masked with `Mask::Shape`: a five-pointed star built from convex pieces
 (egui fills convex paths only), a circle and a text galley ("GLASS"). The side panel toggles each
 shape and picks the effect (frosted glass, lens refraction under a light frost, or pixelation).
 
@@ -27,7 +27,7 @@ use std::f32::consts::{PI, TAU};
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, FontId, Galley, Pos2, Sense, Shape, Stroke, Vec2, vec2};
-use egui_filter_layers::{FilterChain, FilterLayer, Mask, presets};
+use egui_shader_layers::{FilterChain, ShaderLayer, Mask, presets};
 
 use super::{Scene, SceneEntry, SceneFrame, SceneInit};
 use crate::backdrop::CircleMotion;
@@ -208,7 +208,7 @@ impl Scene for MaskScene {
             if response.dragged() {
                 shape.offset += response.drag_delta();
             }
-            FilterLayer::new(bounds, chain.clone()).mask(Mask::Shape(mask)).paint(&painter);
+            ShaderLayer::new(bounds, chain.clone()).mask(Mask::Shape(mask)).paint(&painter);
             painter.add(shape.outline(center, &galley));
         }
     }

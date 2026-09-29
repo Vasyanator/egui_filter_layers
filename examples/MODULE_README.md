@@ -79,7 +79,7 @@ processors. They are also the manual test bench for both backends.
   effect speeds passed via `--stack name:v1:...` must be periodic with the loop too.
 - Scene constructors and `Scene::ui` run on the GUI thread: no file I/O or heavy work there
   (use worker threads, e.g. the hot-reload scene's writer).
-- Scene-owned layers that keep state need a stable `FilterLayer::id` distinct across scenes.
+- Scene-owned layers that keep state need a stable `ShaderLayer::id` distinct across scenes.
 - Stateful layers step once per PAINT. The recorder paints every step a fixed number of times
   (its screenshot handshake: currently twice), so recordings of stateful scenes are deterministic
   but step faster than one step per frame and are not seamless loops (state crosses the seam);

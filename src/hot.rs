@@ -211,8 +211,8 @@ enum Update {
 /// [`HotEffect::error`] says what is wrong (with naga's diagnostic for compile errors).
 ///
 /// ```no_run
-/// # fn demo(ctx: &egui::Context) -> Result<(), egui_filter_layers::HotReloadError> {
-/// use egui_filter_layers::{HotEffect, HotOptions, HotReloadEvent, Pass, rebind};
+/// # fn demo(ctx: &egui::Context) -> Result<(), egui_shader_layers::HotReloadError> {
+/// use egui_shader_layers::{HotEffect, HotOptions, HotReloadEvent, Pass, rebind};
 /// let mut hot = HotEffect::watch_with("water", "shaders/water.wgsl", HotOptions::default().with_repaint(ctx))?;
 /// let mut pass: Option<Pass> = None;
 /// // every frame:
@@ -582,7 +582,7 @@ mod tests {
         fn new(name: &str) -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             let unique = NEXT.fetch_add(1, Ordering::Relaxed);
-            Self(std::env::temp_dir().join(format!("egui_filter_layers_hot_{}_{unique}_{name}.wgsl", std::process::id())))
+            Self(std::env::temp_dir().join(format!("egui_shader_layers_hot_{}_{unique}_{name}.wgsl", std::process::id())))
         }
 
         fn write(&self, content: &str) {

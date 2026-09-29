@@ -67,7 +67,7 @@ impl ToolProcess {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
-        log::debug!("egui_filter_layers (video): running {} {}", program.display(), args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>().join(" "));
+        log::debug!("egui_shader_layers (video): running {} {}", program.display(), args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>().join(" "));
         let mut child = command.spawn().map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound { VideoError::ToolNotFound { program: program.to_owned() } } else { VideoError::Spawn { program: program.to_owned(), source } }
         })?;
@@ -75,7 +75,7 @@ impl ToolProcess {
             Some(stream) => Some(spawn_drain(stream).map_err(|source| {
                 // Without a drain the child could block on a full stderr pipe: stop it.
                 if let Err(error) = child.kill().and_then(|()| child.wait().map(drop)) {
-                    log::warn!("egui_filter_layers (video): could not stop `{}` after a failed thread spawn: {error}", program.display());
+                    log::warn!("egui_shader_layers (video): could not stop `{}` after a failed thread spawn: {error}", program.display());
                 }
                 VideoError::Spawn { program: program.to_owned(), source }
             })?),
@@ -118,7 +118,7 @@ impl ToolProcess {
         let (status, stderr_tail) = self.wait_status()?;
         if status.success() {
             if !stderr_tail.trim().is_empty() {
-                log::debug!("egui_filter_layers (video): `{}` reported: {}", self.program.display(), stderr_tail.trim_end());
+                log::debug!("egui_shader_layers (video): `{}` reported: {}", self.program.display(), stderr_tail.trim_end());
             }
             Ok(())
         } else {
@@ -133,10 +133,10 @@ impl ToolProcess {
         }
         // Killing fails only when the child already exited; `wait` reaps it either way.
         if let Err(error) = self.child.kill() {
-            log::debug!("egui_filter_layers (video): killing `{}`: {error}", self.program.display());
+            log::debug!("egui_shader_layers (video): killing `{}`: {error}", self.program.display());
         }
         if let Err(error) = self.child.wait() {
-            log::warn!("egui_filter_layers (video): could not reap `{}`: {error}", self.program.display());
+            log::warn!("egui_shader_layers (video): could not reap `{}`: {error}", self.program.display());
         }
         self.reaped = true;
         // Joins the drain thread (it ends because the child's stderr closed); the tail only
@@ -153,7 +153,7 @@ impl ToolProcess {
 impl Drop for ToolProcess {
     fn drop(&mut self) {
         if !self.reaped {
-            log::debug!("egui_filter_layers (video): stopping `{}` early", self.program.display());
+            log::debug!("egui_shader_layers (video): stopping `{}` early", self.program.display());
         }
         self.kill();
     }
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn a_missing_program_is_a_typed_error() {
-        let program = Path::new("egui-filter-layers-no-such-program");
+        let program = Path::new("egui-shader-layers-no-such-program");
         assert!(matches!(ToolProcess::spawn(program, &[], false, false), Err(VideoError::ToolNotFound { .. })));
         let message = run_to_string(program, &[]).err().map(|error| error.to_string()).unwrap_or_default();
         assert!(message.contains("install FFmpeg"), "{message}");

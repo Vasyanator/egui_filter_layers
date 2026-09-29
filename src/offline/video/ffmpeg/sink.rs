@@ -140,7 +140,7 @@ impl VideoSink for FfmpegSink {
         }
         check_ffmpeg(self.tools.ffmpeg())?;
         if !self.codec.supports_audio() && self.audio.as_ref().is_some_and(|(_, mode)| *mode != AudioMode::Drop) {
-            log::info!("egui_filter_layers (video): {} carries no audio; the input's audio is left out", self.codec.name());
+            log::info!("egui_shader_layers (video): {} carries no audio; the input's audio is left out", self.codec.name());
         }
         let temporary = TemporaryFile::reserve(&self.output)?;
         let command = EncodeCommand {
@@ -152,7 +152,7 @@ impl VideoSink for FfmpegSink {
             audio: self.audio.as_ref().map(|(input, mode)| (input.as_path(), mode)),
             output: temporary.path(),
         };
-        log::info!("egui_filter_layers (video): encoding {} with {} (via {})", self.output.display(), self.codec.name(), temporary.path().display());
+        log::info!("egui_shader_layers (video): encoding {} with {} (via {})", self.output.display(), self.codec.name(), temporary.path().display());
         // A spawn error drops `temporary`, deleting the reserved file.
         let mut process = ToolProcess::spawn(self.tools.ffmpeg(), &encode_args(&command), true, false)?;
         let stdin = process.take_stdin();
@@ -200,7 +200,7 @@ impl VideoSink for FfmpegSink {
         running.process.wait()?;
         let Running { temporary, frames, .. } = running;
         temporary.persist(&self.output)?;
-        log::info!("egui_filter_layers (video): wrote {} ({frames} frames)", self.output.display());
+        log::info!("egui_shader_layers (video): wrote {} ({frames} frames)", self.output.display());
         Ok(())
     }
 
@@ -208,7 +208,7 @@ impl VideoSink for FfmpegSink {
         if let Some(mut running) = self.running.take() {
             running.process.kill();
             running.stdin = None;
-            log::warn!("egui_filter_layers (video): encoding {} aborted after {} frames; nothing was written there", self.output.display(), running.frames);
+            log::warn!("egui_shader_layers (video): encoding {} aborted after {} frames; nothing was written there", self.output.display(), running.frames);
             // Dropping `running` deletes the partial file.
         }
     }

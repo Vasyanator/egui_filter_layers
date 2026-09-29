@@ -2,7 +2,7 @@
 File: offline/texture.rs
 
 Purpose:
-`OfflineTexture`, the offline counterpart of an egui texture a `FilterLayer` attaches (F8): an
+`OfflineTexture`, the offline counterpart of an egui texture a `ShaderLayer` attaches (F8): an
 owned, premultiplied RGBA8 image plus the egui `TextureOptions` it is sampled with, shared cheaply
 between clones (a video processor passes the same one with every frame).
 

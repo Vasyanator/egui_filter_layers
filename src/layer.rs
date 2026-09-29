@@ -2,18 +2,18 @@
 File: layer.rs
 
 Purpose:
-`FilterLayer`, the user-facing shape: a rect (+ a mask: rounded rect or any shape) and a `FilterChain`,
+`ShaderLayer`, the user-facing shape: a rect (+ a mask: rounded rect or any shape) and a `FilterChain`,
 painted into an `egui::Painter`. Resolves the chain into a backend-neutral `LayerJob` and hands
 it to whichever backend is installed on the painter's context.
 
 Key structures:
-- `FilterLayer`.
+- `ShaderLayer`.
 
 Key functions:
-- `FilterLayer::paint()`.
-- `FilterLayer::texture()` / `check_textures()`: user textures (F8) and the check `paint` runs.
-- `FilterLayer::id()` / `state()` / `check_state()`: persistent state (F7) and its check.
-- `FilterLayer::mask()` / `corner_radius()` / `regions()` / `check_mask()`: the mask (F9) and
+- `ShaderLayer::paint()`.
+- `ShaderLayer::texture()` / `check_textures()`: user textures (F8) and the check `paint` runs.
+- `ShaderLayer::id()` / `state()` / `check_state()`: persistent state (F7) and its check.
+- `ShaderLayer::mask()` / `corner_radius()` / `regions()` / `check_mask()`: the mask (F9) and
   regions (R1); a shape mask and every region are tessellated in `paint` (`resolve_mask`, GUI
   thread).
 - `frame_input()`: the per-frame input (`fl.delta_time`, `fl.frame`, `fl.pointer`) read from the
@@ -47,7 +47,7 @@ use crate::state::{StateError, StateOptions, pending_reset};
 /// Sets `ctx`'s "no backend installed" latch; returns whether it was unset (i.e. whether to warn).
 fn first_not_installed_warning(ctx: &Context) -> bool {
     ctx.data_mut(|data| {
-        let warned = data.get_temp_mut_or_default::<bool>(Id::new("egui_filter_layers::warned_not_installed"));
+        let warned = data.get_temp_mut_or_default::<bool>(Id::new("egui_shader_layers::warned_not_installed"));
         !std::mem::replace(warned, true)
     })
 }
@@ -60,15 +60,15 @@ fn first_not_installed_warning(ctx: &Context) -> bool {
 fn warn_not_installed_once(ctx: &Context) {
     if first_not_installed_warning(ctx) {
         log::warn!(
-            "egui_filter_layers: a FilterLayer was painted but no backend is installed on this egui::Context; \
-             call egui_filter_layers::install_glow (or the wgpu installer) at startup. Layers draw nothing until then."
+            "egui_shader_layers: a ShaderLayer was painted but no backend is installed on this egui::Context; \
+             call egui_shader_layers::install_glow (or the wgpu installer) at startup. Layers draw nothing until then."
         );
     }
 }
 
 /// Sets `ctx`'s latch for `message`; returns whether it was unset (i.e. whether to log).
 fn first_layer_error(ctx: &Context, message: &str) -> bool {
-    ctx.data_mut(|data| !std::mem::replace(data.get_temp_mut_or_default::<bool>(Id::new(("egui_filter_layers::layer_error", message))), true))
+    ctx.data_mut(|data| !std::mem::replace(data.get_temp_mut_or_default::<bool>(Id::new(("egui_shader_layers::layer_error", message))), true))
 }
 
 /// Logs `error` (a layer skipped for its textures) the first time this message is seen on `ctx`.
@@ -78,10 +78,10 @@ fn log_texture_error_once(ctx: &Context, error: &TextureError) {
     let message = error.to_string();
     if first_layer_error(ctx, &message) {
         log::error!(
-            "egui_filter_layers: a FilterLayer was skipped (it draws nothing extra) because its textures cannot serve its effects.\n\
+            "egui_shader_layers: a ShaderLayer was skipped (it draws nothing extra) because its textures cannot serve its effects.\n\
              Error: {message}\n\
-             Fix: attach a texture to every slot the chain's effects read (`FilterLayer::texture(slot, id)`, slots 0..{TEXTURE_SLOTS}); \
-             `FilterLayer::check_textures` reports this without painting. Logged once per message."
+             Fix: attach a texture to every slot the chain's effects read (`ShaderLayer::texture(slot, id)`, slots 0..{TEXTURE_SLOTS}); \
+             `ShaderLayer::check_textures` reports this without painting. Logged once per message."
         );
     }
 }
@@ -92,10 +92,10 @@ fn log_state_error_once(ctx: &Context, error: &StateError) {
     let message = error.to_string();
     if first_layer_error(ctx, &message) {
         log::error!(
-            "egui_filter_layers: a FilterLayer was skipped (it draws nothing extra).\n\
+            "egui_shader_layers: a ShaderLayer was skipped (it draws nothing extra).\n\
              Error: {message}\n\
-             Fix: give every layer whose chain has a state pass a stable identity with `FilterLayer::id(egui::Id)`; \
-             `FilterLayer::check_state` reports this without painting. Logged once per message."
+             Fix: give every layer whose chain has a state pass a stable identity with `ShaderLayer::id(egui::Id)`; \
+             `ShaderLayer::check_state` reports this without painting. Logged once per message."
         );
     }
 }
@@ -105,9 +105,9 @@ fn log_mask_error_once(ctx: &Context, error: &MaskError) {
     let message = error.to_string();
     if first_layer_error(ctx, &message) {
         log::error!(
-            "egui_filter_layers: a FilterLayer was skipped (it draws nothing extra) because its mask cannot be rasterized.\n\
+            "egui_shader_layers: a ShaderLayer was skipped (it draws nothing extra) because its mask cannot be rasterized.\n\
              Error: {message}\n\
-             Fix: build the mask from paths, circles, rects, meshes or text; `FilterLayer::check_mask` reports this without painting. Logged once per message."
+             Fix: build the mask from paths, circles, rects, meshes or text; `ShaderLayer::check_mask` reports this without painting. Logged once per message."
         );
     }
 }
@@ -160,14 +160,14 @@ fn frame_input(ctx: &Context) -> FrameInput {
 ///
 /// ```no_run
 /// # fn demo(ui: &mut egui::Ui, rect: egui::Rect) {
-/// use egui_filter_layers::{FilterLayer, presets};
-/// FilterLayer::new(rect, presets::gaussian_blur(6.0))
+/// use egui_shader_layers::{ShaderLayer, presets};
+/// ShaderLayer::new(rect, presets::gaussian_blur(6.0))
 ///     .corner_radius(12)
 ///     .paint(ui.painter());
 /// # }
 /// ```
 #[derive(Clone, Debug)]
-pub struct FilterLayer {
+pub struct ShaderLayer {
     /// The filtered rect, in points.
     rect: Rect,
     /// The passes to run.
@@ -176,8 +176,8 @@ pub struct FilterLayer {
     mask: Mask,
     /// The user texture attached at each slot (`tex(i, uv)` in effects).
     textures: [Option<TextureId>; TEXTURE_SLOTS],
-    /// The first out-of-range slot given to [`FilterLayer::texture`], reported by
-    /// [`FilterLayer::check_textures`] (the builder cannot return an error).
+    /// The first out-of-range slot given to [`ShaderLayer::texture`], reported by
+    /// [`ShaderLayer::check_textures`] (the builder cannot return an error).
     invalid_slot: Option<usize>,
     /// The layer's identity (required by stateful chains, F7).
     id: Option<Id>,
@@ -185,7 +185,7 @@ pub struct FilterLayer {
     state: StateOptions,
 }
 
-impl FilterLayer {
+impl ShaderLayer {
     /// A layer filtering `rect` (points) through `chain` (a `Pass`, `Vec<Pass>` or `FilterChain`).
     #[must_use]
     pub fn new(rect: Rect, chain: impl Into<FilterChain>) -> Self {
@@ -225,7 +225,7 @@ impl FilterLayer {
     }
 
     /// Whether the layer can keep its state: a chain with a state pass needs an id.
-    /// [`FilterLayer::paint`] runs this and skips the layer on an error (logged once per context).
+    /// [`ShaderLayer::paint`] runs this and skips the layer on an error (logged once per context).
     ///
     /// # Errors
     /// [`StateError::MissingId`] naming the first state pass.
@@ -244,7 +244,7 @@ impl FilterLayer {
     ///
     /// Keep the texture alive while the layer is painted: a freed `id` makes the backend skip the
     /// layer and report it in [`crate::failed_textures`]. A `slot` out of range makes the layer
-    /// fail [`FilterLayer::check_textures`] (and so draw nothing).
+    /// fail [`ShaderLayer::check_textures`] (and so draw nothing).
     #[must_use]
     pub fn texture(mut self, slot: usize, id: TextureId) -> Self {
         match self.textures.get_mut(slot) {
@@ -263,8 +263,8 @@ impl FilterLayer {
     }
 
     /// Whether the attached textures can serve the chain: every slot given to
-    /// [`FilterLayer::texture`] exists, and every slot an effect reads
-    /// ([`crate::Effect::reads_texture`]) has a texture. [`FilterLayer::paint`] runs this and
+    /// [`ShaderLayer::texture`] exists, and every slot an effect reads
+    /// ([`crate::Effect::reads_texture`]) has a texture. [`ShaderLayer::paint`] runs this and
     /// skips the layer on an error (logged once per context). It cannot see whether a texture id
     /// is still alive; the backend reports that ([`crate::failed_textures`]).
     ///
@@ -313,7 +313,7 @@ impl FilterLayer {
     }
 
     /// Whether the mask can be rasterized ([`Mask::check`]: no paint callbacks, no malformed
-    /// meshes, at most [`crate::MAX_REGIONS`] regions). [`FilterLayer::paint`] runs this and skips
+    /// meshes, at most [`crate::MAX_REGIONS`] regions). [`ShaderLayer::paint`] runs this and skips
     /// the layer on an error (logged once per context).
     ///
     /// # Errors
@@ -446,7 +446,7 @@ mod tests {
         for _ in 0..PASSES {
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let painter = Painter::new(ui.ctx().clone(), LayerId::background(), Rect::EVERYTHING);
-                FilterLayer::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)), presets::ripple(2.0, 10.0, 1.0)).paint(&painter);
+                ShaderLayer::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)), presets::ripple(2.0, 10.0, 1.0)).paint(&painter);
             });
             repaint = output.viewport_output.get(&egui::ViewportId::ROOT).is_some_and(|viewport| viewport.repaint_delay.is_zero());
             // The font atlas upload is irrelevant here; epaint asserts deltas are handled.
@@ -516,7 +516,7 @@ mod tests {
             let raw = egui::RawInput { time: Some(time), events, ..Default::default() };
             let mut output = ctx.run_ui(raw, |ui| {
                 let painter = Painter::new(ui.ctx().clone(), LayerId::background(), Rect::EVERYTHING);
-                FilterLayer::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)), presets::gaussian_blur(1.0)).paint(&painter);
+                ShaderLayer::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0)), presets::gaussian_blur(1.0)).paint(&painter);
             });
             output.textures_delta.clear();
         }
@@ -539,7 +539,7 @@ mod tests {
         let Ok(effect) = crate::Effect::new("textured", "fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(2u, uv); }") else { panic!("must compile") };
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0));
         let id = TextureId::User(7);
-        let layer = FilterLayer::new(rect, crate::Pass::new(&effect));
+        let layer = ShaderLayer::new(rect, crate::Pass::new(&effect));
         assert_eq!(layer.check_textures(), Err(TextureError::NotAttached { effect: "textured".to_owned(), pass: 0, slot: 2 }));
         assert_eq!(layer.clone().texture(0, id).check_textures().map_err(|error| matches!(error, TextureError::NotAttached { slot: 2, .. })), Err(true));
         assert_eq!(layer.clone().texture(2, id).texture(3, id).check_textures(), Err(TextureError::InvalidSlot { slot: 3 }));
@@ -551,7 +551,7 @@ mod tests {
         for attach in [false, true] {
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 let painter = Painter::new(ui.ctx().clone(), LayerId::background(), Rect::EVERYTHING);
-                let layer = FilterLayer::new(rect, crate::Pass::new(&effect));
+                let layer = ShaderLayer::new(rect, crate::Pass::new(&effect));
                 if attach { layer.texture(2, id) } else { layer }.paint(&painter);
             });
             output.textures_delta.clear();
@@ -603,9 +603,9 @@ mod tests {
         let Ok(state) = crate::Effect::new_state("sim", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state(uv); }") else { panic!("must compile") };
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0));
         let (id, other) = (Id::new("water"), Id::new("other"));
-        assert_eq!(FilterLayer::new(rect, crate::Pass::new(&state)).check_state(), Err(StateError::MissingId { effect: "sim".to_owned(), pass: 0 }));
-        assert_eq!(FilterLayer::new(rect, crate::Pass::new(&state)).id(id).check_state(), Ok(()));
-        assert_eq!(FilterLayer::new(rect, presets::invert(1.0)).check_state(), Ok(()), "no state pass, no id needed");
+        assert_eq!(ShaderLayer::new(rect, crate::Pass::new(&state)).check_state(), Err(StateError::MissingId { effect: "sim".to_owned(), pass: 0 }));
+        assert_eq!(ShaderLayer::new(rect, crate::Pass::new(&state)).id(id).check_state(), Ok(()));
+        assert_eq!(ShaderLayer::new(rect, presets::invert(1.0)).check_state(), Ok(()), "no state pass, no id needed");
 
         let ctx = Context::default();
         let backend = Arc::new(Jobs { jobs: std::sync::Mutex::new(Vec::new()), claim: std::sync::atomic::AtomicBool::new(true) });
@@ -615,25 +615,25 @@ mod tests {
             output.textures_delta.clear();
             std::mem::take(&mut *backend.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
         };
-        assert!(frame(&|painter| FilterLayer::new(rect, crate::Pass::new(&state)).paint(painter)).is_empty(), "refused before the backend");
+        assert!(frame(&|painter| ShaderLayer::new(rect, crate::Pass::new(&state)).paint(painter)).is_empty(), "refused before the backend");
         crate::reset_state(&ctx, id);
         // A stateless layer with the id and a stateful one with another id leave the request.
         let jobs = frame(&|painter| {
-            FilterLayer::new(rect, presets::invert(1.0)).id(id).paint(painter);
-            FilterLayer::new(rect, crate::Pass::new(&state)).id(other).paint(painter);
+            ShaderLayer::new(rect, presets::invert(1.0)).id(id).paint(painter);
+            ShaderLayer::new(rect, crate::Pass::new(&state)).id(other).paint(painter);
         });
         assert_eq!(jobs, [(Some(id), false, false), (Some(other), false, true)]);
         // A paint whose run returns before the state registry (layer out of view) claims nothing.
         backend.claim.store(false, Ordering::Relaxed);
-        let jobs = frame(&|painter| FilterLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter));
+        let jobs = frame(&|painter| ShaderLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter));
         assert_eq!(jobs, [(Some(id), false, true)]);
         backend.claim.store(true, Ordering::Relaxed);
         let jobs = frame(&|painter| {
-            FilterLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter);
-            FilterLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter);
+            ShaderLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter);
+            ShaderLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter);
         });
         assert_eq!(jobs, [(Some(id), true, true), (Some(id), false, true)], "claimed by the first run of the id, after the unclaimed paint");
-        let jobs = frame(&|painter| FilterLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter));
+        let jobs = frame(&|painter| ShaderLayer::new(rect, crate::Pass::new(&state)).id(id).paint(painter));
         assert_eq!(jobs, [(Some(id), false, true)], "claimed once");
     }
 
@@ -675,7 +675,7 @@ mod tests {
     fn masks_are_resolved_or_refused_before_the_backend() {
         let rect = Rect::from_min_size(pos2(10.0, 10.0), vec2(100.0, 100.0));
         let circle = egui::Shape::circle_filled(pos2(60.0, 60.0), 30.0, egui::Color32::WHITE);
-        let layer = FilterLayer::new(rect, presets::invert(1.0));
+        let layer = ShaderLayer::new(rect, presets::invert(1.0));
         assert_eq!(layer.clone().corner_radius(4).layer_mask(), &Mask::RoundedRect(CornerRadius::same(4)));
         assert_eq!(layer.clone().corner_radius(4).mask(Mask::Shape(circle.clone())).layer_mask(), &Mask::Shape(circle.clone()), "the last mask wins");
         let callback = egui::Shape::Callback(egui::PaintCallback { rect, callback: Arc::new(()) });

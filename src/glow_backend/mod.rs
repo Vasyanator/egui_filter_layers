@@ -126,9 +126,9 @@ impl GlowState {
         }
         let message = format!("{what}: {error}");
         log::error!(
-            "egui_filter_layers (glow): the filter backend failed and is disabled for this session.\n\
+            "egui_shader_layers (glow): the filter backend failed and is disabled for this session.\n\
              Error: {message}\n\
-             Effect: filter layers draw nothing extra; the UI underneath is unaffected.\n\
+             Effect: shader layers draw nothing extra; the UI underneath is unaffected.\n\
              Possible cause: the GPU driver rejected a shader or a render-target format, or the \
              framebuffer cannot be read back (e.g. an unusual multisampled format)."
         );
@@ -159,7 +159,7 @@ impl GlowState {
     /// `gl` must be current on this thread.
     unsafe fn fail_effect(&mut self, gl: &glow::Context, module: &Arc<CompiledModule>, what: &str, error: &dyn std::fmt::Display) {
         log::error!(
-            "egui_filter_layers (glow): effect `{}` failed while {what} and is disabled; layers using it are skipped.\n\
+            "egui_shader_layers (glow): effect `{}` failed while {what} and is disabled; layers using it are skipped.\n\
              Error: {error}\n\
              Possible cause: the driver rejected or could not run naga's GLSL translation of this effect.",
             module.label
@@ -180,7 +180,7 @@ impl GlowState {
         }
         let error = "egui_glow's painter has no texture with this id (freed, or never allocated on this painter)".to_owned();
         log::error!(
-            "egui_filter_layers (glow): a filter layer attaches texture {id:?}, which cannot be resolved; layers attaching it draw nothing extra.\n\
+            "egui_shader_layers (glow): a shader layer attaches texture {id:?}, which cannot be resolved; layers attaching it draw nothing extra.\n\
              Error: {error}\n\
              Possible cause: the TextureHandle was dropped (egui freed the texture) while the layer still attaches its id."
         );
@@ -191,7 +191,7 @@ impl GlowState {
     fn refuse(&mut self, feature: Unsupported) {
         if self.refused.insert(feature) {
             log::error!(
-                "egui_filter_layers (glow): a filter layer was skipped (it draws nothing extra).\n\
+                "egui_shader_layers (glow): a shader layer was skipped (it draws nothing extra).\n\
                  Error: {feature}\n\
                  Fix: use the wgpu backend for this layer, or a shape mask. Logged once per feature."
             );
@@ -204,7 +204,7 @@ impl GlowState {
             return;
         }
         let error = StateError::UnsupportedFormat { format, reason };
-        log::error!("egui_filter_layers (glow): stateful filter layers are skipped (they draw nothing extra).\nError: {error}");
+        log::error!("egui_shader_layers (glow): stateful shader layers are skipped (they draw nothing extra).\nError: {error}");
         self.failed_states.insert(format, StateFailure { format, error });
     }
 
@@ -238,7 +238,7 @@ impl GlowState {
         });
         match built {
             Ok(program) => {
-                log::debug!("egui_filter_layers (glow): built program for effect `{}` ({target:?})", module.label);
+                log::debug!("egui_shader_layers (glow): built program for effect `{}` ({target:?})", module.label);
                 self.programs.insert(module.id, CachedProgram { module: Arc::downgrade(module), program });
                 Some(program)
             }
@@ -414,21 +414,21 @@ pub fn install_glow(ctx: &egui::Context, gl: &glow::Context) -> Result<(), Insta
             // SAFETY: documented precondition — `gl` is current, and it is the context object the
             // previous backend was installed with, so it owns those objects.
             unsafe { previous.lock().destroy(gl) };
-            log::debug!("egui_filter_layers (glow): freed the previously installed glow backend before re-installing");
+            log::debug!("egui_shader_layers (glow): freed the previously installed glow backend before re-installing");
         } else {
             log::warn!(
-                "egui_filter_layers (glow): install_glow was given a different GL context than the installed glow backend; \
+                "egui_shader_layers (glow): install_glow was given a different GL context than the installed glow backend; \
                  its GL objects are not freed (call destroy_glow with the old context before replacing it)"
             );
         }
     }
     let version = gl.version();
     let target = glsl_target(version.major, version.minor, version.is_embedded, cfg!(target_arch = "wasm32"));
-    log::debug!("egui_filter_layers (glow): context {}.{} (embedded: {}) -> {target:?}", version.major, version.minor, version.is_embedded);
+    log::debug!("egui_shader_layers (glow): context {}.{} (embedded: {}) -> {target:?}", version.major, version.minor, version.is_embedded);
     let result = match &target {
         Ok(_) => Ok(()),
         Err(reason) => {
-            log::error!("egui_filter_layers (glow): unsupported context, filter layers are disabled: {reason}");
+            log::error!("egui_shader_layers (glow): unsupported context, shader layers are disabled: {reason}");
             Err(InstallError::Unsupported { backend: BackendKind::Glow, reason: reason.clone() })
         }
     };
@@ -445,11 +445,11 @@ pub fn destroy_glow(ctx: &egui::Context, gl: &glow::Context) {
         return;
     };
     let Some(glow_backend) = backend.as_any().downcast_ref::<GlowBackend>() else {
-        log::warn!("egui_filter_layers: destroy_glow called but the installed backend is {}; left installed and untouched", backend.kind());
+        log::warn!("egui_shader_layers: destroy_glow called but the installed backend is {}; left installed and untouched", backend.kind());
         return;
     };
     // SAFETY: documented precondition — `gl` is the current context on this thread.
     unsafe { glow_backend.lock().destroy(gl) };
     uninstall(ctx);
-    log::debug!("egui_filter_layers (glow): GPU resources freed, backend uninstalled");
+    log::debug!("egui_shader_layers (glow): GPU resources freed, backend uninstalled");
 }

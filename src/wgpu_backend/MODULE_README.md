@@ -5,10 +5,10 @@ The `egui-wgpu` backend (feature `wgpu`), native and web. egui-wgpu's surface ca
 mid-frame, so the backdrop is **re-rendered**: the content under each filter is drawn twice.
 
 ## Architecture
-One frame, per filter layer:
+One frame, per shader layer:
 1. `WgpuBackend::paint_layer` (GUI thread, `mod.rs`) adds an `egui_wgpu::Callback` and pushes a
    `Pending { Weak<callback object>, LayerSlot, rect, padding }` into `Shared::pending`.
-2. `FilterLayersPlugin::output_hook` (`plugin.rs`, egui `Context::end_pass` -> `on_output`) finds
+2. `ShaderLayersPlugin::output_hook` (`plugin.rs`, egui `Context::end_pass` -> `on_output`) finds
    the callback in `FullOutput::shapes` by `Arc` address — egui's exact final paint order with layer
    transforms applied, so there is no stale layer order. Everything before it is "beneath":
    `beneath.rs` clips it to the padded capture rect and skips callbacks; `ctx.tessellate`
@@ -33,7 +33,7 @@ One frame, per filter layer:
 4. `FilterCallback::paint` draws the BLENDED composite (`chain::draw_composite_over`: an erase
    draw then an add draw, together `mix(dst, filtered, coverage)`, uncovered pixels discarded)
    into egui's pass. Outside the rounded mask the screen keeps what egui drew, including paint
-   callbacks and lower filter layers the re-render lacks.
+   callbacks and lower shader layers the re-render lacks.
 
 **Chain executor boundary** (`chain.rs` + `gpu.rs`): everything wgpu-specific about running a
 `FilterChain` — intermediate format, uniform buffer stride, the one `@group(0)` layout with its
@@ -136,7 +136,7 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   from an sRGB texture would fix it but GL's sRGB copy semantics are unverified, so none is made;
   egui-wgpu prefers non-sRGB surfaces, which keeps this rare.
 - egui-wgpu's `predictable_texture_filtering` is not mirrored by `mesh.wgsl` (hardware filtering).
-- Paint callbacks beneath a filter (incl. lower filter layers) are skipped, debug-logged once per install
+- Paint callbacks beneath a filter (incl. lower shader layers) are skipped, debug-logged once per install
   (`Shared::logged`; a re-install may log again, as for every log-once message here).
 - egui-wgpu's `Renderer` is read-locked only in `output_hook` (eframe locks it only while
   painting, never across the pass: no deadlock).

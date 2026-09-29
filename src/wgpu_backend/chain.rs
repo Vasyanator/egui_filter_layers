@@ -154,7 +154,7 @@ impl ChainResources {
 
         with_error_scope(device, || {
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("egui_filter_layers sampler"),
+                label: Some("egui_shader_layers sampler"),
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
@@ -163,7 +163,7 @@ impl ChainResources {
             // module; the params block is unsized (`None`): a module may declare any size there
             // (wgpu checks the bound range against the pipeline's struct size at draw time).
             let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("egui_filter_layers group 0"),
+                label: Some("egui_shader_layers group 0"),
                 entries: &[
                     uniform_entry(BINDING_UNIFORMS, Some(UNIFORM_BLOCK_SIZE)),
                     texture_entry(BINDING_SOURCE_TEXTURE),
@@ -175,26 +175,26 @@ impl ChainResources {
                     texture_entry(BINDING_REGION_TEXTURE),
                 ],
             });
-            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("egui_filter_layers group 0"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("egui_shader_layers group 0"), bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
             // egui-wgpu's texture layout, so egui's own per-texture bind groups bind here.
-            let user_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers user texture"), entries: &egui_texture_entries() });
+            let user_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_shader_layers user texture"), entries: &egui_texture_entries() });
             let effect_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("egui_filter_layers effect"),
+                label: Some("egui_shader_layers effect"),
                 bind_group_layouts: &[Some(&layout), Some(&user_layout), Some(&user_layout), Some(&user_layout)],
                 immediate_size: 0,
             });
             // Zero-initialized by wgpu (textures and buffers are cleared before first use).
-            let transparent = dummy_texture(device, "egui_filter_layers transparent dummy");
+            let transparent = dummy_texture(device, "egui_shader_layers transparent dummy");
             let transparent = transparent.create_view(&wgpu::TextureViewDescriptor::default());
             let dummy_user = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("egui_filter_layers empty user texture"),
+                label: Some("egui_shader_layers empty user texture"),
                 layout: &user_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: USER_TEXTURE_BINDING, resource: wgpu::BindingResource::TextureView(&transparent) },
                     wgpu::BindGroupEntry { binding: USER_SAMPLER_BINDING, resource: wgpu::BindingResource::Sampler(&sampler) },
                 ],
             });
-            let white_texture = dummy_texture(device, "egui_filter_layers white dummy");
+            let white_texture = dummy_texture(device, "egui_shader_layers white dummy");
             queue.write_texture(white_texture.as_image_copy(), &[u8::MAX; 4], wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) }, wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 });
             let white = white_texture.create_view(&wgpu::TextureViewDescriptor::default());
             let coverage = CoverageRasterizer::create(device, &user_layout, &white, &sampler);
@@ -238,7 +238,7 @@ impl ChainResources {
             return Ok(entry.pipeline.clone());
         }
         let pipeline = with_error_scope(device, || pass_pipeline(device, &self.effect_pipeline_layout, module, format, None, wgpu::MultisampleState::default(), None))?;
-        log::debug!("egui_filter_layers (wgpu): built pipeline for effect `{}` ({format:?})", module.label);
+        log::debug!("egui_shader_layers (wgpu): built pipeline for effect `{}` ({format:?})", module.label);
         self.pipelines.insert((module.id, format), CachedPipeline { module: Arc::downgrade(module), pipeline: pipeline.clone() });
         Ok(pipeline)
     }
@@ -307,7 +307,7 @@ impl ChainResources {
     /// [`Self::composite_pipeline`]): drawn in order by `draw_composite_over`, they turn every
     /// pixel into `mix(dst, filtered, coverage)` on all four channels and leave pixels outside the
     /// mask untouched. For targets that hold content the capture lacks (the UI pass: paint
-    /// callbacks, lower filter layers). `*Srgb` formats blend in linear, like egui-wgpu does.
+    /// callbacks, lower shader layers). `*Srgb` formats blend in linear, like egui-wgpu does.
     ///
     /// # Errors
     /// As [`Self::composite_pipeline`].
@@ -359,12 +359,12 @@ impl ChainResources {
             (Some(state_plan), Some(state)) => {
                 let format = state_texture_format(state.format);
                 for (index, slot) in state.targets.iter_mut().enumerate() {
-                    Target::ensure_kept(slot, rec.device, rec.encoder, format, if index == 0 { "egui_filter_layers state A" } else { "egui_filter_layers state B" }, state_plan.target_px);
+                    Target::ensure_kept(slot, rec.device, rec.encoder, format, if index == 0 { "egui_shader_layers state A" } else { "egui_shader_layers state B" }, state_plan.target_px);
                 }
                 if let Some(clear) = state_plan.clear
                     && let Some(target) = state.targets.get(usize::from(clear == Slot::StateB)).and_then(Option::as_ref)
                 {
-                    drop(begin_pass(rec.encoder, &target.view, "egui_filter_layers state clear", wgpu::Color::TRANSPARENT));
+                    drop(begin_pass(rec.encoder, &target.view, "egui_shader_layers state clear", wgpu::Color::TRANSPARENT));
                 }
                 Some(&*state.targets)
             }
@@ -379,7 +379,7 @@ impl ChainResources {
         // Both ping-pong targets hold every step's viewport (the plan's pool size) at least.
         let needed = [plan.target_px[0].max(job.window.min_target_size[0]), plan.target_px[1].max(job.window.min_target_size[1])];
         for (index, slot) in targets.ping_pong.iter_mut().enumerate() {
-            Target::ensure(slot, rec.device, self.intermediate_format, None, if index == 0 { "egui_filter_layers ping" } else { "egui_filter_layers pong" }, needed);
+            Target::ensure(slot, rec.device, self.intermediate_format, None, if index == 0 { "egui_shader_layers ping" } else { "egui_shader_layers pong" }, needed);
         }
         let [Some(first), Some(second)] = &targets.ping_pong else {
             return None;
@@ -413,7 +413,7 @@ impl ChainResources {
             let coverage = bindings.coverage.map_or(&self.white, view_of);
             let region = bindings.region.map_or(&self.white, view_of);
             rec.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("egui_filter_layers draw"),
+                label: Some("egui_shader_layers draw"),
                 layout: &self.layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: BINDING_UNIFORMS, resource: wgpu::BindingResource::Buffer(fl) },
@@ -431,7 +431,7 @@ impl ChainResources {
         for (step, draw) in plan.steps.iter().zip(&uniforms.draws) {
             let pipeline = job.pipelines.get(step.pass)?;
             let group = bind_group(draw, step.bindings);
-            let mut pass = begin_pass(rec.encoder, view_of(step.output), "egui_filter_layers filter pass", wgpu::Color::TRANSPARENT);
+            let mut pass = begin_pass(rec.encoder, view_of(step.output), "egui_shader_layers filter pass", wgpu::Color::TRANSPARENT);
             pass.set_viewport(0.0, 0.0, px_f32(step.used_px[0]), px_f32(step.used_px[1]), 0.0, 1.0);
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &group, &[]);
@@ -494,7 +494,7 @@ pub(crate) struct ChainTargets {
 impl ChainTargets {
     /// Empty targets; textures and the buffer are allocated on first use.
     pub(crate) fn new() -> Self {
-        Self { ping_pong: [None, None], uniforms: GrowBuffer::new(wgpu::BufferUsages::UNIFORM, "egui_filter_layers uniforms"), coverage: CoverageTargets::new() }
+        Self { ping_pong: [None, None], uniforms: GrowBuffer::new(wgpu::BufferUsages::UNIFORM, "egui_shader_layers uniforms"), coverage: CoverageTargets::new() }
     }
 }
 

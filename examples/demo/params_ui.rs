@@ -17,7 +17,7 @@ and written back only when a control changed, so an untouched colour is never re
 */
 
 use eframe::egui::{self, Color32};
-use egui_filter_layers::{ParamInfo, ParamValue, Pass};
+use egui_shader_layers::{ParamInfo, ParamValue, Pass};
 
 /// Edits every named parameter of `pass` in place; returns whether any value changed.
 /// A pass whose effect declares no `struct Params` shows a short note instead.

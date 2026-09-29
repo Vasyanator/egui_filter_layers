@@ -58,7 +58,7 @@ impl OfflineRenderer {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn process_file(&mut self, input: &std::path::Path, output: &std::path::Path, chain: &FilterChain, options: &OfflineOptions) -> Result<(), OfflineError> {
         let decoded = image::ImageReader::open(input).map_err(image::ImageError::IoError)?.with_guessed_format().map_err(image::ImageError::IoError)?.decode()?;
-        log::info!("egui_filter_layers (offline): processing {} ({}x{})", input.display(), decoded.width(), decoded.height());
+        log::info!("egui_shader_layers (offline): processing {} ({}x{})", input.display(), decoded.width(), decoded.height());
         let format = image::ImageFormat::from_path(output)?;
         // Encoders need straight alpha, whatever the caller asked the renderer for.
         let result = self.process_image(&decoded, chain, &options.clone().with_output_alpha(AlphaMode::Straight))?;
@@ -70,7 +70,7 @@ impl OfflineRenderer {
             return Err(OfflineError::AlphaNotSupported { format: format!("{format:?}") });
         };
         encoded.save_with_format(output, format)?;
-        log::info!("egui_filter_layers (offline): wrote {}", output.display());
+        log::info!("egui_shader_layers (offline): wrote {}", output.display());
         Ok(())
     }
 }

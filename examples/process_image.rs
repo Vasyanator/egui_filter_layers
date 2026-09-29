@@ -3,7 +3,7 @@ File: examples/process_image.rs
 
 Purpose:
 Offline processing of an image file with the `image` feature: load, apply a filter stack on a
-headless wgpu device, save. The same chain painted as a `FilterLayer` over the image shown 1:1
+headless wgpu device, save. The same chain painted as a `ShaderLayer` over the image shown 1:1
 in the UI gives the same pixels (see the README, "Offline: images and video").
 
 Usage:
@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use egui::Color32;
-use egui_filter_layers::{Effect, FilterChain, OfflineOptions, OfflineRenderer, Pass, presets};
+use egui_shader_layers::{Effect, FilterChain, OfflineOptions, OfflineRenderer, Pass, presets};
 
 /// The custom effect: red sampled 2 points to the left.
 const RED_SHIFT: &str = "fn effect(uv: vec2<f32>) -> vec4<f32> {

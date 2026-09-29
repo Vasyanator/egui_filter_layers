@@ -18,7 +18,7 @@ Key structures:
 Key functions:
 - `reset_state()` / `state_count()` / `failed_states()` (public, re-exported at the crate root).
 - `pending_reset()` (crate): the pending reset request for an id as a `ResetTicket`
-  (`FilterLayer::paint` puts it into the job; the backend claims it where the registry runs).
+  (`ShaderLayer::paint` puts it into the job; the backend claims it where the registry runs).
 - `StateRegistry::begin()` / `finish()` / `evict()`.
 
 Notes:
@@ -67,7 +67,7 @@ impl std::fmt::Display for StateFormat {
     }
 }
 
-/// How a layer's persistent state is stored ([`crate::FilterLayer::state`],
+/// How a layer's persistent state is stored ([`crate::ShaderLayer::state`],
 /// `OfflineOptions::with_state`). `Default`: full resolution, [`StateFormat::Rgba16Float`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StateOptions {
@@ -117,9 +117,9 @@ impl StateOptions {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateError {
-    /// The chain has a state pass but the layer has no identity: `FilterLayer::id` is required,
+    /// The chain has a state pass but the layer has no identity: `ShaderLayer::id` is required,
     /// because the state must be found again next frame.
-    #[error("effect `{effect}` (pass {pass}) is a state pass, but the layer has no id; call FilterLayer::id(..) so its state can be kept between frames")]
+    #[error("effect `{effect}` (pass {pass}) is a state pass, but the layer has no id; call ShaderLayer::id(..) so its state can be kept between frames")]
     MissingId {
         /// The first state pass's effect label.
         effect: String,
@@ -176,7 +176,7 @@ pub fn failed_states(ctx: &Context) -> Vec<StateFailure> {
 }
 
 /// Key of the pending reset requests in a context's temporary memory.
-const PENDING_RESETS: &str = "egui_filter_layers::pending_state_resets";
+const PENDING_RESETS: &str = "egui_shader_layers::pending_state_resets";
 
 /// Layer ids whose state must be reset at their next run (`reset_state`), each with the ticket
 /// its paints carry; claimed tickets are pruned at the next request / lookup.
@@ -222,7 +222,7 @@ pub(crate) const EVICT_SECONDS: f64 = 2.0;
 pub(crate) struct StateKey {
     /// The viewport that painted it.
     pub viewport: ViewportId,
-    /// `FilterLayer::id`.
+    /// `ShaderLayer::id`.
     pub id: Id,
 }
 
@@ -301,7 +301,7 @@ impl<T> StateRegistry<T> {
         if !step && !entry.logged_repeat {
             entry.logged_repeat = true;
             log::debug!(
-                "egui_filter_layers: the stateful layer {:?} was painted twice in one frame of viewport {:?}; the repeat shows the state without stepping it. Logged once.",
+                "egui_shader_layers: the stateful layer {:?} was painted twice in one frame of viewport {:?}; the repeat shows the state without stepping it. Logged once.",
                 key.id,
                 key.viewport
             );

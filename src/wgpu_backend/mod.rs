@@ -15,7 +15,7 @@ Key structures:
 - `Shared`: install-wide state — options, the `RenderState`, pending layers, health latches
   (backend, per effect, per unresolvable user texture), log-once latches (`LoggedOnce`; per
   install, so a re-install may log each message again).
-- `LayerSlot`: one painted filter layer's hand-over cell (plan from the plugin -> `prepare`,
+- `LayerSlot`: one painted shader layer's hand-over cell (plan from the plugin -> `prepare`,
   drawn target from `prepare` -> `paint`).
 
 Key functions:
@@ -23,7 +23,7 @@ Key functions:
 - `WgpuBackend::paint_layer()`: adds the `egui_wgpu::Callback` and registers the layer as pending.
 
 Notes:
-Pipeline of one frame: `paint_layer` (GUI thread) -> `plugin::FilterLayersPlugin::output_hook`
+Pipeline of one frame: `paint_layer` (GUI thread) -> `plugin::ShaderLayersPlugin::output_hook`
 (end of the egui pass: selects + tessellates the beneath content, snapshots texture bind groups)
 -> `render::FilterCallback::prepare` (offscreen re-render, then the egui-free chain executor in
 `chain.rs` runs the filter passes on egui's encoder) ->
@@ -54,7 +54,7 @@ use crate::backend::{Backend, BackendKind, BackendStatus, EffectFailure, Install
 use crate::effect::{CompiledModule, TEXTURE_SLOTS};
 use crate::state::{StateError, StateFailure, StateFormat};
 use crate::geometry::PxRect;
-use plugin::FilterLayersPlugin;
+use plugin::ShaderLayersPlugin;
 use render::FilterCallback;
 use textures::TextureCopies;
 
@@ -410,9 +410,9 @@ impl Shared {
         }
         let message = format!("{what}: {error}");
         log::error!(
-            "egui_filter_layers (wgpu): the filter backend failed and is disabled for this session.\n\
+            "egui_shader_layers (wgpu): the filter backend failed and is disabled for this session.\n\
              Error: {message}\n\
-             Effect: filter layers draw nothing extra; the UI underneath is unaffected.\n\
+             Effect: shader layers draw nothing extra; the UI underneath is unaffected.\n\
              Possible cause: the device rejected a shader, pipeline or texture format (for example \
              a device limit or a driver bug)."
         );
@@ -426,7 +426,7 @@ impl Shared {
             return;
         }
         log::error!(
-            "egui_filter_layers (wgpu): effect `{}` could not be built and is disabled; layers using it are skipped.\n\
+            "egui_shader_layers (wgpu): effect `{}` could not be built and is disabled; layers using it are skipped.\n\
              Error: {error}\n\
              Possible cause: the device rejected the effect's WGSL (naga accepted it, so this is a device limit or a driver bug).",
             module.label
@@ -443,7 +443,7 @@ impl Shared {
         }
         let error = "egui-wgpu's renderer has no texture with this id (freed, or never registered with this renderer)".to_owned();
         log::error!(
-            "egui_filter_layers (wgpu): a filter layer attaches texture {id:?}, which cannot be resolved; layers attaching it draw nothing extra.\n\
+            "egui_shader_layers (wgpu): a shader layer attaches texture {id:?}, which cannot be resolved; layers attaching it draw nothing extra.\n\
              Error: {error}\n\
              Possible cause: the TextureHandle was dropped (egui freed the texture) while the layer still attaches its id."
         );
@@ -458,7 +458,7 @@ impl Shared {
             return;
         }
         let error = StateError::UnsupportedFormat { format, reason };
-        log::error!("egui_filter_layers (wgpu): stateful filter layers are skipped (they draw nothing extra).\nError: {error}");
+        log::error!("egui_shader_layers (wgpu): stateful shader layers are skipped (they draw nothing extra).\nError: {error}");
         health.failed_states.insert(format, StateFailure { format, error });
     }
 
@@ -540,14 +540,14 @@ impl Backend for WgpuBackend {
 /// Installs the wgpu filter backend on `ctx`. Call once at startup, e.g. from the eframe app
 /// creator with `cc.wgpu_render_state`.
 ///
-/// **The content under every filter layer is rendered twice per frame on wgpu.** egui-wgpu draws
+/// **The content under every shader layer is rendered twice per frame on wgpu.** egui-wgpu draws
 /// into a surface that cannot be read back mid-frame, so this backend re-renders everything
-/// painted beneath each filter layer (clipped to the layer's padded rect) into an offscreen
+/// painted beneath each shader layer (clipped to the layer's padded rect) into an offscreen
 /// texture, filters that, and draws the result over the region. Budget for the extra
 /// tessellation and fill; a one-time warning is logged here.
 ///
 /// Semantics specific to this backend:
-/// * Paint callbacks beneath a filter (your own 3D views, other filter layers) cannot be
+/// * Paint callbacks beneath a filter (your own 3D views, other shader layers) cannot be
 ///   re-rendered and are left out of its backdrop. A filter painted over another filter
 ///   therefore sees the lower filter's *unfiltered* backdrop. Outside a rounded mask (the corners
 ///   of the rect) the filter draws nothing, so what is on screen there — including such
@@ -589,18 +589,18 @@ pub fn install_wgpu(ctx: &egui::Context, render_state: &egui_wgpu::RenderState, 
         logged: LoggedOnce::default(),
         state_count: AtomicUsize::new(0),
     });
-    if let Some(handle) = ctx.plugin_opt::<FilterLayersPlugin>() {
+    if let Some(handle) = ctx.plugin_opt::<ShaderLayersPlugin>() {
         handle.lock().replace_shared(Arc::clone(&shared));
     } else {
-        ctx.add_plugin(FilterLayersPlugin::new(Arc::clone(&shared)));
+        ctx.add_plugin(ShaderLayersPlugin::new(Arc::clone(&shared)));
     }
     register(ctx, Arc::new(WgpuBackend { shared }));
     if let Some(reason) = problem {
-        log::error!("egui_filter_layers (wgpu): invalid WgpuOptions, filter layers are disabled: {reason}");
+        log::error!("egui_shader_layers (wgpu): invalid WgpuOptions, shader layers are disabled: {reason}");
         return Err(InstallError::Unsupported { backend: BackendKind::Wgpu, reason });
     }
     log::warn!(
-        "egui_filter_layers (wgpu): on wgpu the content beneath every filter layer is rendered TWICE per frame \
+        "egui_shader_layers (wgpu): on wgpu the content beneath every shader layer is rendered TWICE per frame \
          (once by egui, once offscreen for the filter); target format {:?}, MSAA {}",
         render_state.target_format,
         options.msaa_samples()

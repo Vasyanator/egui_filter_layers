@@ -102,7 +102,7 @@ pub(crate) fn mesh_pipeline(device: &wgpu::Device, layout: &wgpu::PipelineLayout
 
 /// The layout of the mesh shader's group 0 (`MeshLocals`).
 pub(crate) fn mesh_locals_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers mesh locals"), entries: &[uniform_entry(0, Some(MESH_LOCALS_SIZE))] })
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_shader_layers mesh locals"), entries: &[uniform_entry(0, Some(MESH_LOCALS_SIZE))] })
 }
 
 /// The layout of the region-id passes' group 0: `MeshLocals` at a DYNAMIC offset (one block per
@@ -112,7 +112,7 @@ fn region_locals_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     if let wgpu::BindingType::Buffer { has_dynamic_offset, .. } = &mut entry.ty {
         *has_dynamic_offset = true;
     }
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers region locals"), entries: &[entry] })
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_shader_layers region locals"), entries: &[entry] })
 }
 
 /// Per-device objects of the coverage rasterizer.
@@ -139,16 +139,16 @@ impl CoverageRasterizer {
     /// from `white` + `sampler`. Must run inside the caller's error scope.
     pub(crate) fn create(device: &wgpu::Device, texture_layout: &wgpu::BindGroupLayout, white: &wgpu::TextureView, sampler: &wgpu::Sampler) -> Self {
         let locals_layout = mesh_locals_layout(device);
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("egui_filter_layers coverage"), bind_group_layouts: &[Some(&locals_layout), Some(texture_layout)], immediate_size: 0 });
-        let module = shader(device, "egui_filter_layers mesh", MESH_WGSL);
-        let pipeline = mesh_pipeline(device, &layout, &module, COVERAGE_FORMAT, "fs_main", Some(COVERAGE_BLEND), "egui_filter_layers coverage");
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("egui_shader_layers coverage"), bind_group_layouts: &[Some(&locals_layout), Some(texture_layout)], immediate_size: 0 });
+        let module = shader(device, "egui_shader_layers mesh", MESH_WGSL);
+        let pipeline = mesh_pipeline(device, &layout, &module, COVERAGE_FORMAT, "fs_main", Some(COVERAGE_BLEND), "egui_shader_layers coverage");
         let region_locals_layout = region_locals_layout(device);
-        let region_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("egui_filter_layers region ids"), bind_group_layouts: &[Some(&region_locals_layout), Some(texture_layout)], immediate_size: 0 });
-        let region_pipeline = mesh_pipeline(device, &region_layout, &module, REGION_FORMAT, "fs_region", None, "egui_filter_layers region ids");
+        let region_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("egui_shader_layers region ids"), bind_group_layouts: &[Some(&region_locals_layout), Some(texture_layout)], immediate_size: 0 });
+        let region_pipeline = mesh_pipeline(device, &region_layout, &module, REGION_FORMAT, "fs_region", None, "egui_shader_layers region ids");
         let alignment = usize::try_from(device.limits().min_uniform_buffer_offset_alignment.max(1)).unwrap_or(256);
         let region_locals_stride = MESH_LOCALS_SIZE.div_ceil(alignment) * alignment;
         let white_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("egui_filter_layers white mesh texture"),
+            label: Some("egui_shader_layers white mesh texture"),
             layout: texture_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(white) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) }],
         });
@@ -177,17 +177,17 @@ impl CoverageRasterizer {
         }
         let (device, queue) = (rec.device, rec.queue);
         let needed = step.used_px.map(|side| u32::try_from(side).unwrap_or(0));
-        let coverage = Target::ensure(&mut targets.texture, device, COVERAGE_FORMAT, None, "egui_filter_layers coverage", needed);
+        let coverage = Target::ensure(&mut targets.texture, device, COVERAGE_FORMAT, None, "egui_shader_layers coverage", needed);
         let locals = targets.locals.write(device, queue, &coverage_locals(&job.transform, step));
         let locals = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("egui_filter_layers coverage locals"),
+            label: Some("egui_shader_layers coverage locals"),
             layout: &self.locals_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: locals, offset: 0, size: std::num::NonZeroU64::new(u64::try_from(MESH_LOCALS_SIZE).unwrap_or(0)) }) }],
         });
         let vertices = targets.vertices.write(device, queue, &job.packed.vertices);
         let indices = targets.indices.write(device, queue, &job.packed.indices);
         {
-            let mut pass = begin_pass(rec.encoder, &coverage.view, "egui_filter_layers coverage", wgpu::Color::TRANSPARENT);
+            let mut pass = begin_pass(rec.encoder, &coverage.view, "egui_shader_layers coverage", wgpu::Color::TRANSPARENT);
             // Without draws the cleared (zero) coverage masks everything out.
             if !job.packed.draws.is_empty() {
                 pass.set_viewport(0.0, 0.0, px_f32(step.used_px[0]), px_f32(step.used_px[1]), 0.0, 1.0);
@@ -205,7 +205,7 @@ impl CoverageRasterizer {
         if region_count == 0 {
             return Some(CoverageOutput { coverage, region: None });
         }
-        let region = Target::ensure(&mut targets.region, device, REGION_FORMAT, None, "egui_filter_layers region ids", needed);
+        let region = Target::ensure(&mut targets.region, device, REGION_FORMAT, None, "egui_shader_layers region ids", needed);
         // One locals block per (pass, region), pass-major, at the device's offset alignment.
         let stride = self.region_locals_stride;
         let mut bytes = vec![0_u8; stride.checked_mul(REGION_PASS_THRESHOLDS.len() * region_count)?];
@@ -217,11 +217,11 @@ impl CoverageRasterizer {
         }
         let region_locals = targets.region_locals.write(device, queue, &bytes);
         let region_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("egui_filter_layers region locals"),
+            label: Some("egui_shader_layers region locals"),
             layout: &self.region_locals_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: region_locals, offset: 0, size: std::num::NonZeroU64::new(u64::try_from(MESH_LOCALS_SIZE).unwrap_or(0)) }) }],
         });
-        let mut pass = begin_pass(rec.encoder, &region.view, "egui_filter_layers region ids", REGION_CLEAR);
+        let mut pass = begin_pass(rec.encoder, &region.view, "egui_shader_layers region ids", REGION_CLEAR);
         if !job.packed.draws.is_empty() {
             pass.set_viewport(0.0, 0.0, px_f32(step.used_px[0]), px_f32(step.used_px[1]), 0.0, 1.0);
             pass.set_pipeline(&self.region_pipeline);
@@ -280,10 +280,10 @@ impl CoverageTargets {
         Self {
             texture: None,
             region: None,
-            region_locals: GrowBuffer::new(wgpu::BufferUsages::UNIFORM, "egui_filter_layers region locals"),
-            locals: GrowBuffer::new(wgpu::BufferUsages::UNIFORM, "egui_filter_layers coverage locals"),
-            vertices: GrowBuffer::new(wgpu::BufferUsages::VERTEX, "egui_filter_layers coverage vertices"),
-            indices: GrowBuffer::new(wgpu::BufferUsages::INDEX, "egui_filter_layers coverage indices"),
+            region_locals: GrowBuffer::new(wgpu::BufferUsages::UNIFORM, "egui_shader_layers region locals"),
+            locals: GrowBuffer::new(wgpu::BufferUsages::UNIFORM, "egui_shader_layers coverage locals"),
+            vertices: GrowBuffer::new(wgpu::BufferUsages::VERTEX, "egui_shader_layers coverage vertices"),
+            indices: GrowBuffer::new(wgpu::BufferUsages::INDEX, "egui_shader_layers coverage indices"),
         }
     }
 }

@@ -1,21 +1,18 @@
 [package]
-name = "egui_filter_layers"
+name = "egui-shader-layers"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
-description = "GPU filter layers for egui: redraw everything painted beneath a rect through a chain of WGSL effects (blur, colour adjustments, refraction, custom shaders) on egui_glow and egui-wgpu."
+description = "WGSL shader layers for egui: filters, stateful simulations, textures and masks over everything painted beneath a shape, on egui_glow and egui-wgpu, plus offline image and video."
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/Vasyanator/egui_filter_layers"
-documentation = "https://docs.rs/egui_filter_layers"
+repository = "https://github.com/Vasyanator/egui-shader-layers"
+documentation = "https://docs.rs/egui-shader-layers"
 keywords = ["egui", "shader", "blur", "filter", "wgsl"]
 categories = ["gui", "graphics", "rendering"]
 authors = ["Vasyanator"]
 # `assets/` holds the README GIFs; the README links them by absolute URL, so they stay out of the package.
 exclude = ["MODULE_README.md", "**/MODULE_README.md", "assets/", "dev-docs/"]
-
-[lib]
-name = "egui_filter_layers"
 
 [features]
 default = ["glow", "wgpu"]

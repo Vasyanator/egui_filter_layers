@@ -1,4 +1,4 @@
-// egui_filter_layers: draws egui meshes (egui's 20-byte vertex: pos, uv, packed
+// egui_shader_layers: draws egui meshes (egui's 20-byte vertex: pos, uv, packed
 // colour) into an offscreen texture. Two uses:
 // 1. wgpu backdrop re-render: the maths mirror egui-wgpu 0.36's `egui.wgsl`
 //    (vertex colour * texture sample, premultiplied gamma, optional dithering)

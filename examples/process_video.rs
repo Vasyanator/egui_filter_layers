@@ -21,9 +21,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use egui::Color32;
-use egui_filter_layers::offline::video::VideoProcessor;
-use egui_filter_layers::offline::video::ffmpeg::{AudioMode, FfmpegTranscode, VideoCodec};
-use egui_filter_layers::{FilterChain, OfflineOptions, OfflineRenderer, presets};
+use egui_shader_layers::offline::video::VideoProcessor;
+use egui_shader_layers::offline::video::ffmpeg::{AudioMode, FfmpegTranscode, VideoCodec};
+use egui_shader_layers::{FilterChain, OfflineOptions, OfflineRenderer, presets};
 
 /// Parsed command line.
 struct Args {

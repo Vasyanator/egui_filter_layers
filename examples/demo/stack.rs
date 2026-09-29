@@ -3,7 +3,7 @@ File: examples/demo/stack.rs
 
 Purpose:
 The preset stack editor: a list of presets (`Kind`) the user adds, reorders, toggles and tunes,
-plus a live-compiled custom WGSL effect. Produces one `FilterChain` for a filter layer. Reusable
+plus a live-compiled custom WGSL effect. Produces one `FilterChain` for a shader layer. Reusable
 by any scene; the "stack" scene is its main user.
 
 Key structures:
@@ -23,7 +23,7 @@ CONSTRUCTOR arguments (a change rebuilds the passes, resetting named edits), and
 */
 
 use eframe::egui::{self, Color32};
-use egui_filter_layers::{Effect, EffectError, FilterChain, Pass, presets};
+use egui_shader_layers::{Effect, EffectError, FilterChain, Pass, presets};
 
 use crate::params_ui::pass_params_ui;
 

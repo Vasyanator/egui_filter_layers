@@ -81,7 +81,7 @@ pub struct ImpulsePack {
 /// running while (and only while) an impulse is alive.
 ///
 /// ```
-/// use egui_filter_layers::{FilterLayer, Impulses, presets};
+/// use egui_shader_layers::{ShaderLayer, Impulses, presets};
 ///
 /// struct App { ripples: Impulses }
 ///
@@ -93,7 +93,7 @@ pub struct ImpulsePack {
 ///     }
 ///     app.ripples.retire(now);
 ///     app.ripples.request_repaint_if_alive(ui.ctx(), now);
-///     FilterLayer::new(rect, presets::click_ripples(&app.ripples, now, 6.0, 24.0, 120.0)).paint(ui.painter());
+///     ShaderLayer::new(rect, presets::click_ripples(&app.ripples, now, 6.0, 24.0, 120.0)).paint(ui.painter());
 /// }
 /// # let _ = App { ripples: Impulses::new(1.5) };
 /// ```
@@ -159,7 +159,7 @@ impl Impulses {
     }
 
     /// Adds an impulse at `pos`, given in the same coordinates as `layer_rect` (the rect passed
-    /// to [`FilterLayer::new`](crate::FilterLayer::new), e.g. a `Response`'s pointer position).
+    /// to [`ShaderLayer::new`](crate::ShaderLayer::new), e.g. a `Response`'s pointer position).
     ///
     /// Returns `false` and stores nothing when `layer_rect` has no positive area or any value is
     /// not finite (see [`Impulses::push`]).

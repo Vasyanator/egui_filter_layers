@@ -22,7 +22,7 @@ without that, an idle scene stops repainting once every ripple has expired).
 */
 
 use eframe::egui::{self, Pos2, Rect};
-use egui_filter_layers::{FilterLayer, IMPULSE_SLOTS, Impulses, presets};
+use egui_shader_layers::{ShaderLayer, IMPULSE_SLOTS, Impulses, presets};
 
 use super::{Scene, SceneEntry, SceneFrame, SceneInit};
 use crate::backdrop::{CircleMotion, scroll_widgets};
@@ -160,6 +160,6 @@ impl Scene for RipplesScene {
         }
         self.impulses.retire(now);
         self.impulses.request_repaint_if_alive(ui.ctx(), now);
-        FilterLayer::new(area, presets::click_ripples(&self.impulses, now, self.amplitude, self.wavelength, self.speed)).paint(&painter);
+        ShaderLayer::new(area, presets::click_ripples(&self.impulses, now, self.amplitude, self.wavelength, self.speed)).paint(&painter);
     }
 }

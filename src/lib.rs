@@ -2,28 +2,28 @@
 File: lib.rs
 
 Purpose:
-Crate root of `egui_filter_layers`: public re-exports, backend installers, and the crate-level
+Crate root of `egui_shader_layers`: public re-exports, backend installers, and the crate-level
 documentation (semantics, shader model, backend matrix).
 
 Key items:
-- `FilterLayer`, `FilterChain`, `Pass`, `Effect` (re-exported from their modules)
+- `ShaderLayer`, `FilterChain`, `Pass`, `Effect` (re-exported from their modules)
 - `presets` module (its `WaveObstacle` also re-exported at the root: the one preset input type)
 - `Impulses` (+ `Impulse`, `ImpulsePack`, param-name constants): input-driven transient effects
 - `install_glow()` / `destroy_glow()` (feature `glow`), `install_wgpu()` / `WgpuOptions`
   (feature `wgpu`), `status()`, `failed_effects()`, `failed_textures()`
-- user textures: `TEXTURE_SLOTS`, `TextureError`, `TextureFailure` (`FilterLayer::texture`)
+- user textures: `TEXTURE_SLOTS`, `TextureError`, `TextureFailure` (`ShaderLayer::texture`)
 - persistent state (F7): `StateOptions`, `StateFormat`, `StateError`, `StateFailure`,
-  `reset_state()`, `state_count()`, `failed_states()` (`Effect::new_state`, `FilterLayer::id`)
+  `reset_state()`, `state_count()`, `failed_states()` (`Effect::new_state`, `ShaderLayer::id`)
 - `offline` module and its re-exports (`OfflineRenderer`, ...; features `image` / `video`)
 - `HotEffect`, `rebind` (+ options, events, errors; feature `hot-reload`, native only)
-- shape masks (F9): `Mask`, `MaskError` (`FilterLayer::mask`, `OfflineOptions::with_mask`)
+- shape masks (F9): `Mask`, `MaskError` (`ShaderLayer::mask`, `OfflineOptions::with_mask`)
 
 Notes:
 Backends plug in behind the crate-internal `backend::Backend` trait; nothing outside a backend
 module names a backend type.
 */
 
-//! GPU **filter layers** for [egui](https://github.com/emilk/egui): a shape that takes
+//! GPU **shader layers** for [egui](https://github.com/emilk/egui): a shape that takes
 //! everything already painted beneath a rect and redraws that region through a chain of
 //! WGSL filter passes — blur, colour adjustments, refraction, or your own shader.
 //!
@@ -31,13 +31,13 @@ module names a backend type.
 //! # #[cfg(feature = "glow")]
 //! # fn app_setup(cc_gl: &glow::Context, ctx: &egui::Context) {
 //! // Once, at startup (eframe: `cc.gl` in your app creator):
-//! egui_filter_layers::install_glow(ctx, cc_gl).ok();
+//! egui_shader_layers::install_glow(ctx, cc_gl).ok();
 //! # }
 //! # fn frame(ui: &mut egui::Ui) {
-//! use egui_filter_layers::{FilterLayer, presets};
+//! use egui_shader_layers::{ShaderLayer, presets};
 //! // Every frame, after painting whatever should end up blurred:
 //! let rect = egui::Rect::from_min_size(egui::pos2(40.0, 40.0), egui::vec2(240.0, 160.0));
-//! FilterLayer::new(rect, presets::gaussian_blur(8.0).then(presets::saturation(1.3)))
+//! ShaderLayer::new(rect, presets::gaussian_blur(8.0).then(presets::saturation(1.3)))
 //!     .corner_radius(16)
 //!     .paint(ui.painter());
 //! # }
@@ -56,8 +56,8 @@ module names a backend type.
 //! * **Chains** ([`FilterChain`]) of passes, each optionally at reduced resolution
 //!   ([`Pass::with_scale`]).
 //! * **Input**: [`Impulses`] turns clicks into transient animations that repaint only while alive.
-//! * **User textures** ([`FilterLayer::texture`]), **persistent per-layer state**
-//!   ([`Effect::new_state`], [`FilterLayer::id`]) and **shape masks** ([`FilterLayer::mask`]).
+//! * **User textures** ([`ShaderLayer::texture`]), **persistent per-layer state**
+//!   ([`Effect::new_state`], [`ShaderLayer::id`]) and **shape masks** ([`ShaderLayer::mask`]).
 //! * **Backends**: `egui_glow` and `egui-wgpu`; **offline** processing of images and video
 //!   (features `image` / `video`); **hot reload** of WGSL files (feature `hot-reload`).
 //!
@@ -111,7 +111,7 @@ module names a backend type.
 //! | `fl.pass_scale` | this pass's output resolution relative to the capture ([`Pass::with_scale`]; `1` = full) |
 //! | `to_linear(c)`, `to_gamma(c)` | sRGB transfer functions on `rgb` (alpha untouched) |
 //! | `premultiply(c)`, `unpremultiply(c)`, `luma(rgb)` | colour helpers |
-//! | `tex(i, uv)` | user texture `i` (`0..`[`TEXTURE_SLOTS`], attached with [`FilterLayer::texture`]) at `uv` in the TEXTURE's own `0..1` coordinates (top-left origin), through its own sampler (its egui `TextureOptions`: filters, wrap mode; mip level 0) |
+//! | `tex(i, uv)` | user texture `i` (`0..`[`TEXTURE_SLOTS`], attached with [`ShaderLayer::texture`]) at `uv` in the TEXTURE's own `0..1` coordinates (top-left origin), through its own sampler (its egui `TextureOptions`: filters, wrap mode; mip level 0) |
 //! | `tex_size(i)` | size of user texture `i` in texels (`vec2<f32>`) |
 //! | `tex_load(i, px)` | the exact texel `px` (`vec2<i32>`, clamped to the texture) of user texture `i`, no filtering |
 //! | `state(uv)` | the layer's persistent state at `uv` (bilinear; see [Persistent state](#persistent-state)); zero without a state pass |
@@ -139,7 +139,7 @@ module names a backend type.
 //! Members start at zero (WGSL has no default values).
 //!
 //! ```
-//! use egui_filter_layers::{Effect, ParamError, ParamType, Pass};
+//! use egui_shader_layers::{Effect, ParamError, ParamType, Pass};
 //!
 //! let effect = Effect::new("tint", "
 //! struct Params {
@@ -169,14 +169,14 @@ module names a backend type.
 //! ## Textures
 //!
 //! A layer attaches up to [`TEXTURE_SLOTS`] (3, on every backend) egui textures with
-//! [`FilterLayer::texture`] — noise, normal maps, lookup tables, images — which its effects read
+//! [`ShaderLayer::texture`] — noise, normal maps, lookup tables, images — which its effects read
 //! with `tex(i, uv)`, `tex_size(i)` and `tex_load(i, px)`. Values are premultiplied gamma RGBA,
 //! like `src()`. Each texture is read through its own sampler only (its `TextureOptions`); exact
 //! reads use `tex_load`, which needs none.
 //!
 //! ```
-//! use egui_filter_layers::{Effect, FilterLayer, Pass};
-//! # fn frame(ui: &mut egui::Ui, noise: &egui::TextureHandle, rect: egui::Rect) -> Result<(), egui_filter_layers::EffectError> {
+//! use egui_shader_layers::{Effect, ShaderLayer, Pass};
+//! # fn frame(ui: &mut egui::Ui, noise: &egui::TextureHandle, rect: egui::Rect) -> Result<(), egui_shader_layers::EffectError> {
 //! // `noise` from `ctx.load_texture(.., egui::TextureOptions::LINEAR_REPEAT)`, kept alive.
 //! let displace = Effect::new("displace", "
 //! fn effect(uv: vec2<f32>) -> vec4<f32> {
@@ -184,13 +184,13 @@ module names a backend type.
 //!     return src(uv + n * 8.0 * fl.texel);
 //! }")?.with_sample_radius(4.0);
 //! assert!(displace.reads_texture(0) && !displace.reads_texture(1));
-//! FilterLayer::new(rect, Pass::new(&displace)).texture(0, noise.id()).paint(ui.painter());
+//! ShaderLayer::new(rect, Pass::new(&displace)).texture(0, noise.id()).paint(ui.painter());
 //! # Ok(()) }
 //! ```
 //!
 //! Which slots an effect reads is found in naga's IR ([`Effect::reads_texture`]; a slot index
 //! that is not a constant counts as every slot). A layer whose effect reads a slot with nothing
-//! attached is refused before drawing — [`FilterLayer::check_textures`] returns the
+//! attached is refused before drawing — [`ShaderLayer::check_textures`] returns the
 //! [`TextureError`], `paint` draws nothing and logs it once — never silently fed a dummy. A
 //! texture id the renderer does not know (freed: keep the `TextureHandle` alive) skips the
 //! layers attaching it and is listed by [`failed_textures`]. Offline runs attach an
@@ -225,8 +225,8 @@ module names a backend type.
 //!   wrote (or last frame's state), a state pass the state it steps. Inside a state pass `src()` is
 //!   the display chain's input at that point (a state pass does not advance it), `original()` the
 //!   backdrop. N consecutive state passes are N substeps (`fl.pass_index` = 0..N).
-//! * **Identity.** A layer whose chain has a state pass needs [`FilterLayer::id`]: the state is
-//!   kept per id and viewport. Without an id it is refused ([`FilterLayer::check_state`]:
+//! * **Identity.** A layer whose chain has a state pass needs [`ShaderLayer::id`]: the state is
+//!   kept per id and viewport. Without an id it is refused ([`ShaderLayer::check_state`]:
 //!   [`StateError::MissingId`]; it draws nothing, logged once). Painting one id twice in a frame
 //!   steps it once (the second paint shows the state as it is).
 //! * **Size.** The state spans the whole capture (the padded rect, `uv` space) at
@@ -247,8 +247,8 @@ module names a backend type.
 //!   stateful chains are never tiled (`OfflineError::NotTileable`).
 //!
 //! ```
-//! use egui_filter_layers::{Effect, FilterChain, FilterLayer, Pass};
-//! # fn frame(ui: &mut egui::Ui, rect: egui::Rect) -> Result<(), egui_filter_layers::EffectError> {
+//! use egui_shader_layers::{Effect, FilterChain, ShaderLayer, Pass};
+//! # fn frame(ui: &mut egui::Ui, rect: egui::Rect) -> Result<(), egui_shader_layers::EffectError> {
 //! // Accumulates the backdrop's brightness over frames and shows it.
 //! let accumulate = Effect::new_state("glow", "
 //! fn effect(uv: vec2<f32>) -> vec4<f32> {
@@ -256,7 +256,7 @@ module names a backend type.
 //! }")?;
 //! let show = Effect::new("show", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state(uv); }")?;
 //! let chain = FilterChain::new().then(Pass::new(&accumulate)).then(Pass::new(&show));
-//! FilterLayer::new(rect, chain).id(ui.id().with("glow")).paint(ui.painter());
+//! ShaderLayer::new(rect, chain).id(ui.id().with("glow")).paint(ui.painter());
 //! # Ok(()) }
 //! ```
 //!
@@ -267,8 +267,8 @@ module names a backend type.
 //! / `src_texel()` (input pixels) or `out_texel()`. [`presets::kawase_blur`] and
 //! [`presets::bloom`] are built from such passes. Offline, a scaled chain refuses tiling.
 //!
-//! **Masks.** A layer filters its whole rect, or a rounded rect ([`FilterLayer::corner_radius`]),
-//! or any egui shape: [`FilterLayer::mask`] with [`Mask::Shape`] — paths, circles, rects,
+//! **Masks.** A layer filters its whole rect, or a rounded rect ([`ShaderLayer::corner_radius`]),
+//! or any egui shape: [`ShaderLayer::mask`] with [`Mask::Shape`] — paths, circles, rects,
 //! meshes, text galleys (UI only), in the layer's points (so it follows layer transforms). The
 //! shape's alpha is the coverage (paint it opaque for a full-strength filter; egui's feathered edge
 //! anti-aliases it); outside it the backdrop stays untouched. It is tessellated when the layer is
@@ -279,13 +279,13 @@ module names a backend type.
 //!
 //! ```no_run
 //! # fn frame(ui: &mut egui::Ui, rect: egui::Rect) {
-//! use egui_filter_layers::{FilterLayer, Mask, presets};
+//! use egui_shader_layers::{ShaderLayer, Mask, presets};
 //! let lens = egui::Shape::circle_filled(rect.center(), 60.0, egui::Color32::WHITE);
-//! FilterLayer::new(rect, presets::gaussian_blur(8.0)).mask(Mask::Shape(lens)).paint(ui.painter());
+//! ShaderLayer::new(rect, presets::gaussian_blur(8.0)).mask(Mask::Shape(lens)).paint(ui.painter());
 //! # }
 //! ```
 //!
-//! **Regions.** One layer can run its chain differently per area: [`FilterLayer::regions`] (a
+//! **Regions.** One layer can run its chain differently per area: [`ShaderLayer::regions`] (a
 //! [`Mask::Regions`] of up to [`MAX_REGIONS`] [`Region`]s) masks by the union of the regions (no
 //! seam where they abut) and tells every pass which region a pixel belongs to: `region()` is the
 //! region's index, `region_at(uv)` the one at another point (a kernel that must not cross into a
@@ -299,13 +299,13 @@ module names a backend type.
 //!
 //! ```no_run
 //! # fn frame(ui: &mut egui::Ui, rect: egui::Rect) -> Result<(), Box<dyn std::error::Error>> {
-//! use egui_filter_layers::{Effect, FilterLayer, Pass, Region};
+//! use egui_shader_layers::{Effect, ShaderLayer, Pass, Region};
 //! let tint = Effect::new("tint", "struct Params { tint: array<vec4<f32>, 2> }
 //! fn effect(uv: vec2<f32>) -> vec4<f32> { return mix(src(uv), p.tint[min(region(), 1u)], 0.5); }")?;
 //! let mut pass = Pass::new(&tint);
 //! pass.set_slice("tint", &[[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]])?;
 //! let (left, right) = rect.split_left_right_at_fraction(0.5);
-//! FilterLayer::new(rect, pass).regions([Region::rounded_rect(left, 8), Region::rounded_rect(right, 8)]).paint(ui.painter());
+//! ShaderLayer::new(rect, pass).regions([Region::rounded_rect(left, 8), Region::rounded_rect(right, 8)]).paint(ui.painter());
 //! # Ok(()) }
 //! ```
 //!
@@ -325,9 +325,9 @@ module names a backend type.
 //!
 //! **Warning — wgpu draws the content under a filter twice.** egui-wgpu renders into a surface
 //! that cannot be read back mid-pass, so the wgpu backend re-renders everything beneath each
-//! filter layer (clipped to its padded rect) into an offscreen texture. The content under a
+//! shader layer (clipped to its padded rect) into an offscreen texture. The content under a
 //! filter is therefore **drawn twice** per frame on wgpu. Paint callbacks beneath a filter —
-//! including a lower filter layer — cannot be re-rendered and are left out of its backdrop.
+//! including a lower shader layer — cannot be re-rendered and are left out of its backdrop.
 // Backend items exist only with their feature: sentences linking to them are feature-gated so
 // the docs build with `-D warnings` under any feature set (docs.rs builds with all features).
 #![cfg_attr(feature = "wgpu", doc = "See [`install_wgpu`].")]
@@ -360,7 +360,7 @@ module names a backend type.
 #![warn(clippy::pedantic)]
 #![warn(clippy::undocumented_unsafe_blocks)]
 #![deny(missing_docs)]
-#![allow(clippy::module_name_repetitions)] // `FilterLayer` in `layer`, `EffectError` in `effect` read best as-is.
+#![allow(clippy::module_name_repetitions)] // `ShaderLayer` in `layer`, `EffectError` in `effect` read best as-is.
 // Without any backend feature the backend-facing internals (LayerJob fields, registry writers,
 // binding constants) have no reader by design; the crate still builds for validation-only use.
 #![cfg_attr(not(any(feature = "glow", feature = "wgpu")), allow(dead_code))]
@@ -394,7 +394,7 @@ mod hot;
 pub use backend::{BackendKind, BackendStatus, EffectFailure, InstallError, TextureError, TextureFailure, failed_effects, failed_textures, status};
 pub use effect::{Effect, EffectError, ParamError, ParamInfo, ParamType, ParamValue, SnippetLocation, TEXTURE_SLOTS};
 pub use impulses::{IMPULSE_COUNT_PARAM, IMPULSE_SLOTS, IMPULSES_PARAM, Impulse, ImpulsePack, Impulses};
-pub use layer::FilterLayer;
+pub use layer::ShaderLayer;
 pub use mask::{MAX_REGIONS, Mask, MaskError, REGION_NONE, Region};
 pub use pass::{FilterChain, MIN_PASS_SCALE, PARAM_SLOTS, ParamIndexError, Params, Pass};
 pub use presets::WaveObstacle;

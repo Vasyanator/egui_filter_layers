@@ -119,7 +119,7 @@ impl DragRect {
         }
     }
 
-    /// The outline and resize handle. Paint AFTER the filter layer so they stay crisp.
+    /// The outline and resize handle. Paint AFTER the shader layer so they stay crisp.
     pub fn paint_outline(&self, painter: &egui::Painter) {
         let stroke = Stroke::new(1.5, Color32::from_white_alpha(200));
         painter.rect_stroke(self.rect, CornerRadius::same(self.corner_radius), stroke, StrokeKind::Outside);

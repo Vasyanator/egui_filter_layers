@@ -97,7 +97,7 @@ impl Drop for TemporaryFile {
             && let Err(error) = std::fs::remove_file(&path)
             && error.kind() != ErrorKind::NotFound
         {
-            log::warn!("egui_filter_layers (video): could not delete the partial file `{}`: {error}", path.display());
+            log::warn!("egui_shader_layers (video): could not delete the partial file `{}`: {error}", path.display());
         }
     }
 }
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn temporary_files_keep_the_extension_and_detect_same_files() {
-        let dir = std::env::temp_dir().join(format!("egui_filter_layers_paths_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("egui_shader_layers_paths_{}", std::process::id()));
         assert!(std::fs::create_dir_all(&dir).is_ok());
         let output = dir.join("clip.final.mp4");
         let first = reserve_temporary(&output).unwrap_or_else(|error| panic!("{error}"));

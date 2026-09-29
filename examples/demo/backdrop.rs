@@ -2,7 +2,7 @@
 File: examples/demo/backdrop.rs
 
 Purpose:
-The busy content scenes paint BENEATH their filter layers: a gradient, stripes, moving circles,
+The busy content scenes paint BENEATH their shader layers: a gradient, stripes, moving circles,
 large text, a generated image, and a scroll area of real widgets. Shared by every scene so filters
 always have detail to act on.
 
@@ -77,7 +77,7 @@ impl Backdrop {
             let hue = f32::from(i) / 10.0;
             painter.circle_filled(center, 28.0 + f32::from(i) * 3.0, Color32::from(egui::ecolor::Hsva::new(hue, 0.8, 0.95, 1.0)));
         }
-        painter.text(area.left_top() + vec2(40.0, 40.0), egui::Align2::LEFT_TOP, "Filter layers", FontId::proportional(64.0), Color32::WHITE);
+        painter.text(area.left_top() + vec2(40.0, 40.0), egui::Align2::LEFT_TOP, "Shader layers", FontId::proportional(64.0), Color32::WHITE);
         painter.text(
             area.left_top() + vec2(44.0, 120.0),
             egui::Align2::LEFT_TOP,

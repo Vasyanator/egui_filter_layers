@@ -40,7 +40,7 @@ pub(crate) fn check_ffmpeg(program: &Path) -> Result<(), VideoError> {
         }
         Some(_) => Ok(()),
         None => {
-            log::debug!("egui_filter_layers (video): `{}` reports a non-release version ({first_line}); assuming it is recent", program.display());
+            log::debug!("egui_shader_layers (video): `{}` reports a non-release version ({first_line}); assuming it is recent", program.display());
             Ok(())
         }
     }

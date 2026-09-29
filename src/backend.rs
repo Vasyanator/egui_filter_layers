@@ -7,7 +7,7 @@ The crate-internal backend boundary and the per-`egui::Context` backend registry
 Key structures:
 - `Backend` (crate-internal trait): what a GPU backend must provide. Each backend module
   (`glow_backend`, and the `wgpu` backend) implements it; core code never names a backend type.
-- `LayerJob` (crate-internal): one `FilterLayer::paint` call, resolved for the backend (its mask
+- `LayerJob` (crate-internal): one `ShaderLayer::paint` call, resolved for the backend (its mask
   is a `mask::JobMask`: rounded-rect radii or the shape tessellated on the GUI thread).
 - `FrameInput` / `PointerInput` (crate-internal): the per-frame input a layer reads on the GUI
   thread (`fl.delta_time`, `fl.frame`, `fl.pointer`), resolved per capture by `FrameInput::resolve`.
@@ -22,7 +22,7 @@ Key functions:
 
 Notes:
 The registry is one `Arc<dyn Backend>` held by a hook-less egui plugin (`Registry`), so any code
-holding the `Context` (including `FilterLayer::paint`) can find it without app plumbing. A plugin
+holding the `Context` (including `ShaderLayer::paint`) can find it without app plumbing. A plugin
 lives in the `Context` itself, not in `Memory`, so resetting egui memory (a common "reset UI
 state" idiom) does not silently uninstall the backend.
 */
@@ -63,7 +63,7 @@ impl fmt::Display for BackendKind {
 #[non_exhaustive]
 pub enum BackendStatus {
     /// No backend is installed on this context (never installed, or removed by `destroy_glow`):
-    /// filter layers draw nothing extra.
+    /// shader layers draw nothing extra.
     NotInstalled,
     /// Installed; GPU resources are created on the first painted layer.
     Installed {
@@ -118,7 +118,7 @@ pub struct EffectFailure {
 }
 
 /// Why a layer's user textures cannot serve its effects. Checked before any GPU work:
-/// [`crate::FilterLayer::check_textures`] (what `FilterLayer::paint` runs; the layer is then
+/// [`crate::ShaderLayer::check_textures`] (what `ShaderLayer::paint` runs; the layer is then
 /// skipped and the error logged once per context) and the offline renderer
 /// (`OfflineError::Texture`).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -170,7 +170,7 @@ pub enum InstallError {
     },
 }
 
-/// One `FilterLayer::paint` call, resolved and handed to the backend.
+/// One `ShaderLayer::paint` call, resolved and handed to the backend.
 #[derive(Clone, Debug)]
 pub(crate) struct LayerJob {
     /// The layer's rect in points (painter space, before layer transforms).
@@ -185,14 +185,14 @@ pub(crate) struct LayerJob {
     pub time: f32,
     /// Per-frame input read at paint time (`fl.delta_time`, `fl.frame`, `fl.pointer`).
     pub frame_input: FrameInput,
-    /// The user texture attached at each slot (`FilterLayer::texture`); every slot an effect of
+    /// The user texture attached at each slot (`ShaderLayer::texture`); every slot an effect of
     /// `passes` reads is `Some` (checked by `plan::check_textures` before the job is built).
     pub textures: [Option<TextureId>; TEXTURE_SLOTS],
-    /// `FilterLayer::id`; `Some` whenever a pass is a state pass (checked before the job is built).
+    /// `ShaderLayer::id`; `Some` whenever a pass is a state pass (checked before the job is built).
     pub id: Option<Id>,
     /// The viewport whose pass painted the layer (states are kept per viewport and id).
     pub viewport: ViewportId,
-    /// `FilterLayer::state`.
+    /// `ShaderLayer::state`.
     pub state: StateOptions,
     /// The pending `reset_state` request for `id`, if any. The backend claims it only where the
     /// state registry starts this layer's run ([`LayerJob::claim_reset`]); a paint that returns
@@ -225,7 +225,7 @@ pub(crate) struct PointerInput {
     pub pressed: bool,
 }
 
-/// The per-frame input of one layer, captured on the GUI thread (`FilterLayer::paint`) and
+/// The per-frame input of one layer, captured on the GUI thread (`ShaderLayer::paint`) and
 /// resolved against the capture at paint time (`resolve`). Per context, not per layer: every
 /// layer painted in one frame sees the same values. `Default` = no input (0 s, frame 0, no pointer).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -271,7 +271,7 @@ pub(crate) trait Backend: Send + Sync + 'static {
     fn failed_states(&self) -> Vec<StateFailure>;
     /// How many layer states the backend holds (F7, a debug accessor).
     fn state_count(&self) -> usize;
-    /// Paints one filter layer. Must never panic; failures are latched and logged.
+    /// Paints one shader layer. Must never panic; failures are latched and logged.
     fn paint_layer(&self, painter: &Painter, job: LayerJob);
     /// Downcasting hook for backend-specific teardown (e.g. `destroy_glow`).
     #[cfg_attr(not(feature = "glow"), allow(dead_code))] // Only `destroy_glow` downcasts; wgpu needs no teardown.
@@ -289,7 +289,7 @@ struct Registry {
 
 impl egui::plugin::Plugin for Registry {
     fn debug_name(&self) -> &'static str {
-        "egui_filter_layers::registry"
+        "egui_shader_layers::registry"
     }
 }
 
@@ -301,9 +301,9 @@ pub(crate) fn register(ctx: &Context, backend: Arc<dyn Backend>) {
     let kind = backend.kind();
     let previous = ctx.plugin_or_default::<Registry>().lock().backend.replace(backend);
     if let Some(previous) = previous {
-        log::info!("egui_filter_layers: replaced the installed {} backend with a {kind} backend", previous.kind());
+        log::info!("egui_shader_layers: replaced the installed {} backend with a {kind} backend", previous.kind());
     } else {
-        log::info!("egui_filter_layers: {kind} backend installed");
+        log::info!("egui_shader_layers: {kind} backend installed");
     }
 }
 
@@ -320,7 +320,7 @@ pub(crate) fn uninstall(ctx: &Context) -> Option<Arc<dyn Backend>> {
 
 /// The status of the filter backend installed on `ctx`.
 ///
-/// Show it in a debug overlay or settings page: filter layers never panic, so a context whose
+/// Show it in a debug overlay or settings page: shader layers never panic, so a context whose
 /// backend failed (or was never installed) simply renders unfiltered, and this is where to see why.
 #[must_use]
 pub fn status(ctx: &Context) -> BackendStatus {
@@ -334,7 +334,7 @@ pub fn failed_effects(ctx: &Context) -> Vec<EffectFailure> {
     installed(ctx).map_or_else(Vec::new, |backend| backend.failed_effects())
 }
 
-/// Attached user textures (`FilterLayer::texture`) the installed backend could not resolve when
+/// Attached user textures (`ShaderLayer::texture`) the installed backend could not resolve when
 /// painting (freed or foreign `TextureId`s); layers using them draw nothing extra. Each is also
 /// logged once at `error` level. Empty when none failed or none installed.
 #[must_use]

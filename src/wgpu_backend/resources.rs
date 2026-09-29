@@ -44,7 +44,7 @@ pub(super) const CAPTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba
 pub(super) const CAPTURE_SRGB_VIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 
-/// Everything ONE filter layer of the current frame renders into and draws from.
+/// Everything ONE shader layer of the current frame renders into and draws from.
 #[derive(Debug)]
 pub(super) struct LayerTargets {
     /// The re-rendered backdrop (8-bit gamma); the chain's source.
@@ -67,9 +67,9 @@ impl LayerTargets {
         Self {
             capture: None,
             chain: ChainTargets::new(),
-            mesh_locals: GrowBuffer::new(wgpu::BufferUsages::UNIFORM, "egui_filter_layers mesh locals"),
-            vertices: GrowBuffer::new(wgpu::BufferUsages::VERTEX, "egui_filter_layers vertices"),
-            indices: GrowBuffer::new(wgpu::BufferUsages::INDEX, "egui_filter_layers indices"),
+            mesh_locals: GrowBuffer::new(wgpu::BufferUsages::UNIFORM, "egui_shader_layers mesh locals"),
+            vertices: GrowBuffer::new(wgpu::BufferUsages::VERTEX, "egui_shader_layers vertices"),
+            indices: GrowBuffer::new(wgpu::BufferUsages::INDEX, "egui_shader_layers indices"),
             composite: None,
         }
     }
@@ -130,7 +130,7 @@ impl WgpuResources {
         // failure latches the backend instead of retrying), so no latch is needed.
         if target_format.is_srgb() && !srgb_capture {
             log::warn!(
-                "egui_filter_layers (wgpu): the {target_format:?} target is sRGB but this device cannot reinterpret texture formats \
+                "egui_shader_layers (wgpu): the {target_format:?} target is sRGB but this device cannot reinterpret texture formats \
                  (no DownlevelFlags::VIEW_FORMATS; GL / WebGL2). Effect: the backdrop under filters is re-rendered with gamma-space \
                  blending, so semi-transparent edges under a filter visibly differ from the unfiltered screen (about 25 8-bit \
                  steps measured for 50% white over dark grey). Fix: prefer an Rgba8Unorm / Bgra8Unorm surface (egui-wgpu's own \
@@ -144,14 +144,14 @@ impl WgpuResources {
             // Identical descriptor to egui-wgpu's `egui_texture_bind_group_layout`: wgpu-core
             // deduplicates equal layouts and WebGPU treats them as group-equivalent, so egui's
             // own per-texture bind groups can be bound to this pipeline unchanged.
-            let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_filter_layers egui texture"), entries: &egui_texture_entries() });
+            let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("egui_shader_layers egui texture"), entries: &egui_texture_entries() });
             let mesh_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("egui_filter_layers mesh"),
+                label: Some("egui_shader_layers mesh"),
                 bind_group_layouts: &[Some(&mesh_locals_layout), Some(&texture_layout)],
                 immediate_size: 0,
             });
-            let mesh_shader = shader(device, "egui_filter_layers mesh", MESH_WGSL);
-            let mesh_pipeline = mesh_pipeline(device, &mesh_pipeline_layout, &mesh_shader, mesh_format, mesh_entry, Some(EGUI_BLEND), "egui_filter_layers mesh");
+            let mesh_shader = shader(device, "egui_shader_layers mesh", MESH_WGSL);
+            let mesh_pipeline = mesh_pipeline(device, &mesh_pipeline_layout, &mesh_shader, mesh_format, mesh_entry, Some(EGUI_BLEND), "egui_shader_layers mesh");
             (mesh_locals_layout, mesh_pipeline)
         })?;
 

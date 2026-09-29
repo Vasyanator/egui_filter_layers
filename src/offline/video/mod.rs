@@ -50,9 +50,9 @@ with the frame clock at the start of every stream.
 //!
 //! ```no_run
 //! # #[cfg(not(target_arch = "wasm32"))]
-//! # fn main() -> Result<(), egui_filter_layers::offline::video::VideoError> {
-//! use egui_filter_layers::{OfflineOptions, OfflineRenderer, presets};
-//! use egui_filter_layers::offline::video::{VideoProcessor, ffmpeg::{FfmpegTranscode, VideoCodec}};
+//! # fn main() -> Result<(), egui_shader_layers::offline::video::VideoError> {
+//! use egui_shader_layers::{OfflineOptions, OfflineRenderer, presets};
+//! use egui_shader_layers::offline::video::{VideoProcessor, ffmpeg::{FfmpegTranscode, VideoCodec}};
 //!
 //! let renderer = OfflineRenderer::headless()?;
 //! let chain = presets::ripple(6.0, 40.0, 0.5).into(); // animated through `fl.time`
@@ -340,7 +340,7 @@ where
     K: VideoSink + ?Sized,
 {
     let info = source.info().clone();
-    log::info!("egui_filter_layers (video): processing {}x{} at {} fps ({} frames expected)", info.width(), info.height(), info.frame_rate(), info.frame_count().map_or_else(|| "unknown".to_owned(), |count| count.to_string()));
+    log::info!("egui_shader_layers (video): processing {}x{} at {} fps ({} frames expected)", info.width(), info.height(), info.frame_rate(), info.frame_count().map_or_else(|| "unknown".to_owned(), |count| count.to_string()));
     sink.begin(&info)?;
     // A stream starts at `fl.frame = 0` and a zero state, whatever the processor ran before.
     processor.reset_frame_clock();
@@ -348,11 +348,11 @@ where
     match frame_loop(processor, source, sink, &info, progress, block).await {
         Ok(frames) => {
             sink.finish()?;
-            log::info!("egui_filter_layers (video): wrote {frames} frames");
+            log::info!("egui_shader_layers (video): wrote {frames} frames");
             Ok(frames)
         }
         Err(error) => {
-            log::warn!("egui_filter_layers (video): stopped: {error}");
+            log::warn!("egui_shader_layers (video): stopped: {error}");
             sink.abort();
             Err(error)
         }

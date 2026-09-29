@@ -2,7 +2,7 @@
 File: examples/demo/scenes/hot.rs
 
 Purpose:
-Scene "hot": a filter layer whose effect follows `examples/demo/scenes/hot.wgsl` on disk through
+Scene "hot": a shader layer whose effect follows `examples/demo/scenes/hot.wgsl` on disk through
 `HotEffect` (feature `hot-reload`), with an in-app WGSL editor that saves to that file, compile
 errors shown on the layer and in the side panel, and the named-parameter editor whose values
 survive reloads (`rebind`).
@@ -28,7 +28,7 @@ Notes:
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, FontId, Key, KeyboardShortcut, Modifiers, Rect, Stroke, StrokeKind, UiBuilder, pos2, vec2};
-use egui_filter_layers::{Effect, FilterLayer, HotEffect, HotOptions, HotReloadError, HotReloadEvent, ParamType, Pass, rebind};
+use egui_shader_layers::{Effect, ShaderLayer, HotEffect, HotOptions, HotReloadError, HotReloadEvent, ParamType, Pass, rebind};
 
 use super::{DragRect, Scene, SceneEntry, SceneFrame, SceneInit, record_rect};
 use crate::backdrop::CircleMotion;
@@ -341,7 +341,7 @@ impl Scene for HotScene {
             self.rect.interact(ui, "hot-filter");
         }
         if let Some(pass) = &self.pass {
-            FilterLayer::new(self.rect.rect, pass.clone()).corner_radius(self.rect.corner_radius).paint(&painter);
+            ShaderLayer::new(self.rect.rect, pass.clone()).corner_radius(self.rect.corner_radius).paint(&painter);
         }
         self.paint_overlay(&painter);
         self.rect.paint_outline(&painter);

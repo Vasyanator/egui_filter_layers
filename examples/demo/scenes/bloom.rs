@@ -28,7 +28,7 @@ use std::collections::VecDeque;
 use std::f32::consts::TAU;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, pos2, vec2};
-use egui_filter_layers::{Effect, EffectError, FilterChain, FilterLayer, Pass, presets};
+use egui_shader_layers::{Effect, EffectError, FilterChain, ShaderLayer, Pass, presets};
 
 use super::{DragRect, Scene, SceneEntry, SceneFrame, SceneInit};
 
@@ -211,7 +211,7 @@ impl Scene for BloomScene {
         let rect = *rect;
         // A chain error is shown in the side panel (and a compile error logged once at build).
         if let Ok(chain) = self.chain() {
-            FilterLayer::new(rect.rect, chain).corner_radius(rect.corner_radius).paint(&painter);
+            ShaderLayer::new(rect.rect, chain).corner_radius(rect.corner_radius).paint(&painter);
         }
         rect.paint_outline(&painter);
     }

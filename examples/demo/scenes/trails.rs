@@ -20,7 +20,7 @@ seamless loop, since the first frame starts without a trace.
 */
 
 use eframe::egui::{self, Color32, Id, Pos2, Rect, Vec2, vec2};
-use egui_filter_layers::{FilterLayer, presets, reset_state};
+use egui_shader_layers::{ShaderLayer, presets, reset_state};
 
 use super::{DragRect, Scene, SceneEntry, SceneFrame, SceneInit};
 use crate::backdrop::CircleMotion;
@@ -104,7 +104,7 @@ impl Scene for TrailsScene {
 
         // The circles and the comet move every frame; the trace only fades on painted frames.
         ui.ctx().request_repaint();
-        FilterLayer::new(rect.rect, presets::trails(self.decay)).id(trails_id()).corner_radius(rect.corner_radius).paint(&painter);
+        ShaderLayer::new(rect.rect, presets::trails(self.decay)).id(trails_id()).corner_radius(rect.corner_radius).paint(&painter);
         rect.paint_outline(&painter);
     }
 }

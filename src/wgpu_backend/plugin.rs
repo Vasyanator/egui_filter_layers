@@ -2,15 +2,15 @@
 File: wgpu_backend/plugin.rs
 
 Purpose:
-The egui `Plugin` that, at the end of every pass, turns each pending filter layer into a
+The egui `Plugin` that, at the end of every pass, turns each pending shader layer into a
 `BeneathPlan`: the tessellated content painted beneath it plus egui-wgpu's bind groups for the
 textures that content samples.
 
 Key structures:
-- `FilterLayersPlugin`: registered once per `egui::Context` by `install_wgpu`.
+- `ShaderLayersPlugin`: registered once per `egui::Context` by `install_wgpu`.
 
 Key functions:
-- `FilterLayersPlugin::output_hook()`: runs after egui flattened the pass's shapes.
+- `ShaderLayersPlugin::output_hook()`: runs after egui flattened the pass's shapes.
 
 Notes:
 `output_hook` (egui `Context::end_pass` -> `on_output`) sees `FullOutput::shapes`, which is
@@ -46,13 +46,13 @@ use super::textures::{primitive_textures, resolve_user_textures, snapshot_textur
 use super::{BeneathPlan, LoggedOnce, Pending, Shared};
 use crate::geometry::transform_scale;
 
-/// Collects the beneath content of every pending filter layer at the end of each egui pass.
-pub(crate) struct FilterLayersPlugin {
+/// Collects the beneath content of every pending shader layer at the end of each egui pass.
+pub(crate) struct ShaderLayersPlugin {
     /// The state of the current install (replaced when `install_wgpu` is called again).
     shared: Arc<Shared>,
 }
 
-impl FilterLayersPlugin {
+impl ShaderLayersPlugin {
     /// A plugin serving `shared`.
     pub(super) fn new(shared: Arc<Shared>) -> Self {
         Self { shared }
@@ -64,9 +64,9 @@ impl FilterLayersPlugin {
     }
 }
 
-impl egui::Plugin for FilterLayersPlugin {
+impl egui::Plugin for ShaderLayersPlugin {
     fn debug_name(&self) -> &'static str {
-        "egui_filter_layers"
+        "egui_shader_layers"
     }
 
     fn output_hook(&mut self, ctx: &egui::Context, output: &mut FullOutput) {
@@ -145,8 +145,8 @@ fn plan_layer(ctx: &egui::Context, shared: &Shared, shapes: &[egui::epaint::Clip
     let skipped = selection.skipped_callbacks + strip_callbacks(&mut primitives);
     if skipped > 0 && LoggedOnce::first(&shared.logged.skipped_callbacks) {
         log::debug!(
-            "egui_filter_layers (wgpu): {skipped} paint callback(s) lie beneath a filter layer and are left out of its backdrop \
-             (callbacks cannot be re-rendered offscreen; a lower filter layer is seen unfiltered). Logged once."
+            "egui_shader_layers (wgpu): {skipped} paint callback(s) lie beneath a shader layer and are left out of its backdrop \
+             (callbacks cannot be re-rendered offscreen; a lower shader layer is seen unfiltered). Logged once."
         );
     }
 

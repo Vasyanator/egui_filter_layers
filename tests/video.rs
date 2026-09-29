@@ -25,9 +25,9 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use egui_filter_layers::offline::video::ffmpeg::{AudioMode, FfmpegSink, FfmpegSource, FfmpegTranscode, VideoCodec};
-use egui_filter_layers::offline::video::{FrameRate, VideoError, VideoInfo, VideoProcessor, VideoSink, VideoSource, process_video};
-use egui_filter_layers::{AlphaMode, Effect, FilterChain, FrameRef, OfflineOptions, OfflineRenderer, Pass, presets};
+use egui_shader_layers::offline::video::ffmpeg::{AudioMode, FfmpegSink, FfmpegSource, FfmpegTranscode, VideoCodec};
+use egui_shader_layers::offline::video::{FrameRate, VideoError, VideoInfo, VideoProcessor, VideoSink, VideoSource, process_video};
+use egui_shader_layers::{AlphaMode, Effect, FilterChain, FrameRef, OfflineOptions, OfflineRenderer, Pass, presets};
 
 const WIDTH: u32 = 48;
 const HEIGHT: u32 = 32;
@@ -226,7 +226,7 @@ fn a_stateful_chain_carries_its_state_from_frame_to_frame() {
 
 /// A fresh scratch directory for one test.
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("egui_filter_layers_video_{name}_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("egui_shader_layers_video_{name}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("{error}"));
     dir
 }

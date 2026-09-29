@@ -132,7 +132,7 @@ impl ImageSequenceSource {
             .with_frame_count(frames)
             .with_duration(frames.map(|frames| frame_rate.frame_time(frames)))
             .with_alpha(has_alpha);
-        log::info!("egui_filter_layers (video): image sequence {} ({count} frames from {start}, {}x{})", dir.join(pattern.name(start)).display(), first.width(), first.height());
+        log::info!("egui_shader_layers (video): image sequence {} ({count} frames from {start}, {}x{})", dir.join(pattern.name(start)).display(), first.width(), first.height());
         Ok(Self { dir, pattern, start, next: 0, info })
     }
 }
@@ -248,7 +248,7 @@ impl VideoSink for ImageSequenceSink {
         if self.info.take().is_none() {
             return Err(VideoError::InvalidState("`finish` was called before `begin`"));
         }
-        log::info!("egui_filter_layers (video): wrote {} images to {}", self.frames, self.dir.display());
+        log::info!("egui_shader_layers (video): wrote {} images to {}", self.frames, self.dir.display());
         Ok(())
     }
 
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn a_sequence_round_trips_through_the_folder() {
-        let dir = std::env::temp_dir().join(format!("egui_filter_layers_sequence_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("egui_shader_layers_sequence_{}", std::process::id()));
         let rate = FrameRate::new(10, 1).unwrap_or_else(|error| panic!("{error}"));
         let info = VideoInfo::new(3, 2, rate);
         let frames: Vec<Vec<u8>> = (0..3_u8).map(|index| (0..24).map(|byte: u8| if byte % 4 == 3 { 255 } else { byte.wrapping_mul(7).wrapping_add(index * 40) }).collect()).collect();

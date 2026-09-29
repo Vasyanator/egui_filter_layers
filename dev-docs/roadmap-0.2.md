@@ -1,4 +1,4 @@
-# egui_filter_layers 0.2 — design and roadmap
+# egui_shader_layers 0.2 — design and roadmap
 
 Baseline: 0.1.0 (commit 1e1908b). Versions verified in the registry: egui / egui-wgpu / egui_glow
 0.36.2, wgpu 30.0.1, naga 30.0.1. Breaking changes are allowed (0.x) and are listed in §10.
@@ -112,12 +112,12 @@ detector; F3's helper requests repaints explicitly).
 
 ### 1.3 Per-layer persistent identity (F7 only)
 
-`FilterLayer::id(egui::Id)` (public). Only chains containing a state pass need it: without an
+`ShaderLayer::id(egui::Id)` (public). Only chains containing a state pass need it: without an
 id such a layer is skipped and an error is logged once per context (`layer.rs` latch pattern,
 `layer.rs:22-42`), and `status()` is unaffected (it is a per-layer misuse, not a backend fault).
 F2 needs no identity: `delta_time` = `input.stable_dt` clamped to `0..=0.1` s, `frame` =
 `ctx.cumulative_frame_nr()` (u64 → u32 wrapping, documented) — both read in
-`FilterLayer::paint` next to `time` (`layer.rs:126`) and carried in `LayerJob`.
+`ShaderLayer::paint` next to `time` (`layer.rs:126`) and carried in `LayerJob`.
 
 ### 1.4 New/changed core types
 
@@ -146,7 +146,7 @@ F2 needs no identity: `delta_time` = `input.stable_dt` clamped to `0..=0.1` s, `
 ## 3. F2 — `delta_time`, `frame`, pointer (S)
 
 - Values: §1.3. Pointer: `input.pointer.latest_pos()` (screen points) and `primary_down()`
-  (`egui-0.36.2/src/input_state/mod.rs:1310,1539`) read in `FilterLayer::paint`; the backend
+  (`egui-0.36.2/src/input_state/mod.rs:1310,1539`) read in `ShaderLayer::paint`; the backend
   converts screen points → capture uv (`(p * ppp - capture.xy) / size_px`; no layer transform
   needed since the capture is in screen pixels). `w = 0` when there is no pointer.
 - Offline: `OfflineOptions::with_delta_time(f32)` (default 0), `with_frame(u32)` (default 0),
@@ -223,7 +223,7 @@ block; prefer named".
 
 ## 6. F8 — user textures (M)
 
-- API: `FilterLayer::texture(slot: usize /*0..3*/, id: egui::TextureId)`; prelude
+- API: `ShaderLayer::texture(slot: usize /*0..3*/, id: egui::TextureId)`; prelude
   `fl_user0/1/2` + their samplers, helpers `tex(i, uv)` (own sampler = the texture's egui
   `TextureOptions`), `tex_linear(i, uv)` / `tex_nearest(i, uv)` (crate samplers, group 0). `uv`
   is the texture's own 0..1. An effect that reads slot `i` with no texture bound → the layer is
@@ -282,7 +282,7 @@ Contract:
   in the chain (or last frame's if none precedes). A chain may hold any number of state steps in
   any positions; N consecutive copies of one state pass = N substeps (`fl.pass_index` = 0..N-1;
   the effect divides `delta_time` by the substep count it is told via a named param).
-- `FilterLayer::id(id)` required (§1.3). `FilterLayer::state(StateOptions { scale: f32 /*0..1,
+- `ShaderLayer::id(id)` required (§1.3). `ShaderLayer::state(StateOptions { scale: f32 /*0..1,
   default 1*/, format: StateFormat::Rgba16Float | Rgba8Unorm /*explicit opt-in for packed 8-bit
   effects*/ })`. State size = `ceil(capture * scale)`.
 - Format policy: `Rgba16Float` must be renderable + filterable on the device (wgpu:
@@ -296,7 +296,7 @@ Contract:
   frame's used size, the WRITE uses the new one — so a resized layer reads a stretched previous
   state for free (no copy) and never resets on the ±1 px jitter of a dragged rect. A moved rect
   keeps its uv-relative state (documented: state is in layer uv, not screen space).
-- Reset / eviction: `egui_filter_layers::reset_state(ctx, id)` sets a flag consumed at the next
+- Reset / eviction: `egui_shader_layers::reset_state(ctx, id)` sets a flag consumed at the next
   paint (clears both state textures to 0). A state not painted for 120 frames or 2 s (whichever
   first, checked per paint) is freed; `destroy_glow` frees all. `status()` gains nothing;
   `state_count(ctx)` is a debug accessor.
@@ -326,10 +326,10 @@ Contract:
 
 ## 9. F9 — arbitrary-shape mask (M)
 
-- API: `FilterLayer::mask(Mask)`, `enum Mask { RoundedRect(CornerRadius) /*default*/,
+- API: `ShaderLayer::mask(Mask)`, `enum Mask { RoundedRect(CornerRadius) /*default*/,
   Shape(egui::Shape) /*in layer points; Path, Circle, Text galleys, Mesh…*/ }`; `corner_radius`
   stays as the shorthand.
-- Coverage rasterization (backend-neutral input): `FilterLayer::paint` tessellates the shape
+- Coverage rasterization (backend-neutral input): `ShaderLayer::paint` tessellates the shape
   with `ctx.tessellate(vec![ClippedShape{clip: rect, shape}], ppp)` (`egui-0.36.2/src/
   context.rs:2859`) into `Vec<ClippedPrimitive>` stored in `LayerJob.mask` — meshes whose vertex
   colour alpha × texture alpha IS the coverage (egui's feathering gives the AA edge). Text
@@ -475,7 +475,7 @@ UI. The demo requires both backend features as today.
 
 ## 16. Owner decisions (fixed for 0.2)
 - (a) Anonymous `params(i)` stays beside named params; presets are not migrated.
-- (b) `FilterLayer::id` is mandatory for stateful chains; a stateful chain without an id is refused with a reason.
+- (b) `ShaderLayer::id` is mandatory for stateful chains; a stateful chain without an id is refused with a reason.
 - (c) 3 user-texture slots on every backend (WebGL2 `max_bind_groups = 4`).
 - (d) Hot reload polls file mtimes on a std thread; no new dependency.
 - (e) One directory demo (`examples/demo/`) with a scene selector.
@@ -484,19 +484,19 @@ UI. The demo requires both backend features as today.
 Each phase is marked done here in the same commit that lands it.
 - Phase 1 (plan.rs single owner, full `@group(0)` layout with dummies, 416-byte `FlUniforms`, prelude-name interface check, `ModuleKind` removed): done.
 - Phase 2a (F1 `original(uv)` in every pass: prelude helper, the plan binds the capture as every draw's original with its own `aux` mapping; GPU tests UI + offline incl. tiles): done.
-- Phase 2b (F2: `LayerJob::frame_input` read in `FilterLayer::paint`; `geometry::pointer_uniform` the one pointer -> capture-uv conversion, resolved per paint callback on both backends; `pass::InputUniforms` + `FrameUniforms::with_input`; `OfflineOptions::with_delta_time` / `with_frame` / `with_pointer` + `PointerState` in `offline/options.rs`; `VideoProcessor` frame clock, explicit options win; not animation triggers): done.
+- Phase 2b (F2: `LayerJob::frame_input` read in `ShaderLayer::paint`; `geometry::pointer_uniform` the one pointer -> capture-uv conversion, resolved per paint callback on both backends; `pass::InputUniforms` + `FrameUniforms::with_input`; `OfflineOptions::with_delta_time` / `with_frame` / `with_pointer` + `PointerState` in `offline/options.rs`; `VideoProcessor` frame clock, explicit options win; not animation triggers): done.
 - Phase 2c (F4 named parameters: `struct Params` detected by a pre-parse token scan, crate tail `@group(0) @binding(4) var<uniform> p: Params;`, `ParamLayout` = naga offsets (= std140), unsupported members / arrays with a non-16 stride / > 16 KiB rejected as located `EffectError::Interface`; `Effect::params()` / `param()`, `Pass::set` / `with` / `set_slice` / `get` / `get_slice`, `ParamError`; `plan::params_block` owns binding 4's bytes; wgpu `[fl_i, p_i]` at offset alignment, glow second UBO at binding point 1; `effect.rs` split into `src/effect/`): done.
 - Phase 3b (F6: `Pass::with_scale` clamped to `[MIN_PASS_SCALE = 1/1024, 1]`, non-finite = 1; `plan.rs` owns per-step `Content` (resolution + window), viewports `scaled_px = ceil(capture * s)` (f32 rounding error removed), the pool size `target_px`, per-step `src_texel` / `frag_texel` / `pass_scale`; the composite upsamples a scaled last output; `internal_src_texel` added to `FlUniforms` (432 bytes); prelude `src_texel()` / `out_texel()`, `src_px` in input pixels; both backends size targets and viewports from the plan; offline `OfflineError::NotTileable` when a scaled chain would need tiles; presets `kawase_blur(radius)` (dual-Kawase pyramid, up to 8 levels) and `bloom(threshold, intensity, radius)`; GPU tests wgpu + glow + offline, UI == offline bit for bit for scaled chains): done.
 - Phase 3a (F3 `Impulses` in `src/impulses.rs` + `presets::click_ripples`: layer-rect uv, oldest-first drop at 16 / `with_capacity`, `pack` / `apply` into named params `impulses` / `impulse_count`, `request_repaint_if_alive` the only `Context` use; compact-support wave packet clamped to `|amplitude|` = sample radius; GPU tests wgpu + glow): done.
 - Phase 6 (F5 hot reload, feature `hot-reload`, `src/hot.rs`: `HotEffect::watch` / `watch_with` + `HotOptions` (interval, repaint `Context`, set-up closure), `poll` -> `HotReloadEvent`, `current` / `error` / `status_text`, `HotReloadError` (missing / io / compile with diagnostic / spawn / stopped), free fn `rebind(&Pass, &Effect) -> Rebound`; not compiled on wasm32): done.
-- Phase 3c (F8 user textures: `FilterLayer::texture(slot, TextureId)` / `texture_at` / `check_textures`, `TEXTURE_SLOTS` = 3; prelude `tex(i, uv)` (the texture's own sampler = its egui `TextureOptions`), `tex_size(i)`, `tex_load(i, px)` (`textureLoad`); `fl_user0..2` + samplers at `@group(1..=3)` = egui-wgpu's texture layout; binding 7 (`fl_nearest_sampler`) removed; `Effect::reads_texture` from an IR scan (constant slot = that slot, computed = all); `plan::check_textures` refuses a layer / offline run reading an unattached slot (`TextureError`, logged once per context in the UI); `plan::Bindings::user`; wgpu binds egui's own bind group per slot (kept copies for full uploads not yet applied), dummy groups elsewhere, composites group 0 only; glow units 4..6 from `Painter::texture`; unresolvable ids skip the layer and are reported by `failed_textures()` (`TextureFailure`, latched per id); offline `OfflineTexture` (`new` / `from_color_image`) + `OfflineOptions::with_texture`, uploaded once per texture identity, `OfflineError::Texture` / `TextureTooLarge`; glow params UBO grow-only + `glBufferSubData`; GPU tests wgpu + glow + offline (UI == offline bit for bit, tiled == whole), glow scenes for `original()` in later passes and `fl.pointer` / `delta_time` / `frame`): done.
-- Phase 4 (F7 persistent state: `Effect::new_state` / `is_state`; `FilterLayer::id` (required, `StateError::MissingId` via `check_state`) / `state(StateOptions)`; `StateFormat` RGBA16F (renderable + filterable or refused: `failed_states` / `StateFailure`, offline `OfflineError::State`) / opt-in RGBA8; `reset_state(ctx, id)`, `state_count(ctx)`; `src/state.rs` (`StateRegistry`: per `(ViewportId, Id)`, one step per frame, eviction after > 120 frames AND > 2 s); `plan.rs` state steps (`StepKind`, `Slot::StateA/B`, `StatePlanInput` / `StatePlan`: clear, sizes, final slot); prelude `state` / `state_load` / `state_px` / `state_size` / `state_texel`, `fl.pass_index` documented; `FlUniforms` 448 B; wgpu `WgpuResources::states` + `Target::ensure_kept` + pipelines keyed by format; glow `GlowState::states` + `RenderTarget::ensure_kept`; offline state carried across runs, `reset_state`, `with_state`, `NotTileable`; `VideoProcessor::reset_state`, per-stream reset; `HotOptions::with_state`; presets `trails`, `wave_sim` + `wave_display` + `WaveObstacle`; GPU tests wgpu (Vulkan + GL) / glow / offline / video): done.
-- Phase 5 (F9 shape masks: public `Mask` (`RoundedRect` default / `Shape`), `MaskError`, `FilterLayer::mask` / `layer_mask` / `check_mask` (`corner_radius` = shorthand), `OfflineOptions::with_mask`, `OfflineError::Mask`; `src/mask.rs` (`tessellate`, `JobMask`, `CoverageMeshes::pack` -> `PackedCoverage`); `LayerJob::mask`; `geometry::mask_transform` (layer points -> capture pixels through the layer transform); `plan.rs` `Slot::Coverage`, `CoverageStep`, `ChainPlan::with_coverage`, `COVERAGE_MASK_FLAG` (`params[3].x`), `mesh_locals` / `coverage_locals`, `Allocations::coverage`; `composite.wgsl` `fl_coverage` selects SDF / coverage alpha (snap kept); `mesh.wgsl` moved to `src/shaders/`; wgpu `coverage.rs` (shared mesh pipeline, rasterizer used by `chain::record`, UI and offline); glow `coverage.rs` + `glsl::translate_mesh` (naga translation, no hand-written GLSL); GPU tests wgpu (Vulkan + GL) / glow (incl. 4x MSAA) / offline (UI equivalence, tiled == whole, refusals)): done.
+- Phase 3c (F8 user textures: `ShaderLayer::texture(slot, TextureId)` / `texture_at` / `check_textures`, `TEXTURE_SLOTS` = 3; prelude `tex(i, uv)` (the texture's own sampler = its egui `TextureOptions`), `tex_size(i)`, `tex_load(i, px)` (`textureLoad`); `fl_user0..2` + samplers at `@group(1..=3)` = egui-wgpu's texture layout; binding 7 (`fl_nearest_sampler`) removed; `Effect::reads_texture` from an IR scan (constant slot = that slot, computed = all); `plan::check_textures` refuses a layer / offline run reading an unattached slot (`TextureError`, logged once per context in the UI); `plan::Bindings::user`; wgpu binds egui's own bind group per slot (kept copies for full uploads not yet applied), dummy groups elsewhere, composites group 0 only; glow units 4..6 from `Painter::texture`; unresolvable ids skip the layer and are reported by `failed_textures()` (`TextureFailure`, latched per id); offline `OfflineTexture` (`new` / `from_color_image`) + `OfflineOptions::with_texture`, uploaded once per texture identity, `OfflineError::Texture` / `TextureTooLarge`; glow params UBO grow-only + `glBufferSubData`; GPU tests wgpu + glow + offline (UI == offline bit for bit, tiled == whole), glow scenes for `original()` in later passes and `fl.pointer` / `delta_time` / `frame`): done.
+- Phase 4 (F7 persistent state: `Effect::new_state` / `is_state`; `ShaderLayer::id` (required, `StateError::MissingId` via `check_state`) / `state(StateOptions)`; `StateFormat` RGBA16F (renderable + filterable or refused: `failed_states` / `StateFailure`, offline `OfflineError::State`) / opt-in RGBA8; `reset_state(ctx, id)`, `state_count(ctx)`; `src/state.rs` (`StateRegistry`: per `(ViewportId, Id)`, one step per frame, eviction after > 120 frames AND > 2 s); `plan.rs` state steps (`StepKind`, `Slot::StateA/B`, `StatePlanInput` / `StatePlan`: clear, sizes, final slot); prelude `state` / `state_load` / `state_px` / `state_size` / `state_texel`, `fl.pass_index` documented; `FlUniforms` 448 B; wgpu `WgpuResources::states` + `Target::ensure_kept` + pipelines keyed by format; glow `GlowState::states` + `RenderTarget::ensure_kept`; offline state carried across runs, `reset_state`, `with_state`, `NotTileable`; `VideoProcessor::reset_state`, per-stream reset; `HotOptions::with_state`; presets `trails`, `wave_sim` + `wave_display` + `WaveObstacle`; GPU tests wgpu (Vulkan + GL) / glow / offline / video): done.
+- Phase 5 (F9 shape masks: public `Mask` (`RoundedRect` default / `Shape`), `MaskError`, `ShaderLayer::mask` / `layer_mask` / `check_mask` (`corner_radius` = shorthand), `OfflineOptions::with_mask`, `OfflineError::Mask`; `src/mask.rs` (`tessellate`, `JobMask`, `CoverageMeshes::pack` -> `PackedCoverage`); `LayerJob::mask`; `geometry::mask_transform` (layer points -> capture pixels through the layer transform); `plan.rs` `Slot::Coverage`, `CoverageStep`, `ChainPlan::with_coverage`, `COVERAGE_MASK_FLAG` (`params[3].x`), `mesh_locals` / `coverage_locals`, `Allocations::coverage`; `composite.wgsl` `fl_coverage` selects SDF / coverage alpha (snap kept); `mesh.wgsl` moved to `src/shaders/`; wgpu `coverage.rs` (shared mesh pipeline, rasterizer used by `chain::record`, UI and offline); glow `coverage.rs` + `glsl::translate_mesh` (naga translation, no hand-written GLSL); GPU tests wgpu (Vulkan + GL) / glow (incl. 4x MSAA) / offline (UI equivalence, tiled == whole, refusals)): done.
 - Phase 7a (demo scaffold: `examples/demo/` directory example — `main.rs` shell + `--scene`, `record.rs`, `backdrop.rs`, `stack.rs` (+ kawase / bloom entries and custom `struct Params` via `params_ui.rs`), `scenes/mod.rs` `Scene` trait + `SCENES` registry, scene "stack"; no new scenes yet): done.
 - Phase 8 (docs + release prep: version 0.2.0, CHANGELOG `[0.2.0]` with every breaking change, README feature overview / prelude table / compatibility / demo scenes / Wayland capture note, `WaveObstacle` re-exported at the root, crate docs overview, direct-minimal-versions re-checked (dev-dep `glutin` floor 0.32.3 for eframe 0.36), package list + publish dry run): done.
 - Final review fixes (per-viewport eviction clocks in `StateRegistry`; `reset_state` as a `ResetTicket` claimed where the registry's `begin` runs, so an unrun paint keeps it; malformed user mask meshes refused (`MaskError::InvalidMesh`) and skipped by `CoverageMeshes::pack`; explicit `LayerOutcome` arms in glow; `#[non_exhaustive]` on `Mask`, `HotReloadEvent`, `WaveObstacle` (+ `new`), `PointerState` (+ `new`), `Impulse`, `ImpulsePack`, `Rebound`; demo captures written on a `FrameWriter` thread; hot-reload mtime granularity documented): done.
 - Phase R0 (§19 D1: additive coverage union — wgpu `COVERAGE_BLEND` (`One, One`), `mesh_pipeline` takes the blend (backdrop keeps `EGUI_BLEND`), glow `blend_func(ONE, ONE)`; mask / lib.rs / README / CHANGELOG text: abutting pieces leave no seam; GPU tests `abutting_mask_pieces_leave_no_seam` wgpu + glow (0 / 4x MSAA); no F9 expectation changed): done.
-- Phase R1a (§19.3 regions core + wgpu: `Region`, `Mask::Regions`, `MaskError::TooManyRegions`, `MAX_REGIONS`, `REGION_NONE`, `FilterLayer::regions`, `Effect::reads_regions`; `mask.rs` `RegionMeshes` / `PackedRegions` / `tessellate_regions` / `JobMask::{pack, textures, regions}`; binding 7 `fl_region_texture` + prelude `region()` / `region_at(uv)` / `REGION_NONE`; `FlUniforms` 464 B (`internal_region_scale` 184, `_offset` 192, `params` 208); `mesh.wgsl` `fs_region`, `MeshLocals.region_id` / `alpha_threshold`; `plan.rs` `Slot::RegionId`, `Bindings::region`, `CoverageStep::regions`, `ChainPlan::with_regions`, `region_locals`, `REGION_PASS_THRESHOLDS`, `Allocations::region`; wgpu `coverage.rs` region pipeline + target + dynamic-offset locals, `chain.rs` 8-entry layout; glow units shifted (group 0 = 0..=4, user = 5..=7) and region masks refused (`Unsupported::RegionMasks`, logged once) until R1b; offline refuses region masks (`OfflineError::InvalidOption`, option `mask`) until R1c; GPU tests wgpu (Vulkan + GL) grid / NONE / overlap, glow refusal): done.
+- Phase R1a (§19.3 regions core + wgpu: `Region`, `Mask::Regions`, `MaskError::TooManyRegions`, `MAX_REGIONS`, `REGION_NONE`, `ShaderLayer::regions`, `Effect::reads_regions`; `mask.rs` `RegionMeshes` / `PackedRegions` / `tessellate_regions` / `JobMask::{pack, textures, regions}`; binding 7 `fl_region_texture` + prelude `region()` / `region_at(uv)` / `REGION_NONE`; `FlUniforms` 464 B (`internal_region_scale` 184, `_offset` 192, `params` 208); `mesh.wgsl` `fs_region`, `MeshLocals.region_id` / `alpha_threshold`; `plan.rs` `Slot::RegionId`, `Bindings::region`, `CoverageStep::regions`, `ChainPlan::with_regions`, `region_locals`, `REGION_PASS_THRESHOLDS`, `Allocations::region`; wgpu `coverage.rs` region pipeline + target + dynamic-offset locals, `chain.rs` 8-entry layout; glow units shifted (group 0 = 0..=4, user = 5..=7) and region masks refused (`Unsupported::RegionMasks`, logged once) until R1b; offline refuses region masks (`OfflineError::InvalidOption`, option `mask`) until R1c; GPU tests wgpu (Vulkan + GL) grid / NONE / overlap, glow refusal): done.
 
 ## 18. Findings during execution
 - Phase 1: naga's GLSL writer rejects one texture read through two samplers in one module
@@ -582,7 +582,7 @@ Each phase is marked done here in the same commit that lands it.
   `textureNumLevels` was no alternative (naga translates it for GLSL 330).
 - Phase 3c: missing vs. unresolvable textures are two different contracts. A slot an effect
   reads with nothing attached is known on the GUI thread from the IR, so it is a typed
-  `TextureError` from `FilterLayer::check_textures` (what `paint` runs: the layer draws nothing,
+  `TextureError` from `ShaderLayer::check_textures` (what `paint` runs: the layer draws nothing,
   logged once per context and message; offline `OfflineError::Texture`) — never a dummy. Whether an
   attached id is alive is only known where the renderer is (wgpu: the end-of-pass plugin; glow:
   the paint callback), so an unknown / freed id skips the layer there, is logged once per id and
@@ -596,7 +596,7 @@ Each phase is marked done here in the same commit that lands it.
   each slot's upload while the same `OfflineTexture` (identity, `PartialEq`) stays attached, so
   the roadmap's "uploaded every call" and a separate `VideoProcessor::set_texture` are unneeded: a
   video passes the same texture with every frame's options. `OfflineTexture::from_color_image`
-  holds egui's upload bytes, the equivalence path. `FilterLayer::texture_at` (accessor) added.
+  holds egui's upload bytes, the equivalence path. `ShaderLayer::texture_at` (accessor) added.
 - Phase 3c: the wgpu effect pipelines need groups 1..=3 set for EVERY draw (wgpu validates every
   group of the pipeline layout), so empty slots get a dummy bind group (1x1 transparent + the
   linear sampler); composite pipelines keep a group-0-only layout and bind nothing more. egui's
@@ -708,6 +708,10 @@ Each phase is marked done here in the same commit that lands it.
   snippet declaring one of them fails to parse (redefinition), like any prelude name.
 - Phase R1a: the id passes are verified by mutation: with pass A dropped (thresholds `[0.5, 0.5]`)
   the grid test and `region_none_outside_regions` fail on `REGION_NONE` fringe pixels.
+- Owner decision after R1a (commit d6a6ffc): the crate is renamed `egui_filter_layers` ->
+  `egui-shader-layers` (lib `egui_shader_layers`, repo `Vasyanator/egui-shader-layers`) and
+  `FilterLayer` -> `ShaderLayer` for 0.2.0, because 0.2 layers are no longer only filters
+  (state simulations, textures, masks). Other names stay; this document uses the new names.
 
 # 19. Multi-region layers (R1 regions, R2 benchmark, R3 entries) — design and phases
 
@@ -741,8 +745,8 @@ capturing only its own window, and (R2) a benchmark that tells users when either
 | # | decision (recommended first) | alternative |
 |---|---|---|
 | D1 | Mask coverage union becomes ADDITIVE (`One, One`, saturating) instead of egui "over": abutting pieces / regions get coverage 1 at the shared edge (feathers are complementary ramps), so adjacent regions show no seam. Changes F9 output only at junction pixels where two pieces' OUTER feathers cross (over-estimate ≤ 0.25, one pixel) | keep "over"; document "regions must overlap by ≥ 1 px" and accept the 0.75 seam of §18 phase 5 |
-| D2 | Regions are a mask variant `Mask::Regions(Vec<Region>)` (+ `FilterLayer::regions(..)` shorthand); the union of the regions IS the mask | a separate `FilterLayer::regions` field beside the mask (two sources of coverage) |
-| D3 | R3 API: `Entry` per (rect, chain, mask, textures, state); `FilterLayer::new(rect, chain)` = one entry; layer-level builders (`mask`, `corner_radius`, `texture`, `state`) apply to EVERY entry; accessors `chain()` / `layer_mask()` / `texture_at()` return the FIRST entry's (documented) | make the layer-level builders errors on multi-entry layers |
+| D2 | Regions are a mask variant `Mask::Regions(Vec<Region>)` (+ `ShaderLayer::regions(..)` shorthand); the union of the regions IS the mask | a separate `ShaderLayer::regions` field beside the mask (two sources of coverage) |
+| D3 | R3 API: `Entry` per (rect, chain, mask, textures, state); `ShaderLayer::new(rect, chain)` = one entry; layer-level builders (`mask`, `corner_radius`, `texture`, `state`) apply to EVERY entry; accessors `chain()` / `layer_mask()` / `texture_at()` return the FIRST entry's (documented) | make the layer-level builders errors on multi-entry layers |
 | D4 | glow composites every entry of a multi-entry layer with the BLENDED erase+add composite (the wgpu UI's two modules, GL blend funcs); single-entry layers keep the replace composite unchanged | replace in `Stacked`, blended only in `Independent` (two glow paths) |
 | D5 | State per entry, key `layer_id.with(entry_index)`; `reset_state(ctx, layer_id)` resets all entries; offline keeps one state per entry index | refuse stateful chains in multi-entry layers in 0.2 (`StateError::MultiEntry`, later removed = churn) |
 | D6 | Offline multi-entry layers refuse tiling (`OfflineError::NotTileable`): the frame must fit `max_tile_size` (default 4096; raise it for larger frames). R1 (regions) tiles like F9 | per-entry tiling (+M, a second tiler over sub-rects) |
@@ -810,7 +814,7 @@ pub enum Mask { RoundedRect(CornerRadius), Shape(Shape), /* new */ Regions(Vec<R
 pub enum MaskError { .., /* new */ TooManyRegions { count: usize, max: usize } /* max = MAX_REGIONS */ }
 /// Ids are `0..MAX_REGIONS`; `REGION_NONE` (255) is "no region here" (the prelude's `region()`).
 pub const MAX_REGIONS: usize = 255; pub const REGION_NONE: u32 = 255;
-impl FilterLayer { pub fn regions(self, regions: impl IntoIterator<Item = Region>) -> Self; } // = mask(Mask::Regions(..))
+impl ShaderLayer { pub fn regions(self, regions: impl IntoIterator<Item = Region>) -> Self; } // = mask(Mask::Regions(..))
 impl Effect { pub fn reads_regions(&self) -> bool; }  // IR scan for `fl_region_texture` (like reads_texture); informational
 ```
 Semantics: the union of the regions is the layer's mask (coverage texture, F9 path); the region
@@ -928,7 +932,7 @@ is a valid input; `Effect::reads_regions` exists for UIs that want to warn.
 
 ### 19.4.1 Public API (`src/entry.rs` new, `layer.rs`, `lib.rs`)
 ```rust
-/// One filtered area of a `FilterLayer`: its own rect, mask, chain, textures and state options.
+/// One filtered area of a `ShaderLayer`: its own rect, mask, chain, textures and state options.
 #[derive(Clone, Debug)]
 pub struct Entry { rect: Rect, chain: FilterChain, mask: Mask, textures: [Option<TextureId>; 3], invalid_slot: Option<usize>, state: StateOptions }
 impl Entry {
@@ -940,7 +944,7 @@ impl Entry {
 /// How entries that overlap see each other.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)] #[non_exhaustive]
 pub enum Overlap { #[default] Independent, Stacked }
-impl FilterLayer {
+impl ShaderLayer {
     pub fn new(rect, chain) -> Self;                         // one entry (unchanged call)
     pub fn from_entries(entries: impl IntoIterator<Item = Entry>) -> Self; // rect() = union of entry rects
     pub fn with_entry(self, entry: Entry) -> Self;           // appends; rect() grows
@@ -1058,7 +1062,7 @@ Video: `VideoProcessor` gets `process_layer` too only if trivial; otherwise docu
 
 ### 19.4.8 Tests
 * unit: `plan::schedule` orders (§19.4.3); `entry_rect` under a TSTransform; `LayerJob` checks
-  name the entry; `FilterLayer::rect()` = union; layer-level builders reach every entry.
+  name the entry; `ShaderLayer::rect()` = union; layer-level builders reach every entry.
 * `tests/wgpu_headless.rs`: `two_entries_far_apart_capture_only_their_windows` (an inverting
   entry left, a red-tint entry right; the middle stays untouched; `Independent`);
   `overlapping_entries_independent_later_wins` (two overlapping rounded rects, invert + tint:
@@ -1074,7 +1078,7 @@ Video: `VideoProcessor` gets `process_layer` too only if trivial; otherwise docu
 
 * Demo scene "grid" (`examples/demo/scenes/grid.rs`, registry `SCENES`): an `N = cols × rows`
   grid of small frosted glass tiles (`presets::frosted` + a tint effect `mix(src, p.tint[…], k)`)
-  over the busy backdrop; mode selector: **Layers** (N `FilterLayer`s), **Regions** (one layer,
+  over the busy backdrop; mode selector: **Layers** (N `ShaderLayer`s), **Regions** (one layer,
   `Mask::Regions`, tint by `region()`), **Entries / Independent**, **Entries / Stacked** (after
   R3); N slider (4..=256); frame-time readout = a `FrameTimer` helper moved into
   `scenes/mod.rs` from bloom's inline code (`bloom.rs:141-148`), plus the count of egui
@@ -1129,11 +1133,11 @@ bench only and R2b both.
 
 ## 19.9 API surface changes vs 0.1.0 (for the CHANGELOG)
 Additive: `Region`, `Mask::Regions`, `MaskError::TooManyRegions`, `MAX_REGIONS`, `REGION_NONE`,
-`FilterLayer::regions` / `from_entries` / `with_entry` / `overlap` / `overlap_mode` /
+`ShaderLayer::regions` / `from_entries` / `with_entry` / `overlap` / `overlap_mode` /
 `entries`, `Entry`, `Overlap`, `Effect::reads_regions`, `OfflineEntry`, `OfflineLayer`,
 `OfflineRenderer::process_layer{,_into,_async}`, prelude `region()` / `region_at()` /
 `REGION_NONE`; `TextureError::NotAttached` and `StateError::MissingId` gain `entry: usize`
-(both `#[non_exhaustive]`: additive). Behaviour: `FilterLayer::rect()` = union of entries (equal
+(both `#[non_exhaustive]`: additive). Behaviour: `ShaderLayer::rect()` = union of entries (equal
 to the rect for one entry); `chain()` = the first entry's; `OfflineRenderer::reset_state` resets
 every entry's state. Breaking vs 0.1.0: none beyond what 0.2 already lists (§10); vs the 0.2
 working tree: the coverage union rule (D1, F9 junction pixels).

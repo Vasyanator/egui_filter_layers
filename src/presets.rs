@@ -11,7 +11,7 @@ Key functions:
 - refraction: `ripple` (animated), `lens`
 - impulse-driven: `click_ripples` (driven by an `Impulses`, not animated by itself)
 - reduced resolution (F6, `Pass::with_scale`): `kawase_blur` (dual-Kawase pyramid), `bloom`
-- persistent state (F7, state passes; the layer needs `FilterLayer::id`): `trails`, and the
+- persistent state (F7, state passes; the layer needs `ShaderLayer::id`): `trails`, and the
   water pair `wave_sim` (height-field wave equation with obstacles and impulses) + `wave_display`
   (refraction and a highlight from the heights); `WaveObstacle`
 - combos: `frosted_glass`
@@ -402,7 +402,7 @@ pub(crate) const BUILTIN_EFFECTS: &[(&str, &str)] = &[
 fn builtin(cell: &'static OnceLock<Effect>, label: &str, source: &str, configure: fn(Effect) -> Effect) -> Effect {
     cell.get_or_init(|| match Effect::new(label, source) {
         Ok(effect) => configure(effect),
-        Err(error) => panic!("egui_filter_layers: built-in effect `{label}` is invalid (crate bug): {error}"),
+        Err(error) => panic!("egui_shader_layers: built-in effect `{label}` is invalid (crate bug): {error}"),
     })
     .clone()
 }
@@ -411,7 +411,7 @@ fn builtin(cell: &'static OnceLock<Effect>, label: &str, source: &str, configure
 fn builtin_state(cell: &'static OnceLock<Effect>, label: &str, source: &str) -> Effect {
     cell.get_or_init(|| match Effect::new_state(label, source) {
         Ok(effect) => effect,
-        Err(error) => panic!("egui_filter_layers: built-in state effect `{label}` is invalid (crate bug): {}", EffectError::to_string(&error)),
+        Err(error) => panic!("egui_shader_layers: built-in state effect `{label}` is invalid (crate bug): {}", EffectError::to_string(&error)),
     })
     .clone()
 }
@@ -546,7 +546,7 @@ pub fn frosted_glass(sigma: f32, color: Color32, amount: f32) -> FilterChain {
 fn builtin_param<T>(label: &str, result: Result<T, ParamError>) -> T {
     match result {
         Ok(value) => value,
-        Err(error) => panic!("egui_filter_layers: built-in effect `{label}` rejected its own parameters (crate bug): {error}"),
+        Err(error) => panic!("egui_shader_layers: built-in effect `{label}` rejected its own parameters (crate bug): {error}"),
     }
 }
 
@@ -690,7 +690,7 @@ pub fn bloom(threshold: f32, intensity: f32, radius: f32) -> FilterChain {
 /// fade does not depend on the frame rate (offline: set `OfflineOptions::with_delta_time`, or run
 /// a video, whose frame clock sets it).
 ///
-/// A state chain: the layer needs [`FilterLayer::id`](crate::FilterLayer::id). The trace fades only
+/// A state chain: the layer needs [`ShaderLayer::id`](crate::ShaderLayer::id). The trace fades only
 /// on frames egui paints (repaint while it should move). Keep the default RGBA16F state: 8-bit
 /// state rounds small decays away, so faint traces would never vanish.
 #[must_use]
@@ -747,7 +747,7 @@ impl WaveObstacle {
 /// on the first):
 ///
 /// ```
-/// use egui_filter_layers::{FilterChain, Impulses, presets};
+/// use egui_shader_layers::{FilterChain, Impulses, presets};
 /// let impulses = Impulses::new(0.15);
 /// let sim = presets::wave_sim(&impulses, 0.0, &[]);
 /// let water = FilterChain::new().then(sim.clone()).then(sim).then(presets::wave_display(8.0, 0.6));
@@ -764,7 +764,7 @@ impl WaveObstacle {
 /// default `0`: off). Steps are per paint, not per second: at a fixed frame rate the speed is
 /// constant, and a slower frame rate slows the water (substeps compensate).
 ///
-/// The layer needs [`FilterLayer::id`](crate::FilterLayer::id). The surface moves only on frames
+/// The layer needs [`ShaderLayer::id`](crate::ShaderLayer::id). The surface moves only on frames
 /// egui paints: repaint while it is not calm (e.g. `ctx.request_repaint()` for a few seconds after
 /// the last impulse). The heights need the default RGBA16F state (signed values).
 #[must_use]

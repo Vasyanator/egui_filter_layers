@@ -81,7 +81,7 @@ impl FfmpegSource {
         let color = decode_color(&probe).map_err(|reason| VideoError::UnsupportedColor { input: input.to_owned(), reason })?;
         if color.guessed {
             log::warn!(
-                "egui_filter_layers (video): {} has no colour matrix tag; decoding it as {} (players differ for untagged video)",
+                "egui_shader_layers (video): {} has no colour matrix tag; decoding it as {} (players differ for untagged video)",
                 input.display(),
                 color.matrix.unwrap_or("RGB")
             );
@@ -102,7 +102,7 @@ impl FfmpegSource {
             .with_sample_aspect_ratio(sar_numerator, sar_denominator);
         let frame_bytes = info.frame_bytes()?;
         log::info!(
-            "egui_filter_layers (video): decoding {} (stream {}, {} {}x{}, {}, colour {}/{}, {} fps, audio: {})",
+            "egui_shader_layers (video): decoding {} (stream {}, {} {}x{}, {}, colour {}/{}, {} fps, audio: {})",
             input.display(),
             probe.stream_index,
             probe.codec_name,
@@ -194,7 +194,7 @@ impl FfmpegSource {
         let status = self.finish();
         if filled == 0 {
             status?;
-            log::info!("egui_filter_layers (video): decoded {} frames of {}", self.next, self.input.display());
+            log::info!("egui_shader_layers (video): decoded {} frames of {}", self.next, self.input.display());
             return Ok(None);
         }
         let stderr_tail = match status {

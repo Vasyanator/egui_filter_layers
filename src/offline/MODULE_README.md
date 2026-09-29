@@ -3,7 +3,7 @@
 ## Purpose
 Offline processing (features `image` and `video`, gated together in `lib.rs`): run a
 `FilterChain` over an ordinary RGBA8 frame on wgpu and read the pixels back, producing what a
-`FilterLayer` covering that frame shows in the UI. wgpu only (glow apps enable `image` / `video`
+`ShaderLayer` covering that frame shows in the UI. wgpu only (glow apps enable `image` / `video`
 for export; headless GL is not supported).
 
 ## Architecture

@@ -716,7 +716,7 @@ impl Partial {
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None);
             target.destroy(gl);
             if !complete || error != glow::NO_ERROR {
-                log::info!("egui_filter_layers: {format:?} is not renderable on this context (GL error 0x{error:04x}); using RGBA8 intermediates");
+                log::info!("egui_shader_layers: {format:?} is not renderable on this context (GL error 0x{error:04x}); using RGBA8 intermediates");
             }
             complete && error == glow::NO_ERROR
         }

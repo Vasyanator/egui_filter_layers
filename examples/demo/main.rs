@@ -2,7 +2,7 @@
 File: examples/demo/main.rs
 
 Purpose:
-Interactive demo of `egui_filter_layers`: a set of scenes (see `scenes/`) over a shared busy
+Interactive demo of `egui_shader_layers`: a set of scenes (see `scenes/`) over a shared busy
 backdrop, a side panel with the backend status, a scene selector and the scene's own controls.
 This file owns the command line, the stderr logger, eframe start-up on either renderer, and the
 app shell that dispatches to the selected scene.
@@ -30,7 +30,7 @@ Key structures:
 - DemoApp: the eframe app (status panel, scene selector, lazily built scenes).
 
 Notes:
-The side panel shows the renderer and `egui_filter_layers::status()`, so a missing or failed
+The side panel shows the renderer and `egui_shader_layers::status()`, so a missing or failed
 backend is visible rather than silently drawing nothing.
 */
 
@@ -66,7 +66,7 @@ struct Options {
     renderer: RendererChoice,
     /// MSAA sample count (exercises the glow resolve path).
     msaa: u16,
-    /// Log `egui_filter_layers` at debug level.
+    /// Log `egui_shader_layers` at debug level.
     verbose: bool,
     /// Index into `SCENES` of the scene shown first.
     scene: usize,
@@ -140,13 +140,13 @@ fn parse_args() -> Result<Options, String> {
 
 /// Minimal stderr logger (the demo avoids extra dependencies).
 struct StderrLogger {
-    /// Level for `egui_filter_layers` records; everything else logs at `Warn` and above.
+    /// Level for `egui_shader_layers` records; everything else logs at `Warn` and above.
     crate_level: log::LevelFilter,
 }
 
 impl log::Log for StderrLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        if metadata.target().starts_with("egui_filter_layers") || metadata.target().starts_with("demo") { metadata.level() <= self.crate_level } else { metadata.level() <= log::Level::Warn }
+        if metadata.target().starts_with("egui_shader_layers") || metadata.target().starts_with("demo") { metadata.level() <= self.crate_level } else { metadata.level() <= log::Level::Warn }
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -185,13 +185,13 @@ fn main() -> ExitCode {
         multisampling: options.msaa,
         viewport: if options.record.is_some() {
             // Recording: a small fixed window (1 pixel per point is forced in `DemoApp::new`).
-            egui::ViewportBuilder::default().with_inner_size(RECORD_SIZE).with_resizable(false).with_title("egui_filter_layers demo (recording)")
+            egui::ViewportBuilder::default().with_inner_size(RECORD_SIZE).with_resizable(false).with_title("egui-shader-layers demo (recording)")
         } else {
-            egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]).with_title("egui_filter_layers demo")
+            egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]).with_title("egui-shader-layers demo")
         },
         ..Default::default()
     };
-    let result = eframe::run_native("egui_filter_layers demo", native_options, Box::new(move |cc| Ok(Box::new(DemoApp::new(cc, options)))));
+    let result = eframe::run_native("egui-shader-layers demo", native_options, Box::new(move |cc| Ok(Box::new(DemoApp::new(cc, options)))));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -235,11 +235,11 @@ impl DemoApp {
             cc.egui_ctx.set_pixels_per_point(1.0);
         }
         let install_error = match (renderer, cc.gl.as_ref()) {
-            (RendererChoice::Glow, Some(gl)) => egui_filter_layers::install_glow(&cc.egui_ctx, gl).err().map(|error| error.to_string()),
+            (RendererChoice::Glow, Some(gl)) => egui_shader_layers::install_glow(&cc.egui_ctx, gl).err().map(|error| error.to_string()),
             (RendererChoice::Glow, None) => Some("eframe provided no glow context".to_owned()),
             (RendererChoice::Wgpu, _) => match cc.wgpu_render_state.as_ref() {
                 // Must mirror the NativeOptions given to eframe (see `main`).
-                Some(render_state) => egui_filter_layers::install_wgpu(&cc.egui_ctx, render_state, egui_filter_layers::WgpuOptions::default().with_multisampling(msaa)).err().map(|error| error.to_string()),
+                Some(render_state) => egui_shader_layers::install_wgpu(&cc.egui_ctx, render_state, egui_shader_layers::WgpuOptions::default().with_multisampling(msaa)).err().map(|error| error.to_string()),
                 None => Some("eframe provided no wgpu render state".to_owned()),
             },
         };
@@ -274,9 +274,9 @@ impl DemoApp {
 
     /// The side panel: status, scene selector, then the scene's controls.
     fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.heading("egui_filter_layers");
+        ui.heading("egui_shader_layers");
         ui.label(format!("renderer: {:?}", self.renderer));
-        let status = egui_filter_layers::status(ui.ctx());
+        let status = egui_shader_layers::status(ui.ctx());
         let color = if status.is_usable() { ui.visuals().text_color() } else { ui.visuals().error_fg_color };
         ui.colored_label(color, format!("backend: {status}"));
         if let Some(error) = &self.install_error {
@@ -285,7 +285,7 @@ impl DemoApp {
         if self.renderer == RendererChoice::Wgpu {
             ui.colored_label(ui.visuals().warn_fg_color, "wgpu: the content under the filter is rendered twice per frame");
         }
-        for failure in egui_filter_layers::failed_effects(ui.ctx()) {
+        for failure in egui_shader_layers::failed_effects(ui.ctx()) {
             ui.colored_label(ui.visuals().error_fg_color, format!("effect `{}` failed: {}", failure.label, failure.error));
         }
         ui.separator();
@@ -344,7 +344,7 @@ impl eframe::App for DemoApp {
 
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         if let Some(gl) = gl {
-            egui_filter_layers::destroy_glow(&self.ctx, gl);
+            egui_shader_layers::destroy_glow(&self.ctx, gl);
         }
     }
 }

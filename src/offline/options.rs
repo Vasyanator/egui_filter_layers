@@ -152,7 +152,7 @@ impl OfflineOptions {
 
     /// Attaches `texture` at user texture `slot` (`0..TEXTURE_SLOTS`), which effects read with
     /// `tex(slot, uv)`, `tex_size(slot)` and `tex_load(slot, px)` — the offline counterpart of
-    /// [`FilterLayer::texture`](crate::FilterLayer::texture). The renderer uploads it once and
+    /// [`ShaderLayer::texture`](crate::ShaderLayer::texture). The renderer uploads it once and
     /// reuses the upload while the same texture (a clone) stays attached, so a video passes the
     /// same one with every frame at no cost. A `slot` out of range makes the run fail with
     /// [`OfflineError::Texture`].
@@ -169,7 +169,7 @@ impl OfflineOptions {
 
     /// How the persistent state of a chain with a state pass is stored (default: full
     /// resolution, RGBA16F) — the offline counterpart of
-    /// [`FilterLayer::state`](crate::FilterLayer::state). The renderer carries the state from
+    /// [`ShaderLayer::state`](crate::ShaderLayer::state). The renderer carries the state from
     /// one run to the next; a changed format starts it over.
     #[must_use]
     pub fn with_state(mut self, state: StateOptions) -> Self {
@@ -203,7 +203,7 @@ impl OfflineOptions {
         self
     }
 
-    /// Rounds the layer's corners (layer points), like [`FilterLayer::corner_radius`](crate::FilterLayer::corner_radius):
+    /// Rounds the layer's corners (layer points), like [`ShaderLayer::corner_radius`](crate::ShaderLayer::corner_radius):
     /// outside the mask the unfiltered frame is kept. Shorthand for
     /// `with_mask(Mask::RoundedRect(radius))`, replacing any earlier mask.
     #[must_use]
@@ -212,7 +212,7 @@ impl OfflineOptions {
         self
     }
 
-    /// The layer's mask, like [`FilterLayer::mask`](crate::FilterLayer::mask): a shape is in
+    /// The layer's mask, like [`ShaderLayer::mask`](crate::ShaderLayer::mask): a shape is in
     /// layer points (the frame spans `0..width / pixels_per_point` points), tessellated per run at
     /// the options' pixels per point with egui's default tessellation options. Offline masks must
     /// pass [`Mask::check_offline`]: no text (no font atlas offline) and only untextured meshes;

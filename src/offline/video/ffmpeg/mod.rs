@@ -103,8 +103,8 @@ impl FfmpegTools {
 /// [`FfmpegSink`], with the input's audio handled by [`AudioMode`] (copied by default).
 ///
 /// ```no_run
-/// # fn run(processor: &mut egui_filter_layers::offline::video::VideoProcessor) -> Result<(), egui_filter_layers::offline::video::VideoError> {
-/// use egui_filter_layers::offline::video::ffmpeg::{AudioMode, FfmpegTranscode, VideoCodec};
+/// # fn run(processor: &mut egui_shader_layers::offline::video::VideoProcessor) -> Result<(), egui_shader_layers::offline::video::VideoError> {
+/// use egui_shader_layers::offline::video::ffmpeg::{AudioMode, FfmpegTranscode, VideoCodec};
 /// FfmpegTranscode::new("clip.mov", "clip.webm")
 ///     .with_codec(VideoCodec::Vp9 { crf: 31 })
 ///     .with_audio(AudioMode::Encode(vec!["-c:a".into(), "libopus".into()]))

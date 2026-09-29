@@ -27,7 +27,7 @@ The handles are kept for the scene's lifetime (a freed handle would make the lay
 use std::f32::consts::TAU;
 
 use eframe::egui::{self, Color32, ColorImage, Rect, TextureHandle, TextureOptions, pos2, vec2};
-use egui_filter_layers::{Effect, EffectError, FilterLayer, Pass};
+use egui_shader_layers::{Effect, EffectError, ShaderLayer, Pass};
 
 use super::{DragRect, Scene, SceneEntry, SceneFrame, SceneInit, record_rect};
 use crate::backdrop::CircleMotion;
@@ -180,8 +180,8 @@ impl TexturesScene {
     }
 
     /// The layer with all three textures attached (each effect reads only its own slot).
-    fn layer(&self, pass: Pass) -> FilterLayer {
-        FilterLayer::new(self.rect.rect, pass).corner_radius(self.rect.corner_radius).texture(0, self.noise.id()).texture(1, self.normals.id()).texture(2, self.lut.id())
+    fn layer(&self, pass: Pass) -> ShaderLayer {
+        ShaderLayer::new(self.rect.rect, pass).corner_radius(self.rect.corner_radius).texture(0, self.noise.id()).texture(1, self.normals.id()).texture(2, self.lut.id())
     }
 }
 
@@ -239,7 +239,7 @@ impl Scene for TexturesScene {
                 ui.colored_label(ui.visuals().error_fg_color, format!("effect unavailable: {error}"));
             }
         }
-        for failure in egui_filter_layers::failed_textures(ui.ctx()) {
+        for failure in egui_shader_layers::failed_textures(ui.ctx()) {
             ui.colored_label(ui.visuals().error_fg_color, format!("texture {:?} failed: {}", failure.id, failure.error));
         }
     }

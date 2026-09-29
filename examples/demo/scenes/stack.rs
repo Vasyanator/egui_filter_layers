@@ -12,7 +12,7 @@ Key structures:
 */
 
 use eframe::egui::{self, Rect, pos2, vec2};
-use egui_filter_layers::FilterLayer;
+use egui_shader_layers::ShaderLayer;
 
 use super::{DragRect, Scene, SceneEntry, SceneFrame, SceneInit, record_rect};
 use crate::backdrop::{CircleMotion, scroll_widgets};
@@ -53,7 +53,7 @@ impl Scene for StackScene {
         }
         scroll_widgets(ui, area);
         self.rect.interact(ui, "filter");
-        FilterLayer::new(self.rect.rect, self.editor.chain()).corner_radius(self.rect.corner_radius).paint(&painter);
+        ShaderLayer::new(self.rect.rect, self.editor.chain()).corner_radius(self.rect.corner_radius).paint(&painter);
         self.rect.paint_outline(&painter);
     }
 }

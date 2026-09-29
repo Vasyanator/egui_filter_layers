@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.2.0] - 2026-09-29
 
+### Renamed
+- **The crate is now `egui-shader-layers` (library `egui_shader_layers`); 0.1.0 was published as
+  `egui_filter_layers`. The main type `FilterLayer` is now `ShaderLayer`.** Other names
+  (`FilterChain`, `Pass`, `Effect`, presets, ...) are unchanged. Migration: replace the
+  `egui_filter_layers` dependency with `egui-shader-layers = "0.2"`, then change
+  `egui_filter_layers::` paths to `egui_shader_layers::` and `FilterLayer` to `ShaderLayer`.
+
 ### Added
 - `original(uv)` in the effect prelude: the untouched captured backdrop, readable in every pass
   of a chain (UI and offline, also tiled).
@@ -29,7 +36,7 @@ adheres to [Semantic Versioning](https://semver.org/).
   `[MIN_PASS_SCALE, 1]`), prelude `src_texel()` / `out_texel()` and `fl.pass_scale`; the final
   composite upsamples a scaled last pass. Presets `presets::kawase_blur` (dual-Kawase pyramid)
   and `presets::bloom`.
-- User textures: `FilterLayer::texture(slot, TextureId)` / `texture_at` / `check_textures`,
+- User textures: `ShaderLayer::texture(slot, TextureId)` / `texture_at` / `check_textures`,
   `TEXTURE_SLOTS` (3); prelude `tex(i, uv)` (the texture's own egui sampler), `tex_size(i)`,
   `tex_load(i, px)`; `Effect::reads_texture`; an effect reading an unattached slot is refused
   (`TextureError`), an unknown texture id skips its layers (`failed_textures`, `TextureFailure`).
@@ -38,8 +45,8 @@ adheres to [Semantic Versioning](https://semver.org/).
 - Persistent per-layer state: state passes (`Effect::new_state`, `Effect::is_state`) write two
   ping-pong textures that survive between frames; prelude `state(uv)`, `state_load(px)`,
   `state_px(offset)`, `state_size()`, `state_texel()`, `fl.pass_index` (substeps).
-  `FilterLayer::id` (required for stateful chains: `StateError::MissingId`, `check_state`,
-  `layer_id`), `FilterLayer::state(StateOptions)` (`with_scale`, `with_format`: `StateFormat`
+  `ShaderLayer::id` (required for stateful chains: `StateError::MissingId`, `check_state`,
+  `layer_id`), `ShaderLayer::state(StateOptions)` (`with_scale`, `with_format`: `StateFormat`
   RGBA16F by default, RGBA8 opt-in), `reset_state`, `state_count`, `failed_states`
   (`StateFailure`); states unpainted for 120 frames of their own viewport and 2 s are freed (an
   idle viewport keeps its states while another animates); a `reset_state` requested while the
@@ -50,11 +57,11 @@ adheres to [Semantic Versioning](https://semver.org/).
   `WAVE_OBSTACLES`.
 - Shape masks: `Mask` (`RoundedRect`, `Shape`: any egui shape incl. meshes and text galleys, in
   layer points), `MaskError` (callbacks, and malformed meshes: `InvalidMesh`),
-  `FilterLayer::mask` / `layer_mask` / `check_mask`,
+  `ShaderLayer::mask` / `layer_mask` / `check_mask`,
   `OfflineOptions::with_mask`, `OfflineError::Mask`. The shape's alpha is the coverage; the
   coverage of several pieces is the sum of their alphas, capped at 1 (pieces meeting edge to edge
   leave no seam).
-- Regions: `Mask::Regions` / `FilterLayer::regions` with `Region` (`rounded_rect`, `shape`,
+- Regions: `Mask::Regions` / `ShaderLayer::regions` with `Region` (`rounded_rect`, `shape`,
   `shape_ref`), up to `MAX_REGIONS` (255, `MaskError::TooManyRegions`): the union of the regions
   is the mask and every pass reads the owning region's id with the prelude's `region()` /
   `region_at(uv)` (`REGION_NONE` = 255 outside the regions; also `REGION_NONE` in Rust); later
@@ -90,10 +97,10 @@ adheres to [Semantic Versioning](https://semver.org/).
   with `new` / `WaveObstacle::from_rect`), and the output-only `Impulse`, `ImpulsePack`,
   `Rebound` (read their fields; destructure with `..`). `OfflineOptions::state()` stays the
   getter of `with_state` (every `OfflineOptions` getter is the bare name of its `with_*` builder),
-  while `FilterLayer::state(..)` is a builder whose getter is `state_options()`.
+  while `ShaderLayer::state(..)` is a builder whose getter is `state_options()`.
 - `OfflineError` has new variants (`NotTileable`, `Texture`, `State`, `Mask`,
   `TextureTooLarge`); it is `#[non_exhaustive]`, so exhaustive matches were already impossible.
-- `FilterLayer::corner_radius` and `OfflineOptions::with_corner_radius` are shorthands for
+- `ShaderLayer::corner_radius` and `OfflineOptions::with_corner_radius` are shorthands for
   `Mask::RoundedRect`; a later `mask(...)` replaces them (and vice versa).
 - The crate-private `fl` uniform block grew from 352 to 448 bytes; its documented members keep
   their meaning (undocumented `internal_*` members changed). `presets::gaussian_blur` and
@@ -177,5 +184,5 @@ adheres to [Semantic Versioning](https://semver.org/).
 - `demo` example (`--renderer glow|wgpu`, scripted `--stack name:values`, `--rect`,
   `--screenshot`, seamless-loop `--record` used for the README GIFs).
 
-[0.2.0]: https://github.com/Vasyanator/egui_filter_layers/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/Vasyanator/egui_filter_layers/releases/tag/v0.1.0
+[0.2.0]: https://github.com/Vasyanator/egui-shader-layers/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Vasyanator/egui-shader-layers/releases/tag/v0.1.0

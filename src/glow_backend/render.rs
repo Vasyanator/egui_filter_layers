@@ -2,7 +2,7 @@
 File: glow_backend/render.rs
 
 Purpose:
-One filter layer, executed inside an `egui_glow` paint callback: capture the backdrop from the
+One shader layer, executed inside an `egui_glow` paint callback: capture the backdrop from the
 bound framebuffer, run the draws of the backend-neutral `plan::ChainPlan` (passes ping-pong in
 offscreen targets, then the composite back into the caller's framebuffer). Which slot a draw reads
 and writes, its viewport and its uniform blocks (`fl` at binding point 0, the named-parameter
@@ -190,11 +190,11 @@ unsafe fn drain_errors(gl: &glow::Context) {
         if error == glow::NO_ERROR {
             return;
         }
-        log::debug!("egui_filter_layers (glow): discarding a GL error raised before the filter callback: 0x{error:04x}");
+        log::debug!("egui_shader_layers (glow): discarding a GL error raised before the filter callback: 0x{error:04x}");
     }
 }
 
-/// Runs one filter layer. Never panics; failures are latched in `state`. The caller's framebuffer
+/// Runs one shader layer. Never panics; failures are latched in `state`. The caller's framebuffer
 /// bindings are saved before anything else and restored on every path.
 ///
 /// `textures` are `egui_glow`'s textures of the job's attached user textures and of its shape
@@ -235,7 +235,7 @@ unsafe fn paint_saved(gl: &glow::Context, state: &mut GlowState, target: GlslTar
         if state.resources.is_none() {
             match Resources::create(gl, target) {
                 Ok(resources) => {
-                    log::info!("egui_filter_layers (glow): resources created ({target:?}, float intermediates: {})", resources.float_intermediates());
+                    log::info!("egui_shader_layers (glow): resources created ({target:?}, float intermediates: {})", resources.float_intermediates());
                     state.resources = Some(resources);
                 }
                 Err(error) => {
@@ -332,7 +332,7 @@ unsafe fn apply_outcome(gl: &glow::Context, state: &mut GlowState, resources: &m
         LayerOutcome::Rejected { format, reason } => {
             if resources.rejected_formats.insert(format) {
                 log::error!(
-                    "egui_filter_layers (glow): filter layers cannot read this framebuffer and are skipped on it.\n\
+                    "egui_shader_layers (glow): shader layers cannot read this framebuffer and are skipped on it.\n\
                      Error: {reason}\n\
                      Effect: layers painted into this framebuffer draw nothing extra; other framebuffers are unaffected.\n\
                      Possible cause: a float / integer / unusual colour format (e.g. an HDR or RGB565 multisampled surface)."
@@ -351,7 +351,7 @@ unsafe fn apply_outcome(gl: &glow::Context, state: &mut GlowState, resources: &m
                 // SAFETY: forwarded contract.
                 unsafe { state.fail_effect(gl, module, "running on the GPU", &format!("GL error 0x{error:04x}")) };
             } else {
-                log::warn!("egui_filter_layers (glow): a filter chain raised GL error 0x{error:04x}; checking its passes one by one on the next frames to find the effect responsible");
+                log::warn!("egui_shader_layers (glow): a filter chain raised GL error 0x{error:04x}; checking its passes one by one on the next frames to find the effect responsible");
                 state.suspects.extend(distinct);
             }
         }
@@ -499,7 +499,7 @@ unsafe fn read_format(gl: &glow::Context, resources: &mut Resources, run: &Layer
     match unsafe { ReadFormat::query(gl, default_framebuffer, run.embedded) } {
         Ok(format) => {
             if default_framebuffer {
-                log::debug!("egui_filter_layers (glow): default framebuffer read format {format:?} (samples: {})", run.caller.samples);
+                log::debug!("egui_shader_layers (glow): default framebuffer read format {format:?} (samples: {})", run.caller.samples);
                 resources.default_read_format = Some(format);
             }
             Ok(Some(format))
@@ -508,7 +508,7 @@ unsafe fn read_format(gl: &glow::Context, resources: &mut Resources, run: &Layer
             Err(CaptureError::Rejected { format: UNKNOWN_FORMAT, reason })
         }
         Err(ReadFormatError::Query(error)) => {
-            log::debug!("egui_filter_layers (glow): the driver could not report the framebuffer format (GL error 0x{error:04x}); assuming RGBA8");
+            log::debug!("egui_shader_layers (glow): the driver could not report the framebuffer format (GL error 0x{error:04x}); assuming RGBA8");
             Ok(None)
         }
     }
@@ -550,7 +550,7 @@ unsafe fn capture(gl: &glow::Context, resources: &mut Resources, run: &LayerRun<
             };
             if resources.resolve.is_none() {
                 resources.resolve = Some(ResolveTarget::create(gl).map_err(CaptureError::Gl)?);
-                log::debug!("egui_filter_layers (glow): framebuffer is multisampled ({} samples); resolving through a 0x{internal_format:04x} renderbuffer", run.caller.samples);
+                log::debug!("egui_shader_layers (glow): framebuffer is multisampled ({} samples); resolving through a 0x{internal_format:04x} renderbuffer", run.caller.samples);
             }
             let Some(resolve) = resources.resolve.as_mut() else {
                 return Ok(());

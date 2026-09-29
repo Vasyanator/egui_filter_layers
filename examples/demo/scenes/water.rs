@@ -15,7 +15,7 @@ Key structures:
 - ENTRY: the registry entry (`--scene water`).
 
 Notes:
-The menu is an `egui::Window` (a higher egui layer), so it is painted after the filter layer and
+The menu is an `egui::Window` (a higher egui layer), so it is painted after the shader layer and
 stays crisp. The simulation steps once per paint (substeps per paint, not per second). While
 recording, clicks are scripted as a pure function of the loop phase and the menu is pinned to
 the centre. The recorder paints every step the same number of times (its screenshot handshake),
@@ -24,8 +24,8 @@ a seamless loop, since the surface carries its waves over the seam.
 */
 
 use eframe::egui::{self, Align2, Color32, CornerRadius, Id, Pos2, Rect, Sense, Stroke, StrokeKind, vec2};
-use egui_filter_layers::{FilterChain, FilterLayer, IMPULSE_SLOTS, Impulses, ParamError, StateOptions, presets, reset_state};
-use egui_filter_layers::presets::WaveObstacle;
+use egui_shader_layers::{FilterChain, ShaderLayer, IMPULSE_SLOTS, Impulses, ParamError, StateOptions, presets, reset_state};
+use egui_shader_layers::presets::WaveObstacle;
 
 use super::ripples::scripted_impulses;
 use super::{DragRect, Scene, SceneEntry, SceneFrame, SceneInit};
@@ -258,7 +258,7 @@ impl Scene for WaterScene {
             obstacles.extend(WaveObstacle::from_rect(rock.rect, area, f32::from(rock.corner_radius)));
         }
         match self.chain(now, &obstacles, wake_on) {
-            Ok(chain) => FilterLayer::new(area, chain).id(water_id()).state(StateOptions::default().with_scale(self.state_scale)).paint(&painter),
+            Ok(chain) => ShaderLayer::new(area, chain).id(water_id()).state(StateOptions::default().with_scale(self.state_scale)).paint(&painter),
             Err(error) => {
                 if !self.warned {
                     log::error!("demo: water: the built-in wave_sim rejected a parameter: {error}");

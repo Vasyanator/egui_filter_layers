@@ -1,6 +1,6 @@
 //! Offline processing vs the UI, on a real GPU.
 //!
-//! * Equivalence: an image drawn 1:1 by egui-wgpu under a `FilterLayer` covering the whole screen
+//! * Equivalence: an image drawn 1:1 by egui-wgpu under a `ShaderLayer` covering the whole screen
 //!   and the same image run through `OfflineRenderer::from_render_state` (same device) must give
 //!   byte-identical pixels for every preset and a custom effect (dithering off, opaque image,
 //!   `Rgba8Unorm` surface), also at 2 pixels per point — except the 1-px antialiased edge of a
@@ -38,7 +38,7 @@
 use std::sync::Arc;
 
 use egui::{Color32, ColorImage, Pos2, Rect, TextureOptions, ViewportId, ViewportInfo, pos2, vec2};
-use egui_filter_layers::{AlphaMode, BackendStatus, Effect, FilterChain, FilterLayer, FrameRef, Impulses, OfflineOptions, OfflineRenderer, OfflineTexture, Pass, StateOptions, TEXTURE_SLOTS, WgpuOptions, install_wgpu, presets};
+use egui_shader_layers::{AlphaMode, BackendStatus, Effect, FilterChain, ShaderLayer, FrameRef, Impulses, OfflineOptions, OfflineRenderer, OfflineTexture, Pass, StateOptions, TEXTURE_SLOTS, WgpuOptions, install_wgpu, presets};
 
 const WIDTH: u32 = 192;
 const HEIGHT: u32 = 128;
@@ -246,7 +246,7 @@ impl Ui {
             let mut output = self.ctx.run_ui(input, |ui| {
                 let painter = ui.painter();
                 painter.image(self.texture.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                let layer = FilterLayer::new(rect, chain.clone()).corner_radius(radius);
+                let layer = ShaderLayer::new(rect, chain.clone()).corner_radius(radius);
                 textures.iter().enumerate().fold(layer, |layer, (slot, id)| match id {
                     Some(id) => layer.texture(slot, *id),
                     None => layer,
@@ -258,7 +258,7 @@ impl Ui {
             pixels = self.draw(&primitives, &mut textures_delta);
             textures_delta.clear();
         }
-        assert!(matches!(egui_filter_layers::status(&self.ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&self.ctx));
+        assert!(matches!(egui_shader_layers::status(&self.ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&self.ctx));
         pixels
     }
 
@@ -508,7 +508,7 @@ fn an_empty_chain_and_identity_effects_keep_the_frame() {
 fn default_tiling_equals_an_untiled_run() {
     let (_instance, adapter, device, queue) = gpu();
     let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
-    let (width, height) = (egui_filter_layers::offline::DEFAULT_MAX_TILE_SIZE + 200, 96);
+    let (width, height) = (egui_shader_layers::offline::DEFAULT_MAX_TILE_SIZE + 200, 96);
     assert!(device.limits().max_texture_dimension_2d >= width, "the device cannot run the frame untiled");
     let image = test_image(width, height, |_, _| 255);
     let frame = FrameRef::new(&image, width, height, AlphaMode::Straight);
@@ -595,8 +595,8 @@ fn original_returns_the_input_in_every_pass_and_tile() {
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
 fn offline_frame_input_follows_the_options_and_the_video_clock() {
-    use egui_filter_layers::PointerState;
-    use egui_filter_layers::offline::video::VideoProcessor;
+    use egui_shader_layers::PointerState;
+    use egui_shader_layers::offline::video::VideoProcessor;
 
     let (_instance, adapter, device, queue) = gpu();
     let (width, height) = (96, 64);
@@ -694,7 +694,7 @@ fn scaled_chains_refuse_tiling_and_run_whole() {
     for (name, chain) in scaled_cases() {
         let tiled = offline.process(&frame, &chain, &OfflineOptions::default().with_max_tile_size(Some(128)));
         match tiled {
-            Err(egui_filter_layers::OfflineError::NotTileable { reason }) => eprintln!("{name}: refused as expected: {reason}"),
+            Err(egui_shader_layers::OfflineError::NotTileable { reason }) => eprintln!("{name}: refused as expected: {reason}"),
             other => panic!("{name}: a scaled chain must refuse tiling, got {:?}", other.map(|frame| frame.width())),
         }
         let whole = offline.process(&frame, &chain, &OfflineOptions::default().with_max_tile_size(None)).unwrap_or_else(|error| panic!("{name}: {error}"));
@@ -775,11 +775,11 @@ fn missing_and_invalid_textures_are_typed_errors() {
     let texture = OfflineTexture::from_color_image(&ColorImage::new([1, 1], vec![Color32::WHITE]), TextureOptions::NEAREST).unwrap_or_else(|error| panic!("{error}"));
     let two = OfflineOptions::default().with_texture(0, texture.clone()).with_texture(1, texture.clone());
     match offline.process(&frame, &chain, &two) {
-        Err(egui_filter_layers::OfflineError::Texture(egui_filter_layers::TextureError::NotAttached { slot: 2, pass: 0, .. })) => {}
+        Err(egui_shader_layers::OfflineError::Texture(egui_shader_layers::TextureError::NotAttached { slot: 2, pass: 0, .. })) => {}
         other => panic!("slot 2 is read but empty: {:?}", other.map(|frame| frame.width())),
     }
     match offline.process(&frame, &chain, &two.clone().with_texture(3, texture.clone())) {
-        Err(egui_filter_layers::OfflineError::Texture(egui_filter_layers::TextureError::InvalidSlot { slot: 3 })) => {}
+        Err(egui_shader_layers::OfflineError::Texture(egui_shader_layers::TextureError::InvalidSlot { slot: 3 })) => {}
         other => panic!("slot 3 does not exist: {:?}", other.map(|frame| frame.width())),
     }
     assert!(offline.process(&frame, &chain, &two.clone().with_texture(2, texture)).is_ok());
@@ -787,7 +787,7 @@ fn missing_and_invalid_textures_are_typed_errors() {
     let wide = vec![255_u8; usize::try_from(side).unwrap_or(0) * 4];
     let too_large = OfflineTexture::new(&FrameRef::new(&wide, side, 1, AlphaMode::Straight), TextureOptions::NEAREST).unwrap_or_else(|error| panic!("{error}"));
     match offline.process(&frame, &chain, &two.with_texture(2, too_large)) {
-        Err(egui_filter_layers::OfflineError::TextureTooLarge { slot: 2, width, .. }) => assert_eq!(width, side),
+        Err(egui_shader_layers::OfflineError::TextureTooLarge { slot: 2, width, .. }) => assert_eq!(width, side),
         other => panic!("a texture beyond the device limit: {:?}", other.map(|frame| frame.width())),
     }
 }
@@ -831,7 +831,7 @@ fn offline_state_accumulates_across_runs_and_refuses_tiling() {
         assert!(out.pixels().chunks_exact(4).all(|px| px[..3].iter().all(|v| v.abs_diff(accumulated(2)) <= 1)), "{options:?}: a larger frame continues the state");
     }
     let tiled = offline.process(&FrameRef::new(&large, 120, 90, AlphaMode::Straight), &chain, &OfflineOptions::default().with_max_tile_size(Some(64)));
-    assert!(matches!(tiled, Err(egui_filter_layers::OfflineError::NotTileable { .. })), "{:?}", tiled.map(|frame| frame.width()));
+    assert!(matches!(tiled, Err(egui_shader_layers::OfflineError::NotTileable { .. })), "{:?}", tiled.map(|frame| frame.width()));
 }
 
 /// F7: the water preset. One impulse at the centre of an odd-sized frame spreads as a ring that
@@ -950,7 +950,7 @@ fn frame_star(ppp: f32) -> egui::Shape {
 impl Ui {
     /// The image under a layer covering it masked by `mask` (F9), as egui-wgpu draws it; the
     /// second frame's pixels.
-    fn render_masked(&self, chain: &FilterChain, mask: &egui_filter_layers::Mask) -> Vec<u8> {
+    fn render_masked(&self, chain: &FilterChain, mask: &egui_shader_layers::Mask) -> Vec<u8> {
         let rect = Rect::from_min_size(Pos2::ZERO, vec2(px(WIDTH) / self.ppp, px(HEIGHT) / self.ppp));
         let mut pixels = Vec::new();
         for _ in 0..2 {
@@ -959,14 +959,14 @@ impl Ui {
             let mut output = self.ctx.run_ui(input, |ui| {
                 let painter = ui.painter();
                 painter.image(self.texture.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-                FilterLayer::new(rect, chain.clone()).mask(mask.clone()).paint(painter);
+                ShaderLayer::new(rect, chain.clone()).mask(mask.clone()).paint(painter);
             });
             let mut textures_delta = std::mem::take(&mut output.textures_delta);
             let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
             pixels = self.draw(&primitives, &mut textures_delta);
             textures_delta.clear();
         }
-        assert!(matches!(egui_filter_layers::status(&self.ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&self.ctx));
+        assert!(matches!(egui_shader_layers::status(&self.ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&self.ctx));
         pixels
     }
 }
@@ -985,7 +985,7 @@ fn a_path_mask_offline_equals_the_ui_and_text_masks_are_refused() {
     for ppp in [1.0, 2.0] {
         let ui = Ui::new(wgpu::TextureFormat::Rgba8Unorm, false, ppp, &image);
         let mut offline = OfflineRenderer::from_render_state(&ui.state).unwrap_or_else(|error| panic!("{error}"));
-        let mask = egui_filter_layers::Mask::Shape(frame_star(ppp));
+        let mask = egui_shader_layers::Mask::Shape(frame_star(ppp));
         let expected = ui.render_masked(&chain, &mask);
         let options = OfflineOptions::default().with_pixels_per_point(ppp).with_time(TIME).with_mask(mask.clone()).with_output_alpha(AlphaMode::Premultiplied);
         let result = offline.process(&FrameRef::new(&image, WIDTH, HEIGHT, AlphaMode::Straight), &chain, &options).unwrap_or_else(|error| panic!("{error}"));
@@ -1019,11 +1019,11 @@ fn a_path_mask_offline_equals_the_ui_and_text_masks_are_refused() {
     // The font atlas upload is irrelevant here; epaint asserts deltas are handled.
     output.textures_delta.clear();
     let Some(galley) = galley else { panic!("the layout pass ran") };
-    let text = egui_filter_layers::Mask::Shape(egui::Shape::galley(pos2(10.0, 10.0), galley, Color32::WHITE));
+    let text = egui_shader_layers::Mask::Shape(egui::Shape::galley(pos2(10.0, 10.0), galley, Color32::WHITE));
     let refused = offline.process(&frame, &FilterChain::from(presets::invert(1.0)), &OfflineOptions::default().with_mask(text));
-    assert!(matches!(refused, Err(egui_filter_layers::OfflineError::Mask(egui_filter_layers::MaskError::Text))), "{:?}", refused.map(|frame| frame.width()));
+    assert!(matches!(refused, Err(egui_shader_layers::OfflineError::Mask(egui_shader_layers::MaskError::Text))), "{:?}", refused.map(|frame| frame.width()));
     let mut textured = egui::Mesh::with_texture(egui::TextureId::User(1));
     textured.add_rect_with_uv(Rect::from_min_max(pos2(0.0, 0.0), pos2(20.0, 20.0)), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-    let refused = offline.process(&frame, &FilterChain::from(presets::invert(1.0)), &OfflineOptions::default().with_mask(egui_filter_layers::Mask::Shape(egui::Shape::mesh(textured))));
-    assert!(matches!(refused, Err(egui_filter_layers::OfflineError::Mask(egui_filter_layers::MaskError::TexturedMesh { .. }))), "{:?}", refused.map(|frame| frame.width()));
+    let refused = offline.process(&frame, &FilterChain::from(presets::invert(1.0)), &OfflineOptions::default().with_mask(egui_shader_layers::Mask::Shape(egui::Shape::mesh(textured))));
+    assert!(matches!(refused, Err(egui_shader_layers::OfflineError::Mask(egui_shader_layers::MaskError::TexturedMesh { .. }))), "{:?}", refused.map(|frame| frame.width()));
 }

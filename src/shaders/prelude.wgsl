@@ -1,4 +1,4 @@
-// egui_filter_layers: prelude prepended to every effect.
+// egui_shader_layers: prelude prepended to every effect.
 //
 // Public surface for effect authors (see the crate docs, "Writing an effect"):
 //   fl.rect_uv, fl.texel, fl.size_px, fl.time, fl.pixels_per_point,

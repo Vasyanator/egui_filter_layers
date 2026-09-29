@@ -138,7 +138,7 @@ impl Assembled {
         let file = SimpleFile::new(name, text);
         let diagnostic = Diagnostic::error().with_message(message).with_labels(shown).with_notes(notes.clone());
         emit_into_string(&Config::default(), &file, &diagnostic).unwrap_or_else(|error| {
-            log::debug!("egui_filter_layers: could not render a WGSL diagnostic ({error}); using the plain message");
+            log::debug!("egui_shader_layers: could not render a WGSL diagnostic ({error}); using the plain message");
             std::iter::once(message.to_owned()).chain(notes).collect::<Vec<_>>().join("\n")
         })
     }

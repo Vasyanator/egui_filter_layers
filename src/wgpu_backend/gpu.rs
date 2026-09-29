@@ -268,7 +268,7 @@ pub(crate) fn egui_sampler_descriptor(options: egui::TextureOptions) -> wgpu::Sa
         egui::TextureWrapMode::MirroredRepeat => wgpu::AddressMode::MirrorRepeat,
     };
     wgpu::SamplerDescriptor {
-        label: Some("egui_filter_layers egui texture sampler"),
+        label: Some("egui_shader_layers egui texture sampler"),
         mag_filter: filter(options.magnification),
         min_filter: filter(options.minification),
         address_mode_u: address_mode,

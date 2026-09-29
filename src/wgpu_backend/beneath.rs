@@ -2,7 +2,7 @@
 File: wgpu_backend/beneath.rs
 
 Purpose:
-GPU-free selection of what lies "beneath" a filter layer in egui's final paint list, for the
+GPU-free selection of what lies "beneath" a shader layer in egui's final paint list, for the
 wgpu backend's offscreen re-render.
 
 Key functions:
@@ -15,7 +15,7 @@ Notes:
 The input is `FullOutput::shapes`: egui's exact paint order (layers flattened by `Order` and area
 order, layer transforms applied). Everything BEFORE the filter's own callback shape is beneath
 it; nothing after it is. Paint callbacks cannot be replayed into another render pass, so they are
-skipped — including filter layers painted lower down (the upper filter sees their unfiltered
+skipped — including shader layers painted lower down (the upper filter sees their unfiltered
 backdrop on wgpu).
 */
 
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use egui::epaint::{ClippedPrimitive, ClippedShape, Primitive};
 use egui::{Rect, Shape};
 
-/// Shapes selected beneath one filter layer, ready for tessellation.
+/// Shapes selected beneath one shader layer, ready for tessellation.
 #[derive(Debug, Default)]
 pub(super) struct Selection {
     /// Clones of the beneath shapes, clip rects intersected with the capture rect.

@@ -1,12 +1,12 @@
 # Module: src
 
 ## Purpose
-The whole `egui_filter_layers` library: a `FilterLayer` shape that redraws everything painted
+The whole `egui_shader_layers` library: a `ShaderLayer` shape that redraws everything painted
 beneath a rect through a chain of WGSL filter passes, on pluggable GPU backends.
 
 ## Architecture
 ```text
-user code ──► FilterLayer::paint (layer.rs)
+user code ──► ShaderLayer::paint (layer.rs)
                  │  checks user textures (plan::check_textures), the state id (check_state) and
                  │  the mask (check_mask); tessellates a shape mask (mask.rs, GUI thread);
                  │  resolves FilterChain -> LayerJob (rect, mask, passes, padding, time,
@@ -71,10 +71,10 @@ user code ──► FilterLayer::paint (layer.rs)
   `JobMask`, `tessellate` (the one tessellation, UI and offline: no pre-rasterized discs),
   `CoverageMeshes::pack` -> `PackedCoverage` (egui vertex bytes, absolute `u32` indices, one draw
   per texture run; every backend uploads exactly this), `MESH_WGSL`.
-- `layer.rs`: `FilterLayer` and its `paint` (skips a missing or failed backend, and a layer whose
+- `layer.rs`: `ShaderLayer` and its `paint` (skips a missing or failed backend, and a layer whose
   user textures fail `check_textures` (logged once per context and message); requests a repaint
   for animated chains only when the backend is usable; reads the per-frame input);
-  `FilterLayer::texture` attaches user textures (F8); `FilterLayer::id` / `state` /
+  `ShaderLayer::texture` attaches user textures (F8); `ShaderLayer::id` / `state` /
   `check_state` (F7: a stateful chain without an id is skipped, logged once per message).
 - `backend.rs`: crate-internal `Backend` trait, `LayerJob` (backend-neutral: rect, mask, passes,
   padding, time, `FrameInput`, attached texture ids), registry (`register`, `installed`, `uninstall`; a hook-less egui plugin, so it
@@ -106,7 +106,7 @@ user code ──► FilterLayer::paint (layer.rs)
 - `FlUniforms` byte layout: `pass::offsets` must match the WGSL struct (pinned by a naga-layout test).
   Members without a producer yet hold neutral values set in `FrameUniforms::for_layer`.
 - Per-frame input (`fl.delta_time`, `fl.frame`, `fl.pointer`): read on the GUI thread in
-  `FilterLayer::paint` into `LayerJob::frame_input` (per context, not per layer: every layer of a
+  `ShaderLayer::paint` into `LayerJob::frame_input` (per context, not per layer: every layer of a
   frame sees the same values; `stable_dt` clamped to `0..=0.1`, `cumulative_frame_nr` wrapping to
   `u32`, pointer in screen points). Backends resolve it at paint time with the callback's pixels
   per point (`FrameInput::resolve` -> `pass::InputUniforms`, pointer via
@@ -161,7 +161,7 @@ user code ──► FilterLayer::paint (layer.rs)
   it reads the display chain's current input as `src`, the latest state at binding 5, and writes
   the other of the layer's two state textures (`Slot::StateA` / `StateB`), `ceil(capture * scale)`
   texels over the whole capture; display steps bind the latest state. Stateful chains need
-  `FilterLayer::id`; states are kept per `(ViewportId, Id)` (egui counts frames per viewport) in
+  `ShaderLayer::id`; states are kept per `(ViewportId, Id)` (egui counts frames per viewport) in
   each backend's `StateRegistry` (wgpu: `WgpuResources::states`, outside the per-frame pool, dropped
   on re-install; glow: `GlowState::states`, freed by eviction / `destroy_glow`; offline: the
   renderer's one state). The first paint of a key in a frame steps it; a repeat skips the state
@@ -172,7 +172,7 @@ user code ──► FilterLayer::paint (layer.rs)
   (else refused, `failed_states`; never downgraded); RGBA8 is opt-in. Stateful runs are never
   windowed (offline: `NotTileable`).
 - Shape masks (F9): a `Mask::Shape` is in LAYER points, tessellated where the job is built
-  (`FilterLayer::paint` on the GUI thread with the context's ppp / tessellation options / font
+  (`ShaderLayer::paint` on the GUI thread with the context's ppp / tessellation options / font
   atlas size; offline per run with default options), without egui's pre-rasterized discs (only
   text samples the font atlas). Coverage = the meshes' alpha (an ADDITIVE, saturating union into a
   cleared RGBA8 texture at capture resolution, the run's window at its origin; abutting pieces'
@@ -185,7 +185,7 @@ user code ──► FilterLayer::paint (layer.rs)
   packer skips such meshes too, so no out-of-range index reaches a draw); offline also text and textured meshes (`OfflineError::Mask`). A mask texture
   the renderer cannot resolve skips the layer (`failed_textures`; wgpu: a stale font atlas skips
   only the frame).
-- Regions (R1, `Mask::Regions` / `FilterLayer::regions`, at most `MAX_REGIONS` = 255): the union
+- Regions (R1, `Mask::Regions` / `ShaderLayer::regions`, at most `MAX_REGIONS` = 255): the union
   of the regions is the coverage (F9 path); `plan::ChainPlan::with_regions` adds two id passes
   after the coverage draw into `Slot::RegionId` (window at the texture origin, cleared to 255,
   no blend: pass A threshold 0 = every touched pixel, pass B threshold 0.5; later regions win),

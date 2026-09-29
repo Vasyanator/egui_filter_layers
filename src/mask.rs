@@ -65,9 +65,9 @@ pub const REGION_NONE: u32 = 255;
 ///
 /// ```no_run
 /// # fn demo(ui: &mut egui::Ui, rect: egui::Rect) {
-/// use egui_filter_layers::{FilterLayer, Region, presets};
+/// use egui_shader_layers::{ShaderLayer, Region, presets};
 /// let (left, right) = rect.split_left_right_at_fraction(0.5);
-/// FilterLayer::new(rect, presets::gaussian_blur(6.0)).regions([Region::rounded_rect(left, 8), Region::rounded_rect(right, 8)]).paint(ui.painter());
+/// ShaderLayer::new(rect, presets::gaussian_blur(6.0)).regions([Region::rounded_rect(left, 8), Region::rounded_rect(right, 8)]).paint(ui.painter());
 /// # }
 /// ```
 #[derive(Clone, Debug, PartialEq)]
@@ -103,16 +103,16 @@ impl Region {
 ///
 /// ```no_run
 /// # fn demo(ui: &mut egui::Ui, rect: egui::Rect) {
-/// use egui_filter_layers::{FilterLayer, Mask, presets};
+/// use egui_shader_layers::{ShaderLayer, Mask, presets};
 /// let circle = egui::Shape::circle_filled(rect.center(), rect.height() * 0.5, egui::Color32::WHITE);
-/// FilterLayer::new(rect, presets::gaussian_blur(6.0)).mask(Mask::Shape(circle)).paint(ui.painter());
+/// ShaderLayer::new(rect, presets::gaussian_blur(6.0)).mask(Mask::Shape(circle)).paint(ui.painter());
 /// # }
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Mask {
     /// The layer rect with rounded corners (layer points), anti-aliased over one pixel. The
-    /// default ([`CornerRadius::ZERO`]: the plain rect); what `FilterLayer::corner_radius` sets.
+    /// default ([`CornerRadius::ZERO`]: the plain rect); what `ShaderLayer::corner_radius` sets.
     RoundedRect(CornerRadius),
     /// Any egui shape in LAYER points (the space the layer's rect is in): paths, circles, rects,
     /// meshes, text galleys (UI only), or a `Shape::Vec` of them. Its alpha is the coverage:
@@ -129,7 +129,7 @@ pub enum Mask {
     /// this list; `REGION_NONE` outside every region), e.g. to index per-region parameters
     /// (`p.tint[region()]`). Where regions overlap, the LATER one owns the pixels; the boundary
     /// between two regions is pixel-hard at the later region's 50 % coverage contour. An empty
-    /// list is a mask covering nothing. `FilterLayer::regions` is the shorthand.
+    /// list is a mask covering nothing. `ShaderLayer::regions` is the shorthand.
     Regions(Vec<Region>),
 }
 
