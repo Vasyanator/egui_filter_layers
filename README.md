@@ -589,12 +589,10 @@ ffmpeg -framerate 25 -i frames/frame_%04d.ppm \
   -filter_complex "split[a][b];[a]palettegen[p];[b][p]paletteuse=dither=bayer:bayer_scale=4" -loop 0 waves.gif
 ```
 
-**Wayland**: `--screenshot` and `--record` can hang on native Wayland: launched from a script,
-the window draws its first two frames and then never redraws, so the capture never arrives. A
-minimal eframe app that requests a repaint every frame stalls the same way, so this is winit /
-eframe waiting for a frame callback the compositor does not send (typically for a window it does
-not show), not the demo. Run under XWayland instead: `WAYLAND_DISPLAY= cargo run --example demo
---features hot-reload -- ... --screenshot out.ppm`.
+**Wayland**: `--screenshot` and `--record` need the window to keep redrawing. On Wayland the
+compositor stops sending frame callbacks while the output is off or the window is not shown, so a
+capture started with the screen off stalls after the first frames. Keep the display on, or run
+under XWayland: `WAYLAND_DISPLAY= cargo run --example demo --features hot-reload -- ... --screenshot out.ppm`.
 
 ## License
 

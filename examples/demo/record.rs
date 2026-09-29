@@ -25,9 +25,9 @@ creates the output directory), and the window closes only once the writer has dr
 frame waits for the writer: deliberate backpressure in these scripted capture modes, because
 rendering on while a frame waits would paint the pinned step extra times and make recordings of
 stateful scenes depend on disk speed.
-Both modes need eframe to keep redrawing. On native Wayland a script-launched window stops after
-two frames (winit waits for a frame callback the compositor withholds; a bare eframe app behaves
-the same), so run scripted captures under XWayland (`WAYLAND_DISPLAY=`).
+Both modes need eframe to keep redrawing. On Wayland the compositor withholds frame callbacks while
+the output is off or the window is not shown, so a capture then stalls after the first frames; keep
+the display on or run under XWayland (`WAYLAND_DISPLAY=`).
 */
 
 use std::path::{Path, PathBuf};

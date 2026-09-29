@@ -14,9 +14,9 @@ processors. They are also the manual test bench for both backends.
   - `record.rs`: `--record` / `--screenshot` machinery and the PPM writer thread (`FrameWriter`,
     bounded queue: the GUI thread does no file I/O; a full queue blocks the hand-over on purpose so
     each step is painted a fixed number of times); scene-independent.
-    On native Wayland a script-launched window stalls after two frames (winit waits for a frame
-    callback the compositor withholds; a bare eframe app does the same), so scripted captures
-    run under XWayland: `WAYLAND_DISPLAY= cargo run --example demo ...`.
+    On Wayland the compositor withholds frame callbacks while the output is off or the window is
+    not shown, so a capture then stalls after the first frames; keep the display on or run under
+    XWayland (`WAYLAND_DISPLAY= cargo run --example demo ...`).
   - `backdrop.rs`: the shared busy content scenes paint beneath their layers (`Backdrop::paint`,
     `CircleMotion`, `scroll_widgets` of real widgets).
   - `stack.rs`: the preset stack editor (`Kind`, `Entry`, `StackEditor`, `parse_stack`) incl. the
