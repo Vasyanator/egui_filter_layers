@@ -500,6 +500,7 @@ Each phase is marked done here in the same commit that lands it.
 - Phase R1b (§19.3.6 regions on glow: `glsl::translate_mesh(target, MeshEntry)` (`fs_main` | `fs_region`, pinned per target); `coverage.rs` region program + RGBA8 region-id target (cleared to 255), id passes A / B with blend off and per-region `region_locals` via `glBufferSubData`, `CoverageResources::fits` (mismatch latches); `render.rs` `with_regions(count)` for every mask, `target_of(Slot::RegionId)`, `allocations().region`; `RenderTarget::clear_to`; `Unsupported::RegionMasks` removed (and `JobMask::regions` now test-only, stale R1b `allow(dead_code)` in `plan.rs` dropped); GPU tests glow grid (0 / 4x MSAA) / NONE / empty list / overlap, mutation-checked (pass A dropped fails grid + NONE)): done.
 - Phase R2a (§19.5 bench part 1: `tests/common/mod.rs` (`GridScene` N tinted frosted tiles on a busy backdrop, one chain for both modes: blur + tint by `region()` with a per-layer `p.index` fallback; `time_per_frame` 10 warm-up + 100 timed frames; `print_table`), `#[ignore]` `bench_many_elements` at the end of both headless files, modes Layers / Regions, N in {4, 16, 64} plus a backdrop-only baseline, each mode asserted to apply the glass; demo scene `grid` (`GridMode` = R2b's extension point for entries), `FrameTimer` moved from bloom into `scenes/mod.rs`): done. First numbers (dev machine, Ryzen 5 9600X iGPU, Mesa 26.0.3, release, 256x128, ms/frame incl. GPU completion + readback): wgpu/Vulkan backdrop 0.09, layers 0.56 / 1.34 / 5.54, regions 0.41 / 0.44 / 0.52 (N = 4 / 16 / 64); glow backdrop 0.15, layers 0.48 / 0.76 / 1.57, regions 0.41 / 0.43 / 0.56.
 - Phase R1c (§19.3 regions offline: the `OfflineOptions::validate` / `run` refusal removed, `run` tessellates `Mask::Regions` with `tessellate_regions` and hands each tile's `CoverageJob` the `PackedRegions` draw ranges; `Mask::check_offline` already visited every region (R1a), `offline/options.rs` docs + unit test (textured region, > 255 regions, empty list); §18 sRGB seam fixed by the texture-coverage snap in `composite.wgsl` `fl_coverage`; `plan::REGION_PASS_B_THRESHOLD` = `0.5 - 1/128`; GPU tests `region_masks_offline_equal_the_ui` / `tiled_region_masks_equal_whole` (Vulkan + GL), the wgpu sRGB grid now checks the shared edges): done.
+- Phase R3a (§19.4 entries core + `plan::schedule` + wgpu UI + offline: `src/entry.rs` (`Entry`, `Overlap`); `ShaderLayer` = entries + overlap + id (`from_entries` / `with_entry` / `overlap` / `overlap_mode` / `entries`, layer-level builders reach every entry, accessors the first, `rect()` = union; `FilterChain::new` const); `LayerJob { rect, entries: Vec<EntryJob>, overlap, .. }`, `LayerJob::state_key(index)`; `TextureError::{InvalidSlot, NotAttached}` / `StateError::MissingId` gain `entry`; `geometry::entry_rect`; `plan::{CaptureSource, Op, schedule, composite_for_origin, composite_step_uniforms, entry_state_key}`; wgpu `chain.rs` `RecordedRun` (+ hand-off bind groups from `ChainJob::handoff_origins`), `record_handoff` (replace pipeline into `HANDOFF_FORMAT`), `gpu::begin_pass_load`; wgpu UI: one selection over the padded captures' bounding box, meshes packed once, one pool slot / capture / run per entry, ops executed in schedule order, `paint` composites per entry; offline `offline/layer.rs` (`OfflineEntry`, `OfflineLayer`, `process_layer{,_into,_async}`, per-entry captures / textures / states, blended composite over a frame copy, never tiled); glow refuses multi-entry layers (`Unsupported::MultiEntryLayers`, once-logged, temporary until R3b); tests: schedule orders / hand-offs / three entries, entry checks, layer job; wgpu headless far-apart (`fl.size_px` = own capture), Independent / Stacked overlap incl. AA edge, three stacked entries with padded captures (mutation-checked: no hand-offs fails both stacked tests), per-entry states and textures; offline bit-for-bit both modes at 1 and 2 ppp, tiling / option refusals, per-entry states; glow refusal): done.
 
 ## 18. Findings during execution
 - Phase 1: naga's GLSL writer rejects one texture read through two samplers in one module
@@ -735,6 +736,33 @@ Each phase is marked done here in the same commit that lands it.
   `egui-shader-layers` (lib `egui_shader_layers`, repo `Vasyanator/egui-shader-layers`) and
   `FilterLayer` -> `ShaderLayer` for 0.2.0, because 0.2 layers are no longer only filters
   (state simulations, textures, masks). Other names stay; this document uses the new names.
+- Phase R3a deviations from §19.4: the hand-off composites are extra draws of the EARLIER run's
+  own uniform buffer (`ChainJob::handoff_origins` -> `chain_uniforms` appends one
+  `composite_step_uniforms(composite_for_origin(..))` block each; `record` returns them as
+  `RecordedRun::handoffs`), so `record_handoff` only records a pass (`LoadOp::Load`) with the
+  replace pipeline cached in `ChainResources` (`HANDOFF_FORMAT` = `Rgba8Unorm`, the UI capture and
+  the offline frame format); no second uniform upload per hand-off. `schedule` takes
+  `&[Option<LayerGeometry>]` (invisible entries get no op, indices stay the layer's). The state
+  key of EVERY entry, single-entry layers included, is `id.with(index)` (uniform; a layer that
+  gains entries keeps entry 0's state). `TextureError::InvalidSlot` also names the entry.
+  Offline `process_layer` refuses a mask / texture / state set on the `OfflineOptions`
+  (`InvalidOption`, the setting is per entry) instead of ignoring it, and never tiles, also for a
+  one-entry `OfflineLayer`; video stays single-chain ("0.2: layers are images only", §19.4.6's
+  manager call). The wgpu selection is clipped to the BOUNDING BOX of the entries' padded
+  captures, so shapes between far-apart entries are still selected and tessellated (not
+  re-rendered: every entry draws only meshes whose scissor meets its own capture, meshes are
+  packed once); a per-capture selection would need one tessellation per entry.
+- Phase R3a: glow-only builds cannot read the schedule yet: `plan::{CaptureSource, Op, schedule,
+  composite_for_origin, intersect}`, `geometry::entry_rect`, `LayerJob::overlap` and
+  `EntryJob::rect` carry `cfg_attr(not(feature = "wgpu"), allow(dead_code))` marked TEMPORARY
+  until R3b (which executes the schedule on glow and must drop them).
+- Phase R3a, UI == offline: bit for bit in both modes at 1 and 2 ppp with three overlapping
+  entries (rounded blur + invert, circle-masked tint, pixelate). §19.4.2's claim that an earlier
+  entry's RE-RENDER equals a later entry's (the hand-off writes the earlier capture outside the
+  earlier mask) holds byte for byte also on antialiased content at fractional positions (a circle
+  and text straddling the overlap: `Stacked` == `Independent` outside the earlier mask,
+  `a_hand_off_outside_the_earlier_mask_keeps_the_backdrop`, Vulkan and GL); the test was
+  mutation-checked (a hand-off origin off by one pixel: 516 pixels differ).
 
 # 19. Multi-region layers (R1 regions, R2 benchmark, R3 entries) — design and phases
 

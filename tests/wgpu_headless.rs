@@ -26,6 +26,11 @@
 //! tinted per `region()` fills its cells, switches tint within a pixel of every shared edge with
 //! full coverage there and no `REGION_NONE` fringe; overlapping regions: the later one wins;
 //! `region()` is `REGION_NONE` outside the regions and on a layer without regions.
+//! Entries (R3): far-apart entries capture only their own rects (`fl.size_px`); overlapping
+//! entries in `Independent` (later filters the backdrop) and `Stacked` (later filters the earlier
+//! result, also at its antialiased edge) modes; three stacked entries with padded captures (the
+//! hand-off case of roadmap §19.10 risk 1); outside the earlier mask a hand-off keeps the
+//! backdrop byte for byte (antialiased content included); per-entry states and textures.
 //!
 //! All tests share one wgpu device (`GPU`, a test-only static; see there) and run in parallel on it.
 //!
@@ -38,7 +43,7 @@ use std::sync::Arc;
 
 use egui::{Align2, Color32, ColorImage, FontId, Pos2, Rect, TextureOptions, pos2, vec2};
 use egui::emath::TSTransform;
-use egui_shader_layers::{BackendStatus, Effect, FilterChain, ShaderLayer, Pass, Region, StateFormat, StateOptions, WgpuOptions, install_wgpu, presets};
+use egui_shader_layers::{BackendStatus, Effect, Entry, FilterChain, Overlap, ShaderLayer, Pass, Region, StateFormat, StateOptions, WgpuOptions, install_wgpu, presets};
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 128;
@@ -1463,6 +1468,243 @@ fn overlapping_regions_later_wins() {
             assert_near(&pixels, 40, 60, REGION_TINTS[1], &format!("{what}: first column of the small region"));
         }
     }
+}
+
+// ---- R3: several entries in one layer ----
+
+/// The uniform backdrop of the entry scenes.
+const ENTRY_BACKDROP: Color32 = Color32::from_rgb(100, 150, 200);
+/// `ENTRY_BACKDROP` inverted.
+const ENTRY_INVERTED: [u8; 3] = [155, 105, 55];
+/// `ENTRY_BACKDROP` tinted halfway to red ([`entry_tint`]).
+const ENTRY_TINTED: [u8; 3] = [178, 75, 100];
+/// `ENTRY_INVERTED` tinted halfway to red.
+const ENTRY_TINTED_INVERTED: [u8; 3] = [205, 53, 28];
+
+/// Mixes the input halfway to opaque red (a pointwise effect: its result depends only on the
+/// pixel it reads).
+fn entry_tint() -> Pass {
+    pass_of("half red", "fn effect(uv: vec2<f32>) -> vec4<f32> { let c = src(uv); return vec4<f32>(mix(c.rgb, vec3<f32>(1.0, 0.0, 0.0), 0.5), c.a); }")
+}
+
+/// Paints the uniform entry backdrop over the whole screen.
+fn entry_backdrop(painter: &egui::Painter) {
+    painter.rect_filled(Rect::from_min_max(pos2(0.0, 0.0), pos2(256.0, 128.0)), 0.0, ENTRY_BACKDROP);
+}
+
+/// Renders `layer` over the entry backdrop for two frames (the first uploads the font atlas) and
+/// returns the second frame's pixels.
+fn render_entries(layer: &ShaderLayer) -> Vec<u8> {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let mut paint = |ui: &mut egui::Ui| {
+        entry_backdrop(ui.painter());
+        layer.clone().paint(ui.painter());
+    };
+    render_frame(&ctx, &state, &target, &mut paint);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
+    assert!(egui_shader_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_shader_layers::failed_effects(&ctx));
+    pixels
+}
+
+/// R3: two far-apart entries with different chains filter only their own rects, the pixels
+/// between them stay the backdrop, and each captures only ITS OWN padded rect: an effect writing
+/// `fl.size_px` (the capture size) sees 32x32 and 48x24, not the 240-pixel-wide union.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn two_entries_far_apart_capture_only_their_windows() {
+    let left = Rect::from_min_max(pos2(8.0, 8.0), pos2(40.0, 40.0));
+    let right = Rect::from_min_max(pos2(200.0, 16.0), pos2(248.0, 40.0));
+    let pixels = render_entries(&ShaderLayer::from_entries([Entry::new(left, presets::invert(1.0)), Entry::new(right, entry_tint())]));
+    assert_near(&pixels, 20, 20, ENTRY_INVERTED, "left entry: invert");
+    assert_near(&pixels, 220, 30, ENTRY_TINTED, "right entry: tint");
+    for (x, y) in [(120, 30), (4, 4), (220, 60), (100, 100)] {
+        assert_near(&pixels, x, y, [100, 150, 200], "outside every entry");
+    }
+    let size = |label: &str, blue: f32| pass_of(label, &format!("fn effect(uv: vec2<f32>) -> vec4<f32> {{ return vec4<f32>(fl.size_px / 255.0, {blue:.1}, 1.0); }}"));
+    let chain_right = FilterChain::from(presets::invert(1.0)).then(size("size b", 1.0));
+    let pixels = render_entries(&ShaderLayer::from_entries([Entry::new(left, size("size a", 0.0)), Entry::new(right, chain_right)]));
+    assert_eq!(rgb(&pixels, 20, 20), [32, 32, 0], "the left entry's capture is its own 32x32 rect");
+    assert_eq!(rgb(&pixels, 220, 30), [48, 24, 255], "the right entry's capture is its own 48x24 rect");
+}
+
+/// The overlap scene: entry 0 inverts `(20, 20)..(120, 100)`, entry 1 tints `(80.25, 40)..(200,
+/// 110)` (its left edge a quarter pixel into column 80: coverage 0.75 there).
+fn overlapping_entries(overlap: Overlap) -> ShaderLayer {
+    let first = Rect::from_min_max(pos2(20.0, 20.0), pos2(120.0, 100.0));
+    let second = Rect::from_min_max(pos2(80.25, 40.0), pos2(200.0, 110.0));
+    ShaderLayer::from_entries([Entry::new(first, presets::invert(1.0)), Entry::new(second, entry_tint())]).overlap(overlap)
+}
+
+/// `a + (b - a) * t` per channel, rounded.
+fn mix_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+    std::array::from_fn(|c| {
+        let value = f32::from(a[c]) + (f32::from(b[c]) - f32::from(a[c])) * t;
+        // In 0..=255 by construction.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rounded = value.round() as u8;
+        rounded
+    })
+}
+
+/// R3 `Independent`: where the entries overlap the later one filters the ORIGINAL backdrop
+/// (tint, not tint of invert); its antialiased edge blends over the earlier entry's result.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn overlapping_entries_independent_later_wins() {
+    let pixels = render_entries(&overlapping_entries(Overlap::Independent));
+    assert_near(&pixels, 40, 50, ENTRY_INVERTED, "entry 0 only");
+    assert_near(&pixels, 150, 105, ENTRY_TINTED, "entry 1 only");
+    assert_near(&pixels, 100, 70, ENTRY_TINTED, "overlap: the later entry filters the backdrop");
+    assert_near(&pixels, 80, 70, mix_rgb(ENTRY_INVERTED, ENTRY_TINTED, 0.75), "entry 1's AA edge over entry 0's result");
+    assert_near(&pixels, 230, 120, [100, 150, 200], "outside");
+}
+
+/// R3 `Stacked`: the later entry filters the earlier one's result (the hand-off), also at its
+/// antialiased edge.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn overlapping_entries_stacked_compose() {
+    let pixels = render_entries(&overlapping_entries(Overlap::Stacked));
+    assert_near(&pixels, 40, 50, ENTRY_INVERTED, "entry 0 only");
+    assert_near(&pixels, 150, 105, ENTRY_TINTED, "entry 1 only: the backdrop");
+    assert_near(&pixels, 100, 70, ENTRY_TINTED_INVERTED, "overlap: tint of the inverted backdrop");
+    assert_near(&pixels, 80, 70, mix_rgb(ENTRY_INVERTED, ENTRY_TINTED_INVERTED, 0.75), "entry 1's AA edge over entry 0's result");
+    assert_near(&pixels, 230, 120, [100, 150, 200], "outside");
+}
+
+/// R3 risk 1 (roadmap §19.10): three `Stacked` entries where entry 0 overlaps entry 2 but not
+/// entry 1, and entry 1 overlaps entry 2; entries 0 and 2 are padded (sample radii), so the
+/// hand-off viewports are clipped to the later padded capture. Entry 2 sees both inverts; in
+/// `Independent` it sees neither.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn three_stacked_entries_hand_off_where_they_overlap() {
+    let layer = |overlap| {
+        ShaderLayer::from_entries([
+            Entry::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(60.0, 60.0)), presets::invert(1.0).with_sample_radius(3.0)),
+            Entry::new(Rect::from_min_max(pos2(150.0, 10.0), pos2(200.0, 60.0)), presets::invert(1.0)),
+            Entry::new(Rect::from_min_max(pos2(40.0, 30.0), pos2(170.0, 50.0)), entry_tint().with_sample_radius(4.0)),
+        ])
+        .overlap(overlap)
+    };
+    let stacked = render_entries(&layer(Overlap::Stacked));
+    assert_near(&stacked, 20, 20, ENTRY_INVERTED, "entry 0 only");
+    assert_near(&stacked, 190, 20, ENTRY_INVERTED, "entry 1 only");
+    assert_near(&stacked, 100, 40, ENTRY_TINTED, "entry 2 only");
+    assert_near(&stacked, 50, 40, ENTRY_TINTED_INVERTED, "entries 0 and 2");
+    assert_near(&stacked, 160, 40, ENTRY_TINTED_INVERTED, "entries 1 and 2");
+    assert_near(&stacked, 100, 100, [100, 150, 200], "outside");
+    // Just outside entry 0's region but inside entry 2's padded capture: the backdrop, handed
+    // off as entry 0's original there.
+    assert_near(&stacked, 62, 40, ENTRY_TINTED, "entry 2 beside entry 0");
+    let independent = render_entries(&layer(Overlap::Independent));
+    assert_near(&independent, 50, 40, ENTRY_TINTED, "independent: entry 2 over entry 0");
+    assert_near(&independent, 160, 40, ENTRY_TINTED, "independent: entry 2 over entry 1");
+}
+
+/// R3 (§19.4.2): outside the earlier entry's MASK a `Stacked` hand-off writes the earlier
+/// entry's own re-render of the backdrop into the later capture; it must equal the later entry's
+/// re-render there, also on antialiased content (a circle and text straddling the overlap, drawn
+/// at fractional positions). So `Stacked` equals `Independent` byte for byte wherever the earlier
+/// mask covers nothing.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn a_hand_off_outside_the_earlier_mask_keeps_the_backdrop() {
+    let layer = |overlap| {
+        let small = egui::Shape::circle_filled(pos2(30.0, 30.0), 6.0, Color32::WHITE);
+        ShaderLayer::from_entries([
+            Entry::new(Rect::from_min_max(pos2(20.0, 20.0), pos2(140.0, 110.0)), presets::invert(1.0)).mask(egui_shader_layers::Mask::Shape(small)),
+            Entry::new(Rect::from_min_max(pos2(60.0, 30.0), pos2(200.0, 120.0)), entry_tint().with_sample_radius(2.0)),
+        ])
+        .overlap(overlap)
+    };
+    let render = |overlap| {
+        let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+        let mut paint = |ui: &mut egui::Ui| {
+            let painter = ui.painter();
+            entry_backdrop(painter);
+            painter.circle_filled(pos2(100.3, 70.7), 23.4, Color32::from_rgb(250, 240, 20));
+            painter.text(pos2(66.6, 88.2), Align2::LEFT_TOP, "Hand-off", FontId::proportional(13.3), Color32::BLACK);
+            layer(overlap).paint(painter);
+        };
+        render_frame(&ctx, &state, &target, &mut paint);
+        render_frame(&ctx, &state, &target, &mut paint).0
+    };
+    let (stacked, independent) = (render(Overlap::Stacked), render(Overlap::Independent));
+    let (differing, max) = (60..140_u32).flat_map(|x| (30..110_u32).map(move |y| (x, y))).fold((0, 0), |(count, max), (x, y)| {
+        let diff = rgb(&stacked, x, y).iter().zip(rgb(&independent, x, y)).map(|(a, b)| a.abs_diff(b)).max().unwrap_or(0);
+        (count + usize::from(diff > 0), max.max(diff))
+    });
+    assert_eq!(differing, 0, "the overlap outside entry 0's mask: {differing} pixels differ, max {max}");
+    assert_near(&stacked, 30, 30, ENTRY_INVERTED, "entry 0's mask is still inverted");
+}
+
+/// R3 (D5): stateful entries of one layer (one id) keep separate states — two accumulators at
+/// different rates each show their own count; `reset_state` of the layer id restarts both.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn stateful_entries_keep_separate_states() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let slow = match Effect::new_state("accumulate slowly", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state_px(vec2<i32>(0)) + vec4<f32>(0.125); }") {
+        Ok(effect) => FilterChain::new().then(Pass::new(&effect)).then(pass_of("show", "fn effect(uv: vec2<f32>) -> vec4<f32> { return min(state(uv), vec4<f32>(1.0)); }")),
+        Err(error) => panic!("{error}"),
+    };
+    let id = egui::Id::new("entries with state");
+    let left = Rect::from_min_max(pos2(8.0, 8.0), pos2(120.0, 120.0));
+    let right = Rect::from_min_max(pos2(136.0, 8.0), pos2(248.0, 120.0));
+    let mut paint = |ui: &mut egui::Ui| {
+        halves(ui.painter());
+        ShaderLayer::from_entries([Entry::new(left, accumulator()), Entry::new(right, slow.clone())]).id(id).paint(ui.painter());
+    };
+    let slow_value = |frames: u32| [0, 32, 64, 96, 128].get(usize::try_from(frames).unwrap_or(0)).copied().unwrap_or(0);
+    for frame in 1..=4 {
+        let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+        assert_grey(&pixels, 60, 60, accumulated(frame), &format!("frame {frame}, fast entry"));
+        assert_grey(&pixels, 190, 60, slow_value(frame), &format!("frame {frame}, slow entry"));
+    }
+    assert_eq!(egui_shader_layers::state_count(&ctx), 2, "one state per entry");
+    egui_shader_layers::reset_state(&ctx, id);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+    assert_grey(&pixels, 60, 60, accumulated(1), "fast entry after reset_state");
+    assert_grey(&pixels, 190, 60, slow_value(1), "slow entry after reset_state");
+    // Without an id the whole layer is refused (both entries keep the backdrop).
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui: &mut egui::Ui| {
+        halves(ui.painter());
+        ShaderLayer::from_entries([Entry::new(left, presets::invert(1.0)), Entry::new(right, slow.clone())]).paint(ui.painter());
+    });
+    assert_near(&pixels, 60, 60, [255, 0, 0], "an entry of a refused layer draws nothing");
+    assert!(egui_shader_layers::failed_states(&ctx).is_empty());
+}
+
+/// R3: textures are per entry — the same effect reads the checker in one entry and a yellow
+/// texture in the other; the layer-level `texture` attaches one to every entry.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn entry_textures_are_per_entry() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let checker = ctx.load_texture("checker", checker(), TextureOptions::NEAREST);
+    let yellow = ctx.load_texture("yellow", ColorImage::new([2, 2], vec![Color32::YELLOW; 4]), TextureOptions::NEAREST);
+    let exact = pass_of("exact", TEX_EXACT);
+    let left = Rect::from_min_max(pos2(0.0, 0.0), pos2(128.0, 128.0));
+    let right = Rect::from_min_max(pos2(128.0, 0.0), pos2(256.0, 128.0));
+    let mut per_entry = |ui: &mut egui::Ui| {
+        halves(ui.painter());
+        ShaderLayer::from_entries([Entry::new(left, exact.clone()).texture(0, checker.id()), Entry::new(right, exact.clone()).texture(0, yellow.id())]).paint(ui.painter());
+    };
+    render_frame(&ctx, &state, &target, &mut per_entry);
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut per_entry);
+    // The left entry's own uv spans its capture: the checker's four texels in its quadrants.
+    for (x, y, colour) in [(32, 32, [255, 0, 0]), (96, 32, [0, 255, 0]), (32, 96, [0, 0, 255]), (96, 96, [255, 255, 255])] {
+        assert_eq!(rgb(&pixels, x, y), colour, "left entry: checker at ({x}, {y})");
+    }
+    assert_eq!(rgb(&pixels, 192, 64), [255, 255, 0], "right entry: its own texture");
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui: &mut egui::Ui| {
+        halves(ui.painter());
+        ShaderLayer::from_entries([Entry::new(left, exact.clone()), Entry::new(right, exact.clone())]).texture(0, yellow.id()).paint(ui.painter());
+    });
+    assert!(rgb(&pixels, 32, 32) == [255, 255, 0] && rgb(&pixels, 192, 64) == [255, 255, 0], "the layer-level texture reaches every entry");
+    assert!(egui_shader_layers::failed_textures(&ctx).is_empty(), "{:?}", egui_shader_layers::failed_textures(&ctx));
 }
 
 // ---- R2: benchmark (`tests/common/mod.rs` holds the scene builder shared with glow) ----

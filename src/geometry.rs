@@ -16,6 +16,8 @@ Key functions:
 - `LayerGeometry::composite_params()`: the composite pass's parameter block (every backend).
 - `pointer_uniform()`: the one screen-points -> capture-uv conversion of the pointer (`fl.pointer`),
   used by both backends and the offline renderer.
+- `entry_rect()`: an entry's rect (R3) under the layer transform, from the union rect as painted
+  and as rendered.
 - `mask_transform()`: the one layer-points -> capture-pixels mapping of a shape mask (F9), with
   the layer transform, used by both backends and the offline renderer.
 - `px_f32()`: exact pixel-count -> `f32` conversion shared by the backends.
@@ -180,6 +182,24 @@ pub(crate) fn mask_transform(painted: Rect, rendered: Rect, pixels_per_point: f3
     let translation = rendered.min - painted.min * s;
     let scale = pixels_per_point * s;
     MaskTransform { scale, origin_px: [px_f32(capture.x) - translation.x * pixels_per_point, px_f32(capture.y) - translation.y * pixels_per_point] }
+}
+
+/// Where one ENTRY of a multi-entry layer (R3) lands on screen: `entry` (layer points, the
+/// space of `painted`, the union of the entries as painted) under the layer transform that maps
+/// `painted` onto `rendered` (the paint callback's rect, screen points), derived like
+/// [`mask_transform`]: `t + s * entry`, `s` = [`transform_scale`], `t = rendered.min - s *
+/// painted.min`. An entry equal to `painted` (every single-entry layer) gets `rendered` itself,
+/// bit for bit, so single-entry geometry is unchanged; an untransformed layer maps every entry
+/// onto itself exactly (`s = 1`, `t = 0`).
+#[must_use]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
+pub(crate) fn entry_rect(painted: Rect, rendered: Rect, entry: Rect) -> Rect {
+    if entry == painted {
+        return rendered;
+    }
+    let s = transform_scale(painted, rendered);
+    let translation = rendered.min - painted.min * s;
+    Rect::from_min_max(translation.to_pos2() + entry.min.to_vec2() * s, translation.to_pos2() + entry.max.to_vec2() * s)
 }
 
 /// Computes the geometry of one layer, or `None` when nothing of it is visible.
@@ -403,5 +423,21 @@ mod tests {
         // The rendered rect's top-left corner is `rect_uv.xy`.
         let corner = pointer_uniform(Some((rendered.min, false)), ppp, g.capture);
         assert!(approx(corner[0], g.rect_uv[0]) && approx(corner[1], g.rect_uv[1]), "{corner:?} vs {:?}", g.rect_uv);
+    }
+
+    /// R3: an entry's rect follows the layer transform the union rect reveals; an entry equal to
+    /// the union (every single-entry layer) gets the rendered rect bit for bit, and an
+    /// untransformed layer leaves every entry exactly where it was painted.
+    #[test]
+    fn entries_follow_the_layer_transform() {
+        let painted = Rect::from_min_max(pos2(10.0, 20.0), pos2(110.0, 70.0));
+        let entry = Rect::from_min_max(pos2(60.0, 30.0), pos2(90.0, 50.0));
+        let transform = egui::emath::TSTransform::new(vec2(7.5, -3.0), 1.75);
+        let rendered = transform * painted;
+        let mapped = entry_rect(painted, rendered, entry);
+        let expected = transform * entry;
+        assert!(approx(mapped.min.x, expected.min.x) && approx(mapped.min.y, expected.min.y) && approx(mapped.max.x, expected.max.x) && approx(mapped.max.y, expected.max.y), "{mapped:?} vs {expected:?}");
+        assert_eq!(entry_rect(painted, rendered, painted), rendered, "the union itself is the rendered rect");
+        assert_eq!(entry_rect(painted, painted, entry), entry, "untransformed: exact");
     }
 }

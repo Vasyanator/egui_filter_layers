@@ -8,18 +8,26 @@ draws the chain's composite into egui's render pass.
 
 Key structures:
 - `FilterCallback`: one painted layer (its `LayerJob` + hand-over slot + install state).
+- `EntryRun`, `BackdropDraw`, `MeshBuffers`: one entry's run inputs, one re-render's inputs, the
+  layer's beneath meshes uploaded once.
 
 Key functions:
 - `FilterCallback::prepare()` / `finish_prepare()` / `paint()`.
 - `mesh_locals()`, `scissor_in_capture()`: pure helpers (unit-tested).
 
 Notes:
-Order within `prepare`: every pipeline is resolved BEFORE anything is recorded, so a failing
-effect skips the layer without leaving half-recorded work. Nothing here panics; a missing plan
+Order within `prepare`: every entry's geometry, state format and pipelines are resolved BEFORE
+anything is recorded, so a failing effect skips the layer without leaving half-recorded work.
+Then the ops of `plan::schedule` (pristine source) run in order (R3): the beneath meshes are
+packed and uploaded once (into the first visible entry's pool slot); `Capture` re-renders them
+into that entry's own capture (scissored per mesh), `Run` records its chain (one pool slot per
+entry), `HandOff` draws an earlier entry's replace composite into a later capture (`Stacked`),
+`Composite` is kept for `paint`, which draws them in that order. Nothing here panics; a missing plan
 (the end-of-pass plugin never saw the layer) or a mismatched generation simply draws nothing
 (the missing plan is debug-logged once per install, `Shared::logged`).
-Stateful layers (F7): the layer's state entry (`WgpuResources::states`, keyed by viewport and id,
-outside the per-frame pool) is looked up before recording and updated after it; a state format
+Stateful entries (F7): an entry's state (`WgpuResources::states`, keyed by viewport and the
+entry's key `LayerJob::state_key`, outside the per-frame pool) is looked up at its `Run` and
+updated after it (the layer's reset ticket is claimed once per paint); a state format
 the device cannot render / filter skips the layer (`Shared::fail_state`). Unpainted states are
 evicted at every prepare (`StateRegistry::evict`).
 A shape mask (F9) or region mask (R1) is packed here and handed to the chain executor with its
@@ -38,14 +46,13 @@ use egui::epaint::{ClippedPrimitive, Primitive};
 use egui_wgpu::{CallbackResources, ScreenDescriptor};
 
 use super::coverage::CoverageJob;
-use super::chain::{ChainJob, ChainRecording, ChainSource, ChainState, ChainWindow, draw_composite_over};
+use super::chain::{ChainJob, ChainRecording, ChainSource, ChainState, ChainWindow, RecordedRun, draw_composite_over};
 use super::gpu::{Target, begin_pass};
 use super::resources::{CAPTURE_FORMAT, CAPTURE_SRGB_VIEW_FORMAT, WgpuResources};
-use super::{BeneathPlan, Drawn, LayerSlot, LoggedOnce, Shared};
-use crate::backend::LayerJob;
-use crate::geometry::{LayerGeometry, PxRect, layer_geometry, mask_transform, px_f32, transform_scale};
-use crate::plan::{MESH_LOCALS_SIZE, StatePlanInput, mesh_locals};
-use crate::state::StateKey;
+use super::{BeneathPlan, Drawn, DrawnEntry, LayerSlot, LoggedOnce, Shared};
+use crate::backend::{EntryJob, LayerJob};
+use crate::geometry::{LayerGeometry, PxRect, entry_rect, layer_geometry, mask_transform, px_f32, transform_scale};
+use crate::plan::{CaptureSource, MESH_LOCALS_SIZE, Op, StatePlanInput, mesh_locals, schedule};
 
 /// One painted shader layer, as egui-wgpu sees it.
 pub(super) struct FilterCallback {
@@ -100,10 +107,8 @@ pub(super) fn scissor_in_capture(clip_rect: egui::Rect, pixels_per_point: f32, s
 
 /// Byte ranges of one mesh inside the concatenated vertex / index uploads.
 struct MeshRange {
-    /// Index into the plan's primitives.
+    /// Index into the plan's primitives (its clip rect gives each entry's scissor).
     primitive: usize,
-    /// Scissor in capture pixels.
-    scissor: [u32; 4],
     /// Byte range in the vertex buffer.
     vertices: std::ops::Range<u64>,
     /// Byte range in the index buffer.
@@ -112,13 +117,14 @@ struct MeshRange {
     index_count: u32,
 }
 
-/// Concatenates the drawable meshes (non-empty, texture known, scissor inside the capture) into
-/// vertex and index byte arrays.
-fn pack_meshes(plan: &BeneathPlan, pixels_per_point: f32, screen: [u32; 2], capture: PxRect) -> (Vec<u8>, Vec<u8>, Vec<MeshRange>) {
+/// Concatenates the drawable meshes (non-empty, texture known) into vertex and index byte
+/// arrays, once for every entry of the layer; each entry's re-render skips the meshes whose
+/// scissor misses its capture.
+fn pack_meshes(plan: &BeneathPlan) -> (Vec<u8>, Vec<u8>, Vec<MeshRange>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     let mut ranges = Vec::new();
-    for (index, ClippedPrimitive { clip_rect, primitive }) in plan.primitives.iter().enumerate() {
+    for (index, ClippedPrimitive { primitive, .. }) in plan.primitives.iter().enumerate() {
         let Primitive::Mesh(mesh) = primitive else {
             continue;
         };
@@ -128,16 +134,13 @@ fn pack_meshes(plan: &BeneathPlan, pixels_per_point: f32, screen: [u32; 2], capt
         let Ok(index_count) = u32::try_from(mesh.indices.len()) else {
             continue;
         };
-        let Some(scissor) = scissor_in_capture(*clip_rect, pixels_per_point, screen, capture) else {
-            continue;
-        };
         let vertex_start = u64::try_from(vertices.len()).unwrap_or(u64::MAX);
         let index_start = u64::try_from(indices.len()).unwrap_or(u64::MAX);
         vertices.extend_from_slice(bytemuck::cast_slice(&mesh.vertices));
         indices.extend_from_slice(bytemuck::cast_slice(&mesh.indices));
         let vertex_end = u64::try_from(vertices.len()).unwrap_or(u64::MAX);
         let index_end = u64::try_from(indices.len()).unwrap_or(u64::MAX);
-        ranges.push(MeshRange { primitive: index, scissor, vertices: vertex_start..vertex_end, indices: index_start..index_end, index_count });
+        ranges.push(MeshRange { primitive: index, vertices: vertex_start..vertex_end, indices: index_start..index_end, index_count });
     }
     (vertices, indices, ranges)
 }
@@ -168,13 +171,13 @@ impl FilterCallback {
         resources.get_mut::<WgpuResources>()
     }
 
-    /// Resolves every pass's pipeline (state passes in the layer's state format), or `None`
+    /// Resolves every pass's pipeline of `entry` (state passes in its state format), or `None`
     /// (layer skipped) when one failed.
-    fn pipelines(&self, device: &wgpu::Device, resources: &mut WgpuResources) -> Option<Vec<wgpu::RenderPipeline>> {
-        if self.job.passes.iter().any(|pass| self.shared.effect_failed(pass.effect().module())) {
+    fn pipelines(&self, device: &wgpu::Device, resources: &mut WgpuResources, entry: &EntryJob) -> Option<Vec<wgpu::RenderPipeline>> {
+        if entry.passes.iter().any(|pass| self.shared.effect_failed(pass.effect().module())) {
             return None;
         }
-        match resources.chain.pass_pipelines(device, &self.job.passes, self.job.state.format()) {
+        match resources.chain.pass_pipelines(device, &entry.passes, entry.state.format()) {
             Ok(pipelines) => Some(pipelines),
             Err((module, error)) => {
                 self.shared.fail_effect(&module, &error);
@@ -192,12 +195,26 @@ struct Recording<'a> {
     queue: &'a wgpu::Queue,
     /// egui's encoder.
     encoder: &'a mut wgpu::CommandEncoder,
-    /// Pixel geometry of the layer.
-    geometry: LayerGeometry,
     /// egui scale factor.
     pixels_per_point: f32,
     /// Screen size in pixels.
     screen: [u32; 2],
+}
+
+/// What recording one entry needs besides the layer's `Recording` and resources.
+struct EntryRun<'a> {
+    /// Index of the entry in the job.
+    index: usize,
+    /// Its `WgpuResources::pool` slot.
+    pool_index: usize,
+    /// Its geometry (screen pixels).
+    geometry: LayerGeometry,
+    /// Its passes' pipelines.
+    pipelines: &'a [wgpu::RenderPipeline],
+    /// Where its composite is handed off (`plan::Op::HandOff::origin`, in op order).
+    handoff_origins: &'a [[i32; 2]],
+    /// The layer's claimed `reset_state` request (one claim per paint, every stateful entry).
+    reset: bool,
 }
 
 impl egui_wgpu::CallbackTrait for FilterCallback {
@@ -217,7 +234,7 @@ impl egui_wgpu::CallbackTrait for FilterCallback {
             }
             return Vec::new();
         };
-        if self.shared.is_failed() || self.job.passes.is_empty() {
+        if self.shared.is_failed() || self.job.entries.is_empty() {
             return Vec::new();
         }
         let Some(resources) = self.resources(device, queue, callback_resources) else {
@@ -227,24 +244,41 @@ impl egui_wgpu::CallbackTrait for FilterCallback {
         // Unpainted states are freed here (every prepare checks), before this layer's own lookup.
         drop(resources.states.evict(self.job.viewport, self.job.frame_input.frame, f64::from(self.job.time)));
         self.shared.state_count.store(resources.states.len(), std::sync::atomic::Ordering::Relaxed);
-        let state_key = self.job.state_key();
-        if state_key.is_some()
-            && let Some(problem) = resources.chain.state_format_problem(self.job.state.format())
-        {
-            self.shared.fail_state(self.job.state.format(), problem);
+        // Every entry's geometry in screen pixels (`None`: invisible). A single entry's rect is
+        // the callback rect, so its geometry is what a single-entry layer always had.
+        let geometries: Vec<Option<LayerGeometry>> = self
+            .job
+            .entries
+            .iter()
+            .map(|entry| layer_geometry(entry_rect(self.job.rect, plan.callback_rect, entry.rect), plan.clip_rect, screen.pixels_per_point, screen.size_in_pixels, entry.padding_points, entry.mask.corner_radius(), plan.transform_scale))
+            .collect();
+        // State formats and pipelines of every visible entry BEFORE anything is recorded: one
+        // failing entry skips the whole layer (one layer, one decision) without half-recorded work.
+        let mut pipelines = Vec::with_capacity(self.job.entries.len());
+        for (index, (entry, geometry)) in self.job.entries.iter().zip(&geometries).enumerate() {
+            if geometry.is_none() {
+                pipelines.push(None);
+                continue;
+            }
+            if self.job.state_key(index).is_some()
+                && let Some(problem) = resources.chain.state_format_problem(entry.state.format())
+            {
+                self.shared.fail_state(entry.state.format(), problem);
+                return Vec::new();
+            }
+            let Some(entry_pipelines) = self.pipelines(device, resources, entry) else {
+                return Vec::new();
+            };
+            pipelines.push(Some(entry_pipelines));
+        }
+        let ops = schedule(&geometries, self.job.overlap, CaptureSource::Pristine);
+        if ops.is_empty() {
             return Vec::new();
         }
-        let Some(pipelines) = self.pipelines(device, resources) else {
-            return Vec::new();
-        };
-        let Some(geometry) = layer_geometry(plan.callback_rect, plan.clip_rect, screen.pixels_per_point, screen.size_in_pixels, self.job.padding_points, self.job.mask.corner_radius(), plan.transform_scale) else {
-            return Vec::new();
-        };
-        let mut recording = Recording { device, queue, encoder, geometry, pixels_per_point: screen.pixels_per_point, screen: screen.size_in_pixels };
-        let pool_index = resources.next_targets();
-        self.record(&mut recording, resources, pool_index, &plan, &pipelines, state_key);
+        let mut recording = Recording { device, queue, encoder, pixels_per_point: screen.pixels_per_point, screen: screen.size_in_pixels };
+        let drawn = self.record(&mut recording, resources, &plan, &geometries, &pipelines, &ops);
         self.shared.state_count.store(resources.states.len(), std::sync::atomic::Ordering::Relaxed);
-        self.slot.lock().drawn = Some(Drawn { generation: resources.generation, pool_index, region: geometry.region });
+        self.slot.lock().drawn = drawn.map(|entries| Drawn { generation: resources.generation, entries });
         Vec::new()
     }
 
@@ -257,7 +291,7 @@ impl egui_wgpu::CallbackTrait for FilterCallback {
     }
 
     fn paint(&self, info: egui::PaintCallbackInfo, render_pass: &mut wgpu::RenderPass<'static>, callback_resources: &CallbackResources) {
-        let Some(drawn) = self.slot.lock().drawn else {
+        let Some(drawn) = self.slot.lock().drawn.clone() else {
             return;
         };
         let Some(resources) = callback_resources.get::<WgpuResources>() else {
@@ -266,34 +300,77 @@ impl egui_wgpu::CallbackTrait for FilterCallback {
         if resources.generation != drawn.generation {
             return;
         }
-        let Some(bind_group) = resources.pool.get(drawn.pool_index).and_then(|targets| targets.composite.as_ref()) else {
-            return;
-        };
         // egui-wgpu reports the same rect / clip the plugin planned with; a mismatch would mean
-        // the composite lands somewhere else than what was captured, so it is skipped instead.
+        // a composite lands somewhere else than what was captured, so the layer is skipped instead.
         let transform_scale = transform_scale(self.job.rect, info.viewport);
-        let region = layer_geometry(info.viewport, info.clip_rect, info.pixels_per_point, info.screen_size_px, self.job.padding_points, self.job.mask.corner_radius(), transform_scale).map(|geometry| geometry.region);
-        if region != Some(drawn.region) {
-            log::debug!("egui_shader_layers (wgpu): paint region {region:?} differs from the prepared {:?}; layer skipped this frame", drawn.region);
-            return;
+        let mut composites = Vec::with_capacity(drawn.entries.len());
+        for drawn_entry in &drawn.entries {
+            let Some(entry) = self.job.entries.get(drawn_entry.entry) else {
+                return;
+            };
+            let region = layer_geometry(entry_rect(self.job.rect, info.viewport, entry.rect), info.clip_rect, info.pixels_per_point, info.screen_size_px, entry.padding_points, entry.mask.corner_radius(), transform_scale).map(|geometry| geometry.region);
+            if region != Some(drawn_entry.region) {
+                log::debug!("egui_shader_layers (wgpu): paint region {region:?} differs from the prepared {:?}; layer skipped this frame", drawn_entry.region);
+                return;
+            }
+            let Some(bind_group) = resources.pool.get(drawn_entry.pool_index).and_then(|targets| targets.composite.as_ref()) else {
+                return;
+            };
+            composites.push((bind_group, drawn_entry.region));
         }
-        draw_composite_over(render_pass, &resources.composite, bind_group, drawn.region);
+        // In the schedule's (list) order: a later entry lands over an earlier one.
+        for (bind_group, region) in composites {
+            draw_composite_over(render_pass, &resources.composite, bind_group, region);
+        }
     }
 }
 
 impl FilterCallback {
-    /// Records the backdrop re-render, then the chain (every filter pass) on the capture, and
-    /// stores the composite bind group `paint` uses in the layer's pool entry. A stateful layer
-    /// (`state_key`) runs over its state entry, updated with where the latest state now is.
-    fn record(&self, rec: &mut Recording<'_>, resources: &mut WgpuResources, pool_index: usize, plan: &BeneathPlan, pipelines: &[wgpu::RenderPipeline], state_key: Option<StateKey>) {
-        let capture = rec.geometry.capture;
-        let size = capture.size().map(|extent| u32::try_from(extent).unwrap_or(1));
-        let Some(targets) = resources.pool.get_mut(pool_index) else {
-            return;
-        };
-        let render_view_format = resources.srgb_capture.then_some(CAPTURE_SRGB_VIEW_FORMAT);
-        let capture_target = Target::ensure(&mut targets.capture, rec.device, CAPTURE_FORMAT, render_view_format, "egui_shader_layers capture", size);
+    /// Executes `ops` (`plan::schedule` with a pristine source): the beneath meshes are packed and
+    /// uploaded once, `Capture` re-renders them into an entry's capture, `Run` records its chain
+    /// (with the composite bind groups of its `Stacked` hand-offs), `HandOff` draws one into a
+    /// later entry's capture, `Composite` is left for `paint` (returned, in order). `None`: a run
+    /// could not be recorded, the layer draws nothing this frame.
+    fn record(&self, rec: &mut Recording<'_>, resources: &mut WgpuResources, plan: &BeneathPlan, geometries: &[Option<LayerGeometry>], pipelines: &[Option<Vec<wgpu::RenderPipeline>>], ops: &[Op]) -> Option<Vec<DrawnEntry>> {
+        // One pool slot per visible entry (all prepares precede egui's pass, see `resources.rs`).
+        let pool: Vec<Option<usize>> = geometries.iter().map(|geometry| geometry.map(|_| resources.next_targets())).collect();
+        let first = pool.iter().flatten().copied().next()?;
+        let (vertex_bytes, index_bytes, ranges) = pack_meshes(plan);
+        let targets = resources.pool.get_mut(first)?;
+        let buffers = MeshBuffers { vertices: targets.vertices.write(rec.device, rec.queue, &vertex_bytes).clone(), indices: targets.indices.write(rec.device, rec.queue, &index_bytes).clone(), ranges };
+        // The layer's reset request is claimed once per paint, for every stateful entry.
+        let stateful = geometries.iter().enumerate().any(|(index, geometry)| geometry.is_some() && self.job.state_key(index).is_some());
+        let reset = stateful && self.job.claim_reset();
+        let mut handoffs: Vec<std::vec::IntoIter<wgpu::BindGroup>> = geometries.iter().map(|_| Vec::new().into_iter()).collect();
+        let mut drawn = Vec::new();
+        for op in ops {
+            match *op {
+                Op::Capture(index) => self.capture(rec, resources, (*pool.get(index)?)?, geometries.get(index).copied().flatten()?.capture, plan, &buffers)?,
+                Op::Run(index) => {
+                    let origins: Vec<[i32; 2]> = ops.iter().filter_map(|op| if let Op::HandOff { from, origin, .. } = *op { (from == index).then_some(origin) } else { None }).collect();
+                    let run = EntryRun { index, pool_index: (*pool.get(index)?)?, geometry: geometries.get(index).copied().flatten()?, pipelines: pipelines.get(index)?.as_deref()?, handoff_origins: &origins, reset };
+                    let recorded = self.run_entry(rec, resources, plan, &run)?;
+                    *handoffs.get_mut(index)? = recorded.handoffs.into_iter();
+                    resources.pool.get_mut(run.pool_index)?.composite = Some(recorded.composite);
+                }
+                Op::HandOff { from, into, viewport, .. } => {
+                    let group = handoffs.get_mut(from)?.next()?;
+                    let target = resources.pool.get((*pool.get(into)?)?)?.capture.as_ref()?;
+                    resources.chain.record_handoff(rec.encoder, &group, &target.view, viewport);
+                }
+                Op::Composite(index) => drawn.push(DrawnEntry { entry: index, pool_index: (*pool.get(index)?)?, region: geometries.get(index).copied().flatten()?.region }),
+            }
+        }
+        Some(drawn)
+    }
 
+    /// `Op::Capture`: re-renders the beneath meshes into the capture of pool slot `pool_index`
+    /// (`capture`, screen pixels), each mesh scissored like egui clips it on screen.
+    fn capture(&self, rec: &mut Recording<'_>, resources: &mut WgpuResources, pool_index: usize, capture: PxRect, plan: &BeneathPlan, buffers: &MeshBuffers) -> Option<()> {
+        let size = capture.size().map(|extent| u32::try_from(extent).unwrap_or(1));
+        let render_view_format = resources.srgb_capture.then_some(CAPTURE_SRGB_VIEW_FORMAT);
+        let targets = resources.pool.get_mut(pool_index)?;
+        let capture_target = Target::ensure(&mut targets.capture, rec.device, CAPTURE_FORMAT, render_view_format, "egui_shader_layers capture", size);
         let locals_buffer = targets.mesh_locals.write(rec.device, rec.queue, &backdrop_locals(rec.pixels_per_point, self.shared.options.dithering(), capture));
         let locals = rec.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("egui_shader_layers mesh locals"),
@@ -303,79 +380,91 @@ impl FilterCallback {
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: locals_buffer, offset: 0, size: std::num::NonZeroU64::new(u64::try_from(MESH_LOCALS_SIZE).unwrap_or(0)) }),
             }],
         });
-        let (vertex_bytes, index_bytes, ranges) = pack_meshes(plan, rec.pixels_per_point, rec.screen, capture);
-        let buffers = MeshBuffers { vertices: targets.vertices.write(rec.device, rec.queue, &vertex_bytes).clone(), indices: targets.indices.write(rec.device, rec.queue, &index_bytes).clone(), ranges };
-        self.render_backdrop(rec, &resources.mesh_pipeline, &locals, capture_target, plan, &buffers);
+        self.render_backdrop(rec, &BackdropDraw { pipeline: &resources.mesh_pipeline, locals: &locals, target: capture_target, capture }, plan, buffers);
+        Some(())
+    }
 
-        let mut chain_rec = ChainRecording { device: rec.device, queue: rec.queue, encoder: rec.encoder };
-        let (frame, time) = (self.job.frame_input.frame, f64::from(self.job.time));
-        let format = self.job.state.format();
-        // The entry's replaced targets (a format change) are simply dropped (wgpu frees them
-        // once no recorded command uses them).
-        let mut state = state_key.map(|key| resources.states.begin(key, format, frame, time, self.job.claim_reset(), || [None, None]));
-        let state_input = state.as_ref().map(|(_, run, _)| StatePlanInput { scale: self.job.state.scale(), current: run.current, previous_px: run.previous, step: run.step });
+    /// `Op::Run`: records entry `run.index`'s chain on its capture (a stateful entry over its state
+    /// entry, updated with where the latest state now is) and returns the recorded run.
+    fn run_entry(&self, rec: &mut Recording<'_>, resources: &mut WgpuResources, plan: &BeneathPlan, run: &EntryRun<'_>) -> Option<RecordedRun> {
+        let entry = self.job.entries.get(run.index)?;
+        let capture = run.geometry.capture;
+        let user_textures = plan.user_textures.get(run.index)?;
         // A shape mask (F9): its meshes in layer points, mapped through the layer transform the
         // callback rect reveals; every texture they sample was resolved by the plugin.
         // A region mask (R1) packs every region into the same upload plus its draw ranges.
-        let packed = self.job.mask.pack();
+        let packed = entry.mask.pack();
         let coverage = match &packed {
             Some(packed) => {
                 let textures: Option<Vec<&wgpu::BindGroup>> = packed.packed.draws.iter().map(|draw| plan.textures.get(&draw.texture)).collect();
-                let Some(textures) = textures else {
-                    return;
-                };
-                Some(CoverageJob { packed: &packed.packed, transform: mask_transform(self.job.rect, plan.callback_rect, rec.pixels_per_point, capture), textures, regions: &packed.regions })
+                Some(CoverageJob { packed: &packed.packed, transform: mask_transform(self.job.rect, plan.callback_rect, rec.pixels_per_point, capture), textures: textures?, regions: &packed.regions })
             }
             None => None,
         };
+        let (frame, time) = (self.job.frame_input.frame, f64::from(self.job.time));
+        let format = entry.state.format();
+        // The entry's replaced targets (a format change) are simply dropped (wgpu frees them
+        // once no recorded command uses them).
+        let mut state = self.job.state_key(run.index).map(|key| resources.states.begin(key, format, frame, time, run.reset, || [None, None]));
+        let state_input = state.as_ref().map(|(_, state_run, _)| StatePlanInput { scale: entry.state.scale(), current: state_run.current, previous_px: state_run.previous, step: state_run.step });
+        let targets = resources.pool.get_mut(run.pool_index)?;
+        let (Some(capture_target), chain_targets) = (targets.capture.as_ref(), &mut targets.chain) else {
+            return None;
+        };
         let job = ChainJob {
             source: ChainSource { view: &capture_target.view, allocated: capture_target.size },
-            geometry: rec.geometry,
+            geometry: run.geometry,
             // The whole capture; its pixel (0, 0) is at the capture's screen position.
-            window: ChainWindow::whole(&rec.geometry, [capture.x, capture.y]),
+            window: ChainWindow::whole(&run.geometry, [capture.x, capture.y]),
             time: self.job.time,
             // The pointer relative to this capture, at the callback's pixels per point.
-            input: self.job.frame_input.resolve(rec.pixels_per_point, rec.geometry.capture),
-            passes: &self.job.passes,
-            pipelines,
-            user_textures: plan.user_textures.each_ref().map(Option::as_ref),
+            input: self.job.frame_input.resolve(rec.pixels_per_point, capture),
+            passes: &entry.passes,
+            pipelines: run.pipelines,
+            user_textures: user_textures.each_ref().map(Option::as_ref),
             state: state_input,
             coverage,
+            handoff_origins: run.handoff_origins,
         };
+        let mut chain_rec = ChainRecording { device: rec.device, queue: rec.queue, encoder: rec.encoder };
         let recorded = {
-            let mut chain_state = state.as_mut().map(|(entry, _, _)| ChainState { targets: &mut entry.targets, format });
-            resources.chain.record(&mut chain_rec, &mut targets.chain, &job, chain_state.as_mut())
+            let mut chain_state = state.as_mut().map(|(state_entry, _, _)| ChainState { targets: &mut state_entry.targets, format });
+            resources.chain.record(&mut chain_rec, chain_targets, &job, chain_state.as_mut())
         };
-        if let Some((entry, run, _)) = state {
-            match recorded.as_ref().and_then(|(_, state_plan)| state_plan.as_ref()) {
-                Some(state_plan) => entry.finish(run, frame, state_plan.final_index, state_plan.final_px),
+        if let Some((state_entry, state_run, _)) = state {
+            match recorded.as_ref().and_then(|recorded| recorded.state.as_ref()) {
+                Some(state_plan) => state_entry.finish(state_run, frame, state_plan.final_index, state_plan.final_px),
                 // Nothing (or not everything) was recorded: start over from zero next time.
-                None => entry.invalidate(),
+                None => state_entry.invalidate(),
             }
         }
-        targets.composite = recorded.map(|(bind_group, _)| bind_group);
+        recorded
     }
 
-    /// Re-renders the planned meshes into `capture` (through its render view: the sRGB view when
-    /// `WgpuResources::srgb_capture`), cleared first to what egui's pass shows where nothing was
-    /// painted (`capture_clear_color`).
-    fn render_backdrop(&self, rec: &mut Recording<'_>, pipeline: &wgpu::RenderPipeline, locals: &wgpu::BindGroup, capture: &Target, plan: &BeneathPlan, buffers: &MeshBuffers) {
+    /// Re-renders the planned meshes into `draw.target` (through its render view: the sRGB view
+    /// when `WgpuResources::srgb_capture`), cleared first to what egui's pass shows where nothing
+    /// was painted (`capture_clear_color`).
+    fn render_backdrop(&self, rec: &mut Recording<'_>, draw: &BackdropDraw<'_>, plan: &BeneathPlan, buffers: &MeshBuffers) {
+        let (pipeline, locals, capture, capture_px) = (draw.pipeline, draw.locals, draw.target, draw.capture);
         // Through the sRGB view wgpu encodes the clear value itself, exactly as for egui's pass.
         let through_srgb_view = capture.render_view_format().is_some_and(|format| format.is_srgb());
         let encode = self.shared.render_state.target_format.is_srgb() && !through_srgb_view;
         let clear = capture_clear_color(plan.clear_color, encode);
         let mut pass = begin_pass(rec.encoder, capture.render_view(), "egui_shader_layers backdrop", clear);
-        pass.set_viewport(0.0, 0.0, px_f32(rec.geometry.capture.w), px_f32(rec.geometry.capture.h), 0.0, 1.0);
+        pass.set_viewport(0.0, 0.0, px_f32(capture_px.w), px_f32(capture_px.h), 0.0, 1.0);
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, locals, &[]);
         for range in &buffers.ranges {
-            let Some(Primitive::Mesh(mesh)) = plan.primitives.get(range.primitive).map(|primitive| &primitive.primitive) else {
+            let Some(ClippedPrimitive { clip_rect, primitive: Primitive::Mesh(mesh) }) = plan.primitives.get(range.primitive) else {
                 continue;
             };
             let Some(texture) = plan.textures.get(&mesh.texture_id) else {
                 continue;
             };
-            let [x, y, width, height] = range.scissor;
+            // Meshes outside this entry's capture (another entry's) are skipped.
+            let Some([x, y, width, height]) = scissor_in_capture(*clip_rect, rec.pixels_per_point, rec.screen, capture_px) else {
+                continue;
+            };
             pass.set_scissor_rect(x, y, width, height);
             pass.set_bind_group(1, texture, &[]);
             pass.set_vertex_buffer(0, buffers.vertices.slice(range.vertices.clone()));
@@ -398,6 +487,18 @@ fn capture_clear_color(clear_color: [f32; 4], encode: bool) -> wgpu::Color {
     let [r, g, b, a] = clear_color;
     let encode = |channel: f32| if encode { egui::ecolor::gamma_from_linear(channel) } else { channel };
     wgpu::Color { r: f64::from(encode(r)), g: f64::from(encode(g)), b: f64::from(encode(b)), a: f64::from(a) }
+}
+
+/// One entry's backdrop re-render: the mesh pipeline, its locals and where it draws.
+struct BackdropDraw<'a> {
+    /// The mesh pipeline (`WgpuResources::mesh_pipeline`).
+    pipeline: &'a wgpu::RenderPipeline,
+    /// The `MeshLocals` bind group of this capture (`backdrop_locals`).
+    locals: &'a wgpu::BindGroup,
+    /// The entry's capture texture.
+    target: &'a Target,
+    /// The capture's rect in screen pixels (viewport size and scissors).
+    capture: PxRect,
 }
 
 /// The uploaded beneath meshes of one layer.

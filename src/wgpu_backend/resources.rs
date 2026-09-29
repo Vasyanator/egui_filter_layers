@@ -9,7 +9,7 @@ pool of per-layer targets of the frame being prepared.
 
 Key structures:
 - `WgpuResources`: stored in egui-wgpu's `CallbackResources`; one per install generation.
-- `LayerTargets`: capture, chain targets and mesh buffers of ONE layer of the current frame.
+- `LayerTargets`: capture, chain targets and mesh buffers of ONE layer entry of the current frame.
 - `StateTargets`: the two state textures of one stateful layer (F7), kept across frames in
   `WgpuResources::states` (NOT in the per-frame pool), so they die with the install's resources.
 
@@ -18,8 +18,8 @@ Key functions:
 
 Notes:
 All layers' `prepare` calls are recorded before egui's single render pass, and every layer's
-result must survive until its `paint`, so each layer of a frame gets its own `LayerTargets`
-(pool index = order of `prepare`, reset in `finish_prepare`). Reusing an entry in the next
+result must survive until its `paint`, so each layer ENTRY of a frame gets its own `LayerTargets`
+(pool index = order of `prepare` and of the entries, reset in `finish_prepare`). Reusing an entry in the next
 submission is safe: queue writes and passes of a later submission execute after the earlier one.
 Object creation runs inside wgpu validation error scopes: on native wgpu-core a scope resolves
 immediately, so a rejected shader becomes a latched failure instead of wgpu's default panic.
@@ -44,7 +44,8 @@ pub(super) const CAPTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba
 pub(super) const CAPTURE_SRGB_VIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 
-/// Everything ONE shader layer of the current frame renders into and draws from.
+/// Everything ONE shader layer entry of the current frame renders into and draws from (a layer's
+/// beneath meshes live in its first visible entry's `vertices` / `indices`).
 #[derive(Debug)]
 pub(super) struct LayerTargets {
     /// The re-rendered backdrop (8-bit gamma); the chain's source.

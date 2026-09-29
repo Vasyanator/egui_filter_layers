@@ -18,6 +18,11 @@ Key functions:
 - `OfflineRenderer::new()` / `from_render_state()` / `headless_async()` / `headless()` (native).
 - `OfflineRenderer::process()` / `process_into()` (native, blocking) / `process_async()`.
 - `OfflineRenderer::run()`: the shared implementation (CPU prep, tiles, record, readback).
+- `OfflineRenderer::sync_textures()`: the one user-texture upload cache (per slot, by identity),
+  used by `process` and by every entry of `process_layer` (`layer.rs`).
+
+Submodule `layer` (R3): `OfflineEntry` / `OfflineLayer` and `process_layer*` — multi-entry layers,
+bit-identical to the UI, never tiled.
 
 Submodules: `video/` (feature `video`) builds frame streams on `run`.
 
@@ -94,11 +99,18 @@ two state textures) from one run to the next (a video processor's frames), confi
 //! `ShaderLayer::texture` attaches in the UI; [`OfflineTexture::from_color_image`] holds exactly
 //! the bytes egui uploads for that image, so an effect reading them agrees with the UI.
 //!
+//! **Layers of entries**: [`OfflineRenderer::process_layer`] runs an [`OfflineLayer`] of
+//! [`OfflineEntry`]s (rects in frame points) — what `ShaderLayer::from_entries` shows over the
+//! frame, bit for bit in both `Overlap` modes. Masks, textures and state options are per entry;
+//! each stateful entry keeps its own state across calls. Layer runs are never tiled
+//! ([`OfflineError::NotTileable`] above the tile limit).
+//!
 //! Video (feature `video`): see the `video` module — frame streams, source / sink traits and
 //! ffmpeg / image-sequence adapters, all running through the same renderer.
 
 mod error;
 mod frame;
+mod layer;
 mod options;
 #[cfg(feature = "image")]
 mod image;
@@ -113,6 +125,7 @@ use egui::{CornerRadius, Rect, pos2};
 
 pub use error::OfflineError;
 pub use frame::{AlphaMode, FrameRef, RgbaFrame};
+pub use layer::{OfflineEntry, OfflineLayer};
 pub use options::{OfflineOptions, PointerState};
 pub use texture::OfflineTexture;
 
@@ -123,7 +136,7 @@ use crate::pass::{FilterChain, InputUniforms};
 use crate::plan::{StatePlan, StatePlanInput, check_textures};
 use crate::state::{StateError, StateFormat};
 use crate::wgpu_backend::coverage::CoverageJob;
-use crate::wgpu_backend::chain::{ChainJob, ChainRecording, ChainResources, ChainSource, ChainState, ChainTargets, ChainWindow, draw_composite};
+use crate::wgpu_backend::chain::{ChainJob, ChainRecording, ChainResources, ChainSource, ChainState, ChainTargets, ChainWindow, CompositeOver, draw_composite};
 use crate::wgpu_backend::gpu::{ErrorScopes, Target, begin_pass, egui_sampler_descriptor};
 use frame::{MAX_SIDE, convert_output, frame_bytes};
 use readback::{RowLayout, map_read};
@@ -156,6 +169,11 @@ pub struct OfflineRenderer {
     chain: ChainResources,
     /// Composite pipeline writing `FRAME_FORMAT`.
     composite: wgpu::RenderPipeline,
+    /// The UI's BLENDED composite into `FRAME_FORMAT` (layer runs composite every entry over the
+    /// output with it, exactly like the wgpu UI over egui's pass).
+    composite_over: CompositeOver,
+    /// The objects of `process_layer` runs (`layer.rs`).
+    layer: layer::LayerResources,
     /// `max_texture_dimension_2d` of the device.
     max_texture_side: u32,
     /// Largest side `s` whose `s x s` readback fits the device's `max_buffer_size`.
@@ -227,6 +245,7 @@ impl OfflineRenderer {
     pub fn new(adapter: &wgpu::Adapter, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Self, OfflineError> {
         let chain = ChainResources::create(device, queue, adapter).map_err(OfflineError::Gpu)?;
         let composite = chain.composite_pipeline(device, FRAME_FORMAT, wgpu::MultisampleState::default(), None).map_err(OfflineError::Gpu)?;
+        let composite_over = chain.composite_over_pipelines(device, FRAME_FORMAT, wgpu::MultisampleState::default(), None).map_err(OfflineError::Gpu)?;
         let limits = device.limits();
         let max_readback_side = readback_side_limit(limits.max_buffer_size);
         log::info!(
@@ -239,6 +258,8 @@ impl OfflineRenderer {
             queue: queue.clone(),
             chain,
             composite,
+            composite_over,
+            layer: layer::LayerResources::default(),
             max_texture_side: limits.max_texture_dimension_2d,
             max_readback_side,
             targets: None,
@@ -250,12 +271,14 @@ impl OfflineRenderer {
         })
     }
 
-    /// Starts the persistent state (F7) over: the next run of a stateful chain begins from zero.
-    /// The state textures are kept (reused by the next run).
+    /// Starts the persistent state (F7) over: the next run of a stateful chain begins from zero,
+    /// in `process` and in every entry of `process_layer`. The state textures are kept (reused by
+    /// the next run).
     pub fn reset_state(&mut self) {
         if let Some(state) = self.state.as_mut() {
             state.used = None;
         }
+        self.layer.reset_states();
     }
 
     /// A renderer on egui-wgpu's device: the same adapter, device and shader compiler as the
@@ -347,7 +370,7 @@ impl OfflineRenderer {
     /// [`OfflineRenderer::run`] with the prepared-input buffer passed in.
     async fn run_prepared(&mut self, frame: &FrameRef<'_>, chain: &FilterChain, options: &OfflineOptions, output: &mut Vec<u8>, block: bool, pixels: &mut Vec<u8>) -> Result<(), OfflineError> {
         options.validate()?;
-        check_textures(chain.passes(), options.attached_textures())?;
+        check_textures(chain.passes(), options.attached_textures(), 0)?;
         frame.premultiplied_rows_into(options.background, pixels)?;
         let pixels: &[u8] = pixels;
         let size = [frame.width(), frame.height()];
@@ -488,9 +511,24 @@ impl OfflineRenderer {
     /// [`OfflineError::TextureTooLarge`] for a texture beyond the device's limit (before any GPU
     /// work); [`OfflineError::OutOfMemory`] / [`OfflineError::Gpu`] from the device.
     async fn ensure_user_textures(&mut self, options: &OfflineOptions) -> Result<(), OfflineError> {
+        let wanted: [Option<OfflineTexture>; TEXTURE_SLOTS] = std::array::from_fn(|slot| options.texture(slot).cloned());
+        let mut cache = std::mem::replace(&mut self.user_textures, [const { None }; TEXTURE_SLOTS]);
+        let result = self.sync_textures(&mut cache, &wanted).await;
+        self.user_textures = cache;
+        result
+    }
+
+    /// Makes `cache` (one slot per user texture) hold the uploads of `wanted`: a slot keeps its
+    /// upload while the same `OfflineTexture` stays, uploads a new one otherwise (inside
+    /// [`ErrorScopes`], awaited), and drops it when the slot is empty. After a GPU error the whole
+    /// cache is emptied. The one texture synchronisation of `process` and `process_layer`.
+    ///
+    /// # Errors
+    /// As [`OfflineRenderer::ensure_user_textures`].
+    async fn sync_textures(&mut self, cache: &mut [Option<UploadedTexture>; TEXTURE_SLOTS], wanted: &[Option<OfflineTexture>; TEXTURE_SLOTS]) -> Result<(), OfflineError> {
         let mut uploads = Vec::new();
-        for (slot, cached) in self.user_textures.iter_mut().enumerate() {
-            match options.texture(slot) {
+        for (slot, (cached, wanted)) in cache.iter_mut().zip(wanted).enumerate() {
+            match wanted {
                 None => *cached = None,
                 Some(texture) if cached.as_ref().is_some_and(|uploaded| uploaded.source.same(texture)) => {}
                 Some(texture) => {
@@ -509,12 +547,12 @@ impl OfflineRenderer {
         let scopes = ErrorScopes::push(&self.device);
         for (slot, texture) in uploads {
             let uploaded = self.upload_texture(texture);
-            if let Some(entry) = self.user_textures.get_mut(slot) {
+            if let Some(entry) = cache.get_mut(slot) {
                 *entry = Some(uploaded);
             }
         }
         if let Some(error) = scopes.pop().await {
-            self.user_textures = [const { None }; TEXTURE_SLOTS];
+            *cache = [const { None }; TEXTURE_SLOTS];
             log::warn!("egui_shader_layers (offline): uploading a user texture failed: {error}");
             return Err(offline_gpu_error(&error));
         }
@@ -616,12 +654,14 @@ impl OfflineRenderer {
                 // Untextured meshes only (`Mask::check_offline`): the white group stands in for
                 // egui's white atlas pixel.
                 coverage: run.coverage.map(|(packed, transform)| CoverageJob { packed: &packed.packed, transform: *transform, textures: vec![resources.coverage().white_group(); packed.packed.draws.len()], regions: &packed.regions }),
+                handoff_origins: &[],
             };
             let recorded = resources.record(&mut ChainRecording { device, queue, encoder: &mut encoder }, &mut targets.chain, &job, state.as_mut());
-            let Some((bind_group, planned_state)) = recorded else {
+            let Some(recorded) = recorded else {
                 break 'record false;
             };
-            state_plan = planned_state;
+            state_plan = recorded.state;
+            let bind_group = recorded.composite;
             {
                 let mut pass = begin_pass(&mut encoder, &targets.output_view, "egui_shader_layers offline composite", wgpu::Color::TRANSPARENT);
                 draw_composite(&mut pass, composite, &bind_group, PxRect { x: 0, y: 0, w: out.w, h: out.h });

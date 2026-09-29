@@ -6,11 +6,12 @@ beneath a rect through a chain of WGSL filter passes, on pluggable GPU backends.
 
 ## Architecture
 ```text
-user code ──► ShaderLayer::paint (layer.rs)
-                 │  checks user textures (plan::check_textures), the state id (check_state) and
-                 │  the mask (check_mask); tessellates a shape mask (mask.rs, GUI thread);
-                 │  resolves FilterChain -> LayerJob (rect, mask, passes, padding, time,
-                 │  frame_input, textures, id / viewport / state options / reset ticket)
+user code ──► ShaderLayer::paint (layer.rs; one or more `Entry`s, entry.rs)
+                 │  checks every entry's user textures (plan::check_textures), the state id
+                 │  (check_state) and the mask (check_mask); tessellates shape masks (mask.rs,
+                 │  GUI thread); resolves the entries -> LayerJob (union rect, overlap, time,
+                 │  frame_input, id / viewport / reset ticket) + one EntryJob per entry (rect,
+                 │  mask, passes, padding, textures, state options)
                  ▼
           backend registry plugin (backend.rs)       ──►  Arc<dyn Backend>
                  │                                         ├─ glow_backend/  (feature "glow")
@@ -34,6 +35,12 @@ user code ──► ShaderLayer::paint (layer.rs)
   twice, and the UI composite BLENDS over egui's pass by mask coverage (the re-render lacks paint
   callbacks, so outside the mask the screen must stay as it is). Offline replaces (its input is
   the whole backdrop).
+- **Entries (R3)**: a layer of several entries runs one capture + chain per entry, each over its
+  OWN padded rect (never the union); `plan::schedule` is the single owner of the order of
+  captures, runs, `Stacked` hand-offs and composites for every backend (`CaptureSource::Pristine`:
+  wgpu UI and offline; `Framebuffer`: glow from phase R3b — until then glow refuses multi-entry
+  layers). A `Stacked` hand-off on a pristine source is the replace composite of an earlier entry
+  drawn into a later entry's capture (`wgpu_backend/chain.rs::record_handoff`, UI and offline).
 - **Coordinates**: effect `uv` is top-left origin, y down on every backend. A backend whose
   texture storage is bottom-up sets `FrameUniforms::flip_y`; the prelude's `src()` applies it.
   Intermediates are grow-only; `src_scale` / `aux_scale` map the used region to storage.
@@ -56,13 +63,16 @@ user code ──► ShaderLayer::paint (layer.rs)
   where the registry's `begin` runs, so an unrun paint keeps it); `StateRegistry<T>`
   (per `(viewport, id)` entry: the backend's targets `T`, which one holds the latest state and its
   size, one step per frame, eviction), used by both UI backends.
-- `plan.rs`: backend-neutral wiring of one chain run — `plan()` (steps: bindings by `Slot`,
+- `plan.rs`: `schedule()` — the order of a multi-entry paint (`Op`: capture / run / hand-off /
+  composite), `composite_for_origin()` (a hand-off's composite), `entry_state_key()` (one state per
+  entry: `id.with(index)`); backend-neutral wiring of one chain run — `plan()` (steps: bindings by `Slot`,
   what each slot holds (`Content`: resolution, window), output, viewport, fragment offset; the
   composite; the ping-pong pool size `target_px`; which user texture slots each draw binds),
   `check_textures` (every slot an effect reads is attached), `scaled_px` (per-pass scale sizes),
   `TextureMapping::of` (the one storage-uv formula), `step_uniforms` / `composite_uniforms` / `params_block` / `composite_params_block`
   (every block a backend uploads, at bindings 0 and 4).
 - `geometry.rs`: `layer_geometry` — region / capture / UV / mask math (pure, unit-tested);
+  `entry_rect` (an entry's rect under the layer transform, from the union as painted / rendered);
   `LayerGeometry::composite_params` (the composite pass's parameter block, every backend);
   `pointer_uniform` (the one screen-points -> capture-uv conversion of `fl.pointer`).
 - `mask.rs`: `Mask` (public: rounded rect / any egui `Shape` in layer points / `Regions`),
@@ -71,13 +81,17 @@ user code ──► ShaderLayer::paint (layer.rs)
   `JobMask`, `tessellate` (the one tessellation, UI and offline: no pre-rasterized discs),
   `CoverageMeshes::pack` -> `PackedCoverage` (egui vertex bytes, absolute `u32` indices, one draw
   per texture run; every backend uploads exactly this), `MESH_WGSL`.
-- `layer.rs`: `ShaderLayer` and its `paint` (skips a missing or failed backend, and a layer whose
+- `entry.rs`: `Entry` (one area of a layer: rect, chain, mask, textures, state options; its
+  checks name its index) and `Overlap` (`Independent` / `Stacked`).
+- `layer.rs`: `ShaderLayer` (a list of entries, the overlap mode, the id; layer-level builders
+  apply to every entry, accessors read the first) and its `paint` (skips a missing or failed backend, and a layer whose
   user textures fail `check_textures` (logged once per context and message); requests a repaint
   for animated chains only when the backend is usable; reads the per-frame input);
   `ShaderLayer::texture` attaches user textures (F8); `ShaderLayer::id` / `state` /
   `check_state` (F7: a stateful chain without an id is skipped, logged once per message).
-- `backend.rs`: crate-internal `Backend` trait, `LayerJob` (backend-neutral: rect, mask, passes,
-  padding, time, `FrameInput`, attached texture ids), registry (`register`, `installed`, `uninstall`; a hook-less egui plugin, so it
+- `backend.rs`: crate-internal `Backend` trait, `LayerJob` (backend-neutral: union rect, overlap,
+  time, `FrameInput`, id, reset ticket) with one `EntryJob` per entry (rect, mask, passes, padding,
+  attached texture ids, state options), registry (`register`, `installed`, `uninstall`; a hook-less egui plugin, so it
   lives in the `Context` and survives `Memory` resets), public `status`, `failed_effects`,
   `failed_textures`, `BackendStatus`, `EffectFailure`, `TextureError`, `TextureFailure`, `InstallError`.
 - `presets.rs`: built-in effects (compiled once in `OnceLock`s) and their constructors.
@@ -162,7 +176,7 @@ user code ──► ShaderLayer::paint (layer.rs)
   the other of the layer's two state textures (`Slot::StateA` / `StateB`), `ceil(capture * scale)`
   texels over the whole capture; display steps bind the latest state. Stateful chains need
   `ShaderLayer::id`; states are kept per `(ViewportId, Id)` (egui counts frames per viewport) in
-  each backend's `StateRegistry` (wgpu: `WgpuResources::states`, outside the per-frame pool, dropped
+  each backend's `StateRegistry` (one key per ENTRY, `plan::entry_state_key`) (wgpu: `WgpuResources::states`, outside the per-frame pool, dropped
   on re-install; glow: `GlowState::states`, freed by eviction / `destroy_glow`; offline: the
   renderer's one state). The first paint of a key in a frame steps it; a repeat skips the state
   steps. A new / reset state is cleared before use; growth keeps the content (backends copy); the
@@ -198,6 +212,11 @@ user code ──► ShaderLayer::paint (layer.rs)
   screen, `FrameUniforms::for_layer`, and `wgpu_backend/chain.rs`. Never add a second pass /
   composite recorder.
 
+- Entries (R3): a layer is drawn or refused as a whole (any entry failing a check skips it);
+  empty-chain / non-positive entries are left out; the layer-level reset ticket is claimed once
+  per paint for every stateful entry. Composites are in list order on every backend. Offline
+  layer runs (`OfflineRenderer::process_layer`) are never tiled (D6).
+
 ## Editing map
 - New preset: add the WGSL constant + entry in `BUILTIN_EFFECTS` + constructor in `presets.rs`.
 - New prelude helper or uniform: `shaders/prelude.wgsl`, then `pass.rs` offsets/packing and tests.
@@ -211,6 +230,9 @@ user code ──► ShaderLayer::paint (layer.rs)
 - New backend: implement `backend::Backend` in a feature-gated module, add its `install_*` API,
   register with `backend::register`.
 - Capture/padding/mask math: `geometry.rs`.
+- Entries: the public types `entry.rs` / `layer.rs`; the order of captures, runs, hand-offs and
+  composites `plan::schedule` (never in a backend); the hand-off draw `wgpu_backend/chain.rs`;
+  execution wgpu `render.rs`, offline `offline/layer.rs`, glow `render.rs` (R3b).
 - Shape masks: what is accepted / tessellation / packing `mask.rs`; the coverage step and its
   uniform bytes `plan.rs`; rasterization wgpu `wgpu_backend/coverage.rs` (UI and offline), glow
   `glow_backend/coverage.rs`; the composite's read `shaders/composite.wgsl` (`fl_coverage`).

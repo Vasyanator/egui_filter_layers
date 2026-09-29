@@ -67,6 +67,20 @@ adheres to [Semantic Versioning](https://semver.org/).
   `region_at(uv)` (`REGION_NONE` = 255 outside the regions; also `REGION_NONE` in Rust); later
   regions win where they overlap; `Effect::reads_regions`. Runs on the wgpu and glow
   backends and offline (`OfflineOptions::with_mask`, tiled runs included).
+- Entries: several independent areas in one layer — `Entry` (`new`, `mask`, `corner_radius`,
+  `texture`, `state`, accessors) with `ShaderLayer::from_entries` / `with_entry` / `entries`,
+  and `Overlap` (`Independent`: every entry filters the original backdrop; `Stacked`: a later
+  entry filters the earlier entries' result, also on wgpu) via `ShaderLayer::overlap` /
+  `overlap_mode`. Each entry captures only its own padded rect and runs its own chain; entries
+  share one paint callback (on wgpu one selection and tessellation of the content beneath) and
+  are composited in list order. Layer-level builders apply to every entry, accessors return the
+  first entry's, `ShaderLayer::rect` is the union; a stateful entry keeps its own state under the
+  layer id (`reset_state` resets all). Offline: `OfflineEntry`, `OfflineLayer`,
+  `OfflineRenderer::process_layer` / `process_layer_into` / `process_layer_async` (bit-identical
+  to the UI in both modes, never tiled: `NotTileable` above the tile limit). The glow backend
+  skips layers of more than one entry for now (logged once); single-entry layers are unchanged.
+  `TextureError::InvalidSlot` / `NotAttached` and `StateError::MissingId` name the failing
+  `entry`; `FilterChain::new` is `const`.
 - Feature `hot-reload` (native only, no extra dependencies): `HotEffect` (`watch`,
   `watch_with` + `HotOptions`, `poll` -> `HotReloadEvent`, `current`, `error`, `status_text`)
   recompiles a WGSL file off the GUI thread and keeps the last good effect while the file is

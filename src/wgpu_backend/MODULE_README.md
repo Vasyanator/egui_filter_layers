@@ -6,12 +6,14 @@ mid-frame, so the backdrop is **re-rendered**: the content under each filter is 
 
 ## Architecture
 One frame, per shader layer:
-1. `WgpuBackend::paint_layer` (GUI thread, `mod.rs`) adds an `egui_wgpu::Callback` and pushes a
-   `Pending { Weak<callback object>, LayerSlot, rect, padding }` into `Shared::pending`.
+1. `WgpuBackend::paint_layer` (GUI thread, `mod.rs`) adds an `egui_wgpu::Callback` (rect = the
+   union of the layer's entries) and pushes a `Pending { Weak<callback object>, LayerSlot, rect,
+   entries (rect, padding, textures) }` into `Shared::pending`.
 2. `ShaderLayersPlugin::output_hook` (`plugin.rs`, egui `Context::end_pass` -> `on_output`) finds
    the callback in `FullOutput::shapes` by `Arc` address — egui's exact final paint order with layer
    transforms applied, so there is no stale layer order. Everything before it is "beneath":
-   `beneath.rs` clips it to the padded capture rect and skips callbacks; `ctx.tessellate`
+   `beneath.rs` clips it to the padded capture rect (for several entries: the bounding box of
+   their padded capture rects, ONE selection and tessellation) and skips callbacks; `ctx.tessellate`
    tessellates; `textures.rs` resolves texture bind groups, and the bind groups of the layer's
    attached user textures (an unresolvable id: the layer is not planned, `Shared::fail_texture`).
    The `BeneathPlan` goes into the slot.
@@ -30,7 +32,11 @@ One frame, per shader layer:
    unpainted entries runs at every prepare; the job's reset ticket is claimed at that lookup,
    `LayerJob::claim_reset`) and hands its two state textures to the executor
    (`ChainState`), then records where the latest state is.
-4. `FilterCallback::paint` draws the BLENDED composite (`chain::draw_composite_over`: an erase
+   A layer of several entries (R3) runs `plan::schedule` (pristine source): the beneath meshes
+   are packed once, every entry gets its own pool slot and capture (re-rendered with scissors
+   relative to it), its own chain run, and in `Stacked` mode the `HandOff` draws of earlier
+   entries into later captures (`ChainResources::record_handoff`) between the runs.
+4. `FilterCallback::paint` draws the BLENDED composite (one per entry, in the schedule's list order) (`chain::draw_composite_over`: an erase
    draw then an add draw, together `mix(dst, filtered, coverage)`, uncovered pixels discarded)
    into egui's pass. Outside the rounded mask the screen keeps what egui drew, including paint
    callbacks and lower shader layers the re-render lacks.
@@ -67,7 +73,9 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   coverage rasterizer (`mesh_pipeline` with a blend: `EGUI_BLEND` / additive `COVERAGE_BLEND`, `CoverageRasterizer` with a white texture
   group for untextured offline meshes, per-run `CoverageTargets`, `CoverageJob`); used by
   `chain.rs`, so offline runs rasterize masks unchanged.
-- `chain.rs`: the chain executor (`ChainResources`, `ChainTargets`, `ChainWindow`, `record`,
+- `chain.rs`: the chain executor (`ChainResources`, `ChainTargets`, `ChainWindow`, `record` ->
+  `RecordedRun` (composite + hand-off bind groups + state plan), `record_handoff` (R3: the replace
+  composite into another entry's capture, `HANDOFF_FORMAT`, `LoadOp::Load`),
   `frame_uniforms`, `chain_uniforms` = every draw's plan blocks (`fl`, then the named-parameter
   block) at the device's offset alignment (`ChainUniforms` / `DrawUniforms`); composites: replace `composite_pipeline` / `draw_composite` for offline,
   blended `CompositeOver` / `draw_composite_over` for the UI); egui-free; shared with `src/offline/`.
@@ -107,8 +115,9 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   GUI thread.
 - Both ping-pong targets are grown to at least the plan's `target_px` (every scaled step's
   image sits at the target origin; viewports and mappings come from the plan).
-- Every layer of a frame gets its own `LayerTargets` (pool index = prepare order, reset in
-  `finish_prepare`): all prepares are recorded before the single egui pass. Likewise any caller of
+- Every layer ENTRY of a frame gets its own `LayerTargets` (pool index = prepare order, reset in
+  `finish_prepare`; a layer's beneath meshes are uploaded once, into its first visible entry's
+  slot): all prepares are recorded before the single egui pass. Likewise any caller of
   the executor needs one `ChainTargets` per run whose composite is still pending.
 - `chain.rs` / `gpu.rs` must not depend on egui, egui-wgpu or this module's UI types; they are
   `pub(crate)` because `src/offline/` runs chains through them.
@@ -125,6 +134,15 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   passes A and B of `plan.rs` with `fs_region` and no blend; one `MeshLocals` block per (pass,
   region) at the device's uniform offset alignment, selected by a dynamic offset), bound at
   binding 7 of every pass step.
+- Entries (R3): each entry's geometry is `layer_geometry(geometry::entry_rect(union as painted,
+  callback rect, entry rect), ...)` — a single entry's rect IS the callback rect, so single-entry
+  layers are unchanged; its pointer resolves against its own capture. A `Stacked` hand-off's
+  viewport (earlier region ∩ later capture) and origin come from `plan::schedule`, never from this
+  module; its composite block is `plan::composite_for_origin` (extra blocks of the earlier run's
+  uniform buffer). Outside the earlier mask it writes the earlier capture, which holds the same
+  re-rendered backdrop there. State per entry (`LayerJob::state_key(index)`), the reset ticket
+  claimed once per paint. A failing entry (state format, pipeline) skips the whole layer before
+  anything is recorded.
 - The UI composite never writes pixels its mask does not cover (discard), and inside the mask it
   equals the filtered value exactly; only the 1-px antialiased edge is a blend with what the pass
   holds (on `*Srgb` targets in linear, so it differs from the offline / glow gamma mix there).
@@ -160,7 +178,8 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
 
 ## Editing map
 - What counts as "beneath" / clipping: `beneath.rs`. Texture staleness: `textures.rs`.
-- Which texture / mapping a draw gets: `src/plan.rs` (shared with glow). Recording, bind groups,
+- Which texture / mapping a draw gets: `src/plan.rs` (shared with glow). The order of a
+  multi-entry layer's work: `plan::schedule`; its execution `render.rs::record`. Recording, bind groups,
   uniform layout, intermediate format: `chain.rs` (shared by every wgpu caller). Backdrop re-render, egui-pass pipelines: `render.rs` / `resources.rs`.
 - Per-layer uniform values and composite params: core `FrameUniforms::for_layer` /
   `with_input` (`pass.rs`) and `LayerGeometry::composite_params` (`geometry.rs`), shared with glow.

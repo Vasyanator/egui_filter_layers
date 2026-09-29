@@ -28,6 +28,9 @@ blur, colour adjustments, refraction, or your own WGSL shader.
 - Regions: split one layer into up to 255 areas that share one capture and one chain run; every
   pass knows which area a pixel is in (`region()`) and can use per-area parameters (wgpu and glow UI,
   and offline).
+- Entries: several areas in one layer, each with its own chain, mask, textures and state, each
+  capturing only its own rect; overlapping entries either filter the original backdrop or the
+  earlier entries' result (`Overlap::Independent` / `Overlap::Stacked`, wgpu UI and offline).
 - Offline processing of images and video with the same chains (features `image` / `video`).
 - View-only: never touches egui textures or your data.
 - One shader language on every backend (WGSL, translated to GLSL for OpenGL).
@@ -338,8 +341,50 @@ let (left, right) = rect.split_left_right_at_fraction(0.5);
 ShaderLayer::new(rect, pass).regions([Region::rounded_rect(left, 8), Region::rounded_rect(right, 8)]).paint(ui.painter());
 ```
 
-In this build regions run on the wgpu backend; the glow backend skips region-masked layers (logged
-once) and offline runs refuse them (`OfflineError::InvalidOption`).
+Regions run on the wgpu and glow backends and offline (`OfflineOptions::with_mask`, tiled like
+any mask).
+
+**Entries.** A layer can hold several independent areas (`Entry`), each with its own rect,
+chain, mask, textures and state options; each captures and filters only its own padded rect, and
+they share one paint callback (on wgpu also one selection and tessellation of the content
+beneath). Entries are composited in list order; `Overlap` decides what a later entry filters
+where they overlap: `Independent` (default) the original backdrop, `Stacked` the earlier
+entries' result — like separate layers, but on every backend (separate layers on wgpu cannot see
+each other).
+
+```rust
+use egui_shader_layers::{Entry, Overlap, ShaderLayer, presets};
+
+ShaderLayer::from_entries([
+    Entry::new(sidebar, presets::gaussian_blur(8.0)).corner_radius(12),
+    Entry::new(badge, presets::invert(1.0)),
+])
+.overlap(Overlap::Stacked)
+.paint(ui.painter());
+```
+
+The layer-level builders (`mask`, `corner_radius`, `regions`, `texture`, `state`) apply to every
+entry present; the accessors (`chain`, `layer_mask`, `texture_at`) return the first entry's. A
+stateful entry keeps its own state under the layer's `id`; `reset_state(ctx, id)` resets all of
+them. A layer whose ANY entry fails a check is skipped whole. Offline: `OfflineLayer` of
+`OfflineEntry`s with `OfflineRenderer::process_layer` — bit-identical to the UI, never tiled (a
+frame above the tile limit is `NotTileable`). In this build the glow backend skips layers of more
+than one entry (logged once); single-entry layers are unaffected.
+
+**Regions, entries or layers?** Regions are the cheapest (one capture of the layer rect, one run
+for every area) when the areas share one effect and differ in parameters; entries when each area
+needs its own chain, mask or state, or areas are far apart (no capture of the space between);
+separate layers when they must sit at different positions of egui's paint order (they cost a
+selection, tessellation and re-render each on wgpu). Measured by `bench_many_elements` (N frosted,
+tinted tiles over a busy 256x128 backdrop; release build, Ryzen 5 9600X iGPU, Mesa 26.0.3; wall
+time per frame incl. GPU completion and readback; N = 4 / 16 / 64):
+
+| backend | backdrop only | N layers | one layer, N regions |
+|---|---|---|---|
+| wgpu (Vulkan) | 0.09 ms | 0.56 / 1.34 / 5.54 ms | 0.41 / 0.44 / 0.52 ms |
+| glow | 0.15 ms | 0.48 / 0.76 / 1.57 ms | 0.41 / 0.43 / 0.56 ms |
+
+Entry numbers follow with the glow implementation of entries.
 
 ### Named parameters
 
@@ -523,6 +568,13 @@ state is carried by the renderer from one `process` call to the next (`OfflineOp
 `OfflineRenderer::reset_state`; a `VideoProcessor` continues it frame to frame and every
 `process_video` stream starts from zero). At the frame border sampling clamps to the edge, exactly as the UI
 clamps at the screen edge.
+
+**Layers of entries** (`OfflineRenderer::process_layer` with an `OfflineLayer` of `OfflineEntry`s,
+rects in frame points) compute what `ShaderLayer::from_entries` shows over the frame, bit for bit
+in both overlap modes. Masks, textures and state options are set per entry (on the options they
+are refused); each stateful entry keeps its own state across calls. Such runs are never tiled:
+a frame above the tile limit is `NotTileable` (raise it with `with_max_tile_size`). Video
+processing takes single chains.
 
 ### Video
 

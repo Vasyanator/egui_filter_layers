@@ -18,6 +18,13 @@ OfflineRenderer::run (mod.rs)
    │           → draw_composite into the output texture → copy to readback buffer → submit
    ▼
 readback.rs: map_async future (blocking helpers poll with Wait) → rows into the frame
+
+OfflineRenderer::run_layer (layer.rs, R3: `OfflineLayer` of `OfflineEntry`s)
+   │ per entry: layer_geometry(entry rect, screen = frame) ── same as the UI; checks, pipelines
+   │ one encoder: frame → source, output = copy of source, then plan::schedule (pristine):
+   │   Capture = copy of the entry's capture rect, Run = chain::record, HandOff =
+   │   chain::record_handoff, Composite = draw_composite_over (the UI's blended composite)
+   ▼   readback of the whole output
    │ frame.rs: unpremultiply (egui rounding) unless premultiplied output was asked for
    ▼
 RgbaFrame / image::RgbaImage (image.rs)
@@ -29,7 +36,11 @@ frame stream needs (`video/` builds on exactly that).
 
 ## Files and submodules
 - `mod.rs`: `OfflineRenderer` (constructors, `process` / `process_into` / `process_async`,
-  `run`, per-tile recording), `frame_geometry`, upload / readback copies.
+  `run`, per-tile recording, `sync_textures` — the one texture-upload cache sync of both paths),
+  `frame_geometry`, upload / readback copies.
+- `layer.rs`: `OfflineEntry`, `OfflineLayer`, `process_layer` / `process_layer_into` /
+  `process_layer_async` (`run_layer`), `LayerResources` (frame textures, per-entry capture /
+  chain targets / texture uploads / state).
 - `texture.rs`: `OfflineTexture` (owned premultiplied RGBA8 + egui `TextureOptions`, shared by
   clones; `from_color_image` = egui's upload bytes; identity decides re-uploads).
 - `options.rs`: `OfflineOptions` (persistent state options, `with_state`; user textures per slot, `with_texture`; validated before GPU work; `delta_time` / `frame` remember
@@ -81,6 +92,12 @@ frame stream needs (`video/` builds on exactly that).
   `run` tessellates every region (`tessellate_regions`) and packs them with their draw ranges
   (`PackedRegions`), and each tile's `CoverageJob` rasterizes the union and the region ids of its
   own window; ids are identical tiled and whole (tested), `check_offline` visits every region.
+- Layer runs (R3, `process_layer`): never tiled (roadmap D6: a frame above the tile limit is
+  `NotTileable`); the options' mask / textures / state must stay default (per entry instead,
+  `InvalidOption`); every capture is exactly its size and every entry composites with the UI's
+  BLENDED composite over a copy of the frame, so UI == offline bit for bit in both overlap modes
+  (tested); per-entry states are kept by entry index (`reset_state` clears them too) and dropped,
+  with every layer object, after a GPU error.
 - Tiles overlap by the chain padding + 1 px; effects must read no further than their sample radius
   (the `lens` preset needs an explicit radius when tiled).
 - Every size is checked (`MAX_SIDE` = 2^24 - 1 per side, `usize` / `u32` / `u64` arithmetic);

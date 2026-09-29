@@ -30,6 +30,9 @@ viewports to transparent, all others to `WgpuOptions::clear_color()`.
 The textures a layer's shape mask samples (F9: the font atlas, a mask mesh's own texture) join
 the beneath textures; the layer is not planned when one is missing (an unknown user texture is
 reported through `Shared::fail_texture`, a stale font atlas only skips the frame).
+A multi-entry layer (R3) is selected and tessellated ONCE, clipped to the bounding box of its
+entries' padded capture rects; every entry then re-renders and filters only its OWN capture
+(scissored per entry in `render.rs`), never that box.
 The layer's attached user textures (F8) are resolved here too, at the end of the pass that
 painted it, exactly like the textures of its beneath meshes (`textures.rs`); a layer attaching an
 id that cannot be resolved is not planned (it draws nothing) and the id is reported once
@@ -44,7 +47,7 @@ use egui::{FullOutput, Shape};
 use super::beneath::{capture_points, find_callback, select_beneath, strip_callbacks};
 use super::textures::{primitive_textures, resolve_user_textures, snapshot_textures};
 use super::{BeneathPlan, LoggedOnce, Pending, Shared};
-use crate::geometry::transform_scale;
+use crate::geometry::{entry_rect, transform_scale};
 
 /// Collects the beneath content of every pending shader layer at the end of each egui pass.
 pub(crate) struct ShaderLayersPlugin {
@@ -131,14 +134,24 @@ fn plan_layer(ctx: &egui::Context, shared: &Shared, shapes: &[egui::epaint::Clip
         return None;
     };
     let transform_scale = transform_scale(pending.rect, callback.rect);
-    let capture = capture_points(callback.rect, clipped.clip_rect, pending.padding_points, transform_scale, pixels_per_point)?;
-    let user_textures = match resolve_user_textures(shared, pending.textures) {
-        Ok(resolved) => resolved,
-        Err(id) => {
-            shared.fail_texture(id);
-            return None;
+    // One selection for every entry (R3): the union of the entries' padded capture rects. Each
+    // entry then re-renders only its own capture from it (scissors per entry in `render.rs`); a
+    // single entry's rect IS the callback rect, so its capture is exactly as before.
+    let capture = pending
+        .entries
+        .iter()
+        .filter_map(|entry| capture_points(entry_rect(pending.rect, callback.rect, entry.rect), clipped.clip_rect, entry.padding_points, transform_scale, pixels_per_point))
+        .reduce(egui::Rect::union)?;
+    let mut user_textures = Vec::with_capacity(pending.entries.len());
+    for entry in &pending.entries {
+        match resolve_user_textures(shared, entry.textures) {
+            Ok(resolved) => user_textures.push(resolved),
+            Err(id) => {
+                shared.fail_texture(id);
+                return None;
+            }
         }
-    };
+    }
 
     let selection = select_beneath(shapes.get(..index)?, capture);
     let mut primitives = ctx.tessellate(selection.shapes, pixels_per_point);

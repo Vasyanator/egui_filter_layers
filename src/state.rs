@@ -119,12 +119,15 @@ impl StateOptions {
 pub enum StateError {
     /// The chain has a state pass but the layer has no identity: `ShaderLayer::id` is required,
     /// because the state must be found again next frame.
-    #[error("effect `{effect}` (pass {pass}) is a state pass, but the layer has no id; call ShaderLayer::id(..) so its state can be kept between frames")]
+    #[error("effect `{effect}` (pass {pass} of layer entry {entry}) is a state pass, but the layer has no id; call ShaderLayer::id(..) so its state can be kept between frames")]
     MissingId {
         /// The first state pass's effect label.
         effect: String,
         /// Its index in the chain.
         pass: usize,
+        /// Index of the layer entry ([`crate::Entry`]) whose chain has it (0 for a single-entry
+        /// layer).
+        entry: usize,
     },
     /// The device cannot render (or bilinearly filter) the state format.
     #[error("the {format} state format is not renderable and filterable on this device ({reason}); opt in to StateFormat::Rgba8Unorm if the effect packs its state into 8 bits")]
@@ -222,7 +225,8 @@ pub(crate) const EVICT_SECONDS: f64 = 2.0;
 pub(crate) struct StateKey {
     /// The viewport that painted it.
     pub viewport: ViewportId,
-    /// `ShaderLayer::id`.
+    /// `ShaderLayer::id` for the layer's key; a registry entry's key is one ENTRY's
+    /// (`plan::entry_state_key`: the layer id `.with(entry index)`, R3).
     pub id: Id,
 }
 

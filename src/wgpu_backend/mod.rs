@@ -250,17 +250,26 @@ struct Pending {
     callback: Weak<dyn Any + Send + Sync>,
     /// Where the plan goes.
     slot: Arc<LayerSlot>,
-    /// The layer's rect as painted (before layer transforms), to derive the transform scale.
+    /// The layer's rect as painted (before layer transforms; the union of its entries), to
+    /// derive the transform scale.
     rect: Rect,
-    /// `LayerJob::padding_points`.
-    padding_points: f32,
+    /// Per entry (R3), in list order: what planning needs of it.
+    entries: Vec<PendingEntry>,
     /// The viewport whose pass painted the layer (selects its clear colour).
     viewport: egui::ViewportId,
-    /// `LayerJob::textures`: resolved to bind groups when the layer is planned.
-    textures: [Option<TextureId>; TEXTURE_SLOTS],
-    /// The textures a shape mask's meshes sample (F9; the font atlas for text and pre-rasterized
-    /// content, a mesh's own texture), resolved with the beneath textures.
+    /// The textures the entries' shape masks sample (F9; the font atlas for text and
+    /// pre-rasterized content, a mesh's own texture), resolved with the beneath textures.
     mask_textures: Vec<TextureId>,
+}
+
+/// One entry of a pending layer.
+struct PendingEntry {
+    /// `EntryJob::rect` (layer points, as painted).
+    rect: Rect,
+    /// `EntryJob::padding_points`.
+    padding_points: f32,
+    /// `EntryJob::textures`: resolved to bind groups when the layer is planned.
+    textures: [Option<TextureId>; TEXTURE_SLOTS],
 }
 
 /// What the plugin hands to `prepare`: the beneath content of one layer, tessellated.
@@ -271,26 +280,37 @@ struct BeneathPlan {
     clip_rect: Rect,
     /// `callback_rect.width() / LayerJob::rect.width()` (padding and radii scale with it).
     transform_scale: f32,
-    /// Mesh primitives beneath the filter, clipped to the padded capture rect.
+    /// Mesh primitives beneath the filter, clipped to the union of the entries' padded capture
+    /// rects (one selection and tessellation for every entry).
     primitives: Vec<ClippedPrimitive>,
     /// A bind group for every texture the primitives reference (missing ones skipped) and for
     /// every texture of the layer's shape mask (all present, else the layer is not planned).
     textures: HashMap<TextureId, wgpu::BindGroup>,
     /// Premultiplied gamma-space colour the layer's viewport is cleared to (see `plugin.rs`).
     clear_color: [f32; 4],
-    /// The bind group of every attached user texture (`textures::resolve_user_textures`; a
-    /// layer with an unresolvable one is not planned).
-    user_textures: [Option<wgpu::BindGroup>; TEXTURE_SLOTS],
+    /// Per entry, the bind group of every attached user texture
+    /// (`textures::resolve_user_textures`; a layer with an unresolvable one is not planned).
+    user_textures: Vec<[Option<wgpu::BindGroup>; TEXTURE_SLOTS]>,
 }
 
-/// Where `prepare` left a layer's result, for `paint`.
-#[derive(Clone, Copy, Debug)]
+/// Where `prepare` left a layer's result, for `paint`: one composite per drawn entry, in the
+/// order `plan::schedule` composites them (list order).
+#[derive(Clone, Debug)]
 struct Drawn {
     /// `Shared::generation` of the resources that hold it.
     generation: u64,
+    /// The composites to draw, in order.
+    entries: Vec<DrawnEntry>,
+}
+
+/// One entry's composite left for `paint`.
+#[derive(Clone, Copy, Debug)]
+struct DrawnEntry {
+    /// Index of the entry in the layer's job.
+    entry: usize,
     /// Index into `WgpuResources::pool`.
     pool_index: usize,
-    /// The processed region in screen pixels (the composite viewport).
+    /// The entry's processed region in screen pixels (the composite viewport).
     region: PxRect,
 }
 
@@ -513,8 +533,9 @@ impl Backend for WgpuBackend {
             return;
         }
         let slot = Arc::new(LayerSlot::default());
-        let (rect, padding_points, textures) = (job.rect, job.padding_points, job.textures);
-        let mut mask_textures: Vec<TextureId> = job.mask.textures();
+        let rect = job.rect;
+        let entries = job.entries.iter().map(|entry| PendingEntry { rect: entry.rect, padding_points: entry.padding_points, textures: entry.textures }).collect();
+        let mut mask_textures: Vec<TextureId> = job.entries.iter().flat_map(|entry| entry.mask.textures()).collect();
         mask_textures.sort_unstable();
         mask_textures.dedup();
         // Read during the pass: after `end_pass` the context reports the parent viewport.
@@ -527,7 +548,7 @@ impl Backend for WgpuBackend {
             // Entries whose callback died without being planned (discarded pass, other viewport
             // that never ended) are dropped here as well as in the plugin.
             pending.retain(|entry| entry.callback.strong_count() > 0);
-            pending.push(Pending { callback: weak, slot, rect, padding_points, viewport, textures, mask_textures });
+            pending.push(Pending { callback: weak, slot, rect, entries, viewport, mask_textures });
         }
         painter.add(paint_callback);
     }

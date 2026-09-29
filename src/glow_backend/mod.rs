@@ -30,6 +30,8 @@ foreign) skips the layers attaching it (logged once per id, reported by `failed_
 egui_glow applies a frame's texture deltas before painting and frees after, so a live id always
 resolves to its current texture. Nothing is retried per frame. Re-installing on the same context frees the
 previous glow backend's GL objects first.
+A layer with several entries (R3) is refused on the GUI thread (`Unsupported::MultiEntryLayers`,
+logged once; temporary until roadmap phase R3b); single-entry layers run as before.
 */
 
 mod coverage;
@@ -92,8 +94,30 @@ pub(crate) struct GlowState {
     states: StateRegistry<StateTargets>,
     /// State formats this context cannot render / filter, latched per format.
     failed_states: HashMap<StateFormat, StateFailure>,
+    /// Layer features refused on this backend, latched so each is logged once.
+    refused: HashSet<Unsupported>,
     /// Set by `destroy_glow`; a late callback must not recreate resources.
     destroyed: bool,
+}
+
+/// A layer feature the glow backend refuses (the layer draws nothing extra; logged once).
+///
+/// TEMPORARY (AGENTS.md §14): multi-entry layers run on wgpu (UI and offline) since roadmap §19
+/// phase R3a; glow gains the capture pool, the blended composite and the schedule execution in
+/// phase R3b of the same release, which removes this refusal and this type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Unsupported {
+    /// A layer with more than one [`crate::Entry`]: glow runs one capture per paint callback.
+    /// Running only the first entry would silently drop the others.
+    MultiEntryLayers,
+}
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MultiEntryLayers => f.write_str("layers with several entries (ShaderLayer::from_entries / with_entry) are not supported by the glow backend yet"),
+        }
+    }
 }
 
 impl GlowState {
@@ -163,6 +187,17 @@ impl GlowState {
              Possible cause: the TextureHandle was dropped (egui freed the texture) while the layer still attaches its id."
         );
         self.failed_textures.insert(id, TextureFailure { id, error });
+    }
+
+    /// Records that layers using `feature` are refused on this backend (logged once per feature).
+    fn refuse(&mut self, feature: Unsupported) {
+        if self.refused.insert(feature) {
+            log::error!(
+                "egui_shader_layers (glow): a shader layer was skipped (it draws nothing extra).\n\
+                 Error: {feature}\n\
+                 Fix: use the wgpu backend for this layer, or paint its entries as separate layers. Logged once per feature."
+            );
+        }
     }
 
     /// Records that stateful layers asking for `format` are refused and logs it once per format.
@@ -308,11 +343,16 @@ impl Backend for GlowBackend {
         let Ok(target) = self.target.clone() else {
             return;
         };
+        let [entry] = job.entries.as_slice() else {
+            self.lock().refuse(Unsupported::MultiEntryLayers);
+            return;
+        };
         let state = Arc::clone(&self.state);
         let rect = job.rect;
+        let textures = entry.textures;
         // A shape or region mask (F9 / R1) is packed once here, on the GUI thread; the callback
         // only resolves the textures its draws sample.
-        let packed = job.mask.pack();
+        let packed = entry.mask.pack();
         let callback = egui_glow::CallbackFn::new(move |info, glow_painter| {
             let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
             let mut mask_textures = Vec::with_capacity(packed.as_ref().map_or(0, |packed| packed.packed.draws.len()));
@@ -327,7 +367,7 @@ impl Backend for GlowBackend {
             // egui_glow applied this frame's texture deltas before painting, so a live id maps to
             // its current texture; an unknown one skips the layer (no dummy stands in for it).
             let mut user_textures = [None; TEXTURE_SLOTS];
-            for (resolved, id) in user_textures.iter_mut().zip(job.textures) {
+            for (resolved, id) in user_textures.iter_mut().zip(textures) {
                 let Some(id) = id else {
                     continue;
                 };

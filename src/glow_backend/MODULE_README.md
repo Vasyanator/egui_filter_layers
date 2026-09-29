@@ -83,6 +83,10 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   PASS step (`target_of(Slot::RegionId)`, `allocations().region`); the composite and layers
   without regions get the white dummy (`REGION_NONE`). A packed mask that does not match its plan
   (`CoverageResources::fits`) latches (crate bug).
+- Entries (R3): until roadmap phase R3b a layer of more than one entry is refused on the GUI
+  thread (`Unsupported::MultiEntryLayers`, logged once, draws nothing extra — temporary, removed
+  by R3b); a single-entry layer runs exactly as before, from its `EntryJob` (state key
+  `LayerJob::state_key(0)`).
 - Backend-wide failures (resource creation, unexplained capture / composite GL error) latch
   `GlowState::failure`; per-effect failures (translation, compile/link, a GL error of that
   effect's draw — attributed directly for single-effect chains, else by per-pass checks on later

@@ -17,6 +17,9 @@ Key items:
 - `offline` module and its re-exports (`OfflineRenderer`, ...; features `image` / `video`)
 - `HotEffect`, `rebind` (+ options, events, errors; feature `hot-reload`, native only)
 - shape masks (F9): `Mask`, `MaskError` (`ShaderLayer::mask`, `OfflineOptions::with_mask`)
+- regions (R1): `Region`, `MAX_REGIONS`, `REGION_NONE` (`ShaderLayer::regions`)
+- entries (R3): `Entry`, `Overlap` (`ShaderLayer::from_entries` / `with_entry` / `overlap`);
+  offline `OfflineEntry`, `OfflineLayer` (`OfflineRenderer::process_layer`)
 
 Notes:
 Backends plug in behind the crate-internal `backend::Backend` trait; nothing outside a backend
@@ -58,6 +61,9 @@ module names a backend type.
 //! * **Input**: [`Impulses`] turns clicks into transient animations that repaint only while alive.
 //! * **User textures** ([`ShaderLayer::texture`]), **persistent per-layer state**
 //!   ([`Effect::new_state`], [`ShaderLayer::id`]) and **shape masks** ([`ShaderLayer::mask`]).
+//! * **Many areas in one layer**: per-area parameters of one chain ([`ShaderLayer::regions`]) or
+//!   several independent areas, each with its own chain ([`Entry`], [`ShaderLayer::from_entries`]);
+//!   see [Regions and entries](#regions-and-entries).
 //! * **Backends**: `egui_glow` and `egui-wgpu`; **offline** processing of images and video
 //!   (features `image` / `video`); **hot reload** of WGSL files (feature `hot-reload`).
 //!
@@ -294,7 +300,7 @@ module names a backend type.
 //! regions overlap the LATER one wins, and the boundary between two regions is pixel-hard (a soft
 //! transition between two parameter sets needs two layers). One capture and one chain run serve
 //! every region, which is what makes many small areas cheaper than many layers. Regions run on the
-//! wgpu and glow backends; offline runs refuse them (`OfflineError::InvalidOption`) for now.
+//! wgpu and glow backends and offline (`OfflineOptions::with_mask`, tiled like any mask).
 //!
 //! ```no_run
 //! # fn frame(ui: &mut egui::Ui, rect: egui::Rect) -> Result<(), Box<dyn std::error::Error>> {
@@ -313,6 +319,44 @@ module names a backend type.
 //! painted in. Inside a transformed layer (an `egui::Scene`, `Context::set_transform_layer`) they
 //! scale with its zoom exactly like the painted content: a 4-point blur covers 8 pixels at zoom 2
 //! and 2 pixels at zoom 0.5 (at 1 pixel per point), and the capture padding follows.
+//!
+//! # Regions and entries
+//!
+//! Three ways to filter many areas, from cheapest to most flexible:
+//!
+//! * **Regions** ([`ShaderLayer::regions`]): ONE chain, one capture (the layer rect, which must
+//!   cover the regions) and one run for every area; effects read `region()` to vary their
+//!   parameters. Use it for many small areas that share the effect and differ only in parameters
+//!   (a grid of tinted glass tiles); the boundary between two regions is hard. The capture covers
+//!   the whole rect, so a few areas far apart pay for the space between them.
+//! * **Entries** ([`Entry`], [`ShaderLayer::from_entries`], [`ShaderLayer::with_entry`]): each
+//!   area has its OWN chain, mask, textures and state, and captures ONLY its own padded rect;
+//!   the entries share one paint callback (and on wgpu one selection and tessellation of the
+//!   content beneath). [`Overlap`] says what a later entry filters where entries overlap:
+//!   [`Overlap::Independent`] (the original backdrop; the later one covers the earlier) or
+//!   [`Overlap::Stacked`] (the earlier entries' result, like separate layers — on EVERY backend,
+//!   while separate layers on wgpu cannot see each other). Composites are in list order. The
+//!   layer-level builders (`mask`, `corner_radius`, `regions`, `texture`, `state`) apply to every
+//!   entry present, the accessors return the first entry's; a stateful entry keeps its own state
+//!   under the layer's id, and [`reset_state`] resets them all. A layer is drawn or refused as a
+//!   whole (any failing entry refuses it). Offline: `OfflineLayer` + `OfflineEntry` with
+//!   `OfflineRenderer::process_layer` (never tiled). The glow backend refuses layers of more than
+//!   one entry for now (they draw nothing, logged once); single-entry layers are unchanged.
+//! * **Separate layers**: one [`ShaderLayer`] per area. The most general (each its own paint
+//!   position), and the costliest on wgpu: every layer selects, tessellates and re-renders the
+//!   content beneath it again.
+//!
+//! Measured (roadmap R2, `bench_many_elements`: N frosted, tinted tiles over a busy 256x128
+//! backdrop, release build, Ryzen 5 9600X iGPU, Mesa 26.0.3, wall time per frame including GPU
+//! completion and readback; N = 4 / 16 / 64):
+//!
+//! | backend | backdrop only | N layers | one layer, N regions |
+//! |---|---|---|---|
+//! | wgpu (Vulkan) | 0.09 ms | 0.56 / 1.34 / 5.54 ms | 0.41 / 0.44 / 0.52 ms |
+//! | glow | 0.15 ms | 0.48 / 0.76 / 1.57 ms | 0.41 / 0.43 / 0.56 ms |
+//!
+//! Regions stay flat as N grows; layers grow linearly (on wgpu with the re-render). Entries sit
+//! between: one selection and callback, N small captures and runs (numbers pending, roadmap R2b).
 //!
 //! # Backends
 //!
@@ -366,6 +410,7 @@ module names a backend type.
 
 mod backend;
 mod effect;
+mod entry;
 mod geometry;
 mod impulses;
 mod layer;
@@ -392,6 +437,7 @@ mod hot;
 
 pub use backend::{BackendKind, BackendStatus, EffectFailure, InstallError, TextureError, TextureFailure, failed_effects, failed_textures, status};
 pub use effect::{Effect, EffectError, ParamError, ParamInfo, ParamType, ParamValue, SnippetLocation, TEXTURE_SLOTS};
+pub use entry::{Entry, Overlap};
 pub use impulses::{IMPULSE_COUNT_PARAM, IMPULSE_SLOTS, IMPULSES_PARAM, Impulse, ImpulsePack, Impulses};
 pub use layer::ShaderLayer;
 pub use mask::{MAX_REGIONS, Mask, MaskError, REGION_NONE, Region};
@@ -404,6 +450,6 @@ pub use glow_backend::{destroy_glow, install_glow};
 #[cfg(feature = "wgpu")]
 pub use wgpu_backend::{WgpuOptions, install_wgpu};
 #[cfg(any(feature = "image", feature = "video"))]
-pub use offline::{AlphaMode, FrameRef, OfflineError, OfflineOptions, OfflineRenderer, OfflineTexture, PointerState, RgbaFrame};
+pub use offline::{AlphaMode, FrameRef, OfflineEntry, OfflineError, OfflineLayer, OfflineOptions, OfflineRenderer, OfflineTexture, PointerState, RgbaFrame};
 #[cfg(all(feature = "hot-reload", not(target_arch = "wasm32")))]
 pub use hot::{DEFAULT_POLL_INTERVAL, HotEffect, HotOptions, HotReloadError, HotReloadEvent, MIN_POLL_INTERVAL, Rebound, rebind};

@@ -262,8 +262,8 @@ pub struct FilterChain {
 impl FilterChain {
     /// An empty chain (painting it does nothing).
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self { passes: Vec::new() }
     }
 
     /// Appends a pass or a whole chain.

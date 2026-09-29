@@ -23,6 +23,7 @@
 //! regions tinted per `region()` fills its cells, switches tint within a pixel of every shared
 //! edge with full coverage there and no `REGION_NONE` fringe; overlapping regions: the later one
 //! wins; `region()` is `REGION_NONE` outside the regions and on a layer without regions.
+//! Entries (R3): a multi-entry layer is refused until phase R3b (single-entry layers unaffected).
 //!
 //! Linux only (EGL device platform, Mesa or a vendor EGL). Needs a GPU or Mesa's software
 //! device, so it is ignored by default: `cargo test --all-features --test glow_headless -- --ignored`.
@@ -34,7 +35,7 @@ use std::sync::Arc;
 
 use egui::emath::TSTransform;
 use egui::{Color32, ColorImage, Pos2, Rect, TextureOptions, pos2, vec2};
-use egui_shader_layers::{BackendKind, BackendStatus, Effect, FilterChain, ShaderLayer, Pass, Region, StateFormat, StateOptions, destroy_glow, install_glow, presets};
+use egui_shader_layers::{BackendKind, BackendStatus, Effect, Entry, FilterChain, ShaderLayer, Pass, Region, StateFormat, StateOptions, destroy_glow, install_glow, presets};
 use glow::HasContext as _;
 use glutin::api::egl::context::PossiblyCurrentContext;
 use glutin::api::egl::device::Device;
@@ -1412,6 +1413,32 @@ fn overlapping_regions_later_wins() {
             assert_near(&pixels, 39, 60, REGION_TINTS[0], &format!("{what}: left of the small region"));
             assert_near(&pixels, 40, 60, REGION_TINTS[1], &format!("{what}: first column of the small region"));
         }
+    }
+    assert_active(&harness.ctx);
+}
+
+// ---- R3: entries (glow runs them from phase R3b) ----
+
+/// R3 on glow before phase R3b: a layer of two entries is refused (it draws nothing extra, logged
+/// once), a single-entry layer in the same frame still filters and the backend stays active.
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn multi_entry_layers_are_refused_until_glow_runs_them() {
+    let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let scene = |ui: &mut egui::Ui| {
+        halves(ui.painter());
+        ShaderLayer::from_entries([
+            Entry::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(50.0, 50.0)), presets::invert(1.0)),
+            Entry::new(Rect::from_min_max(pos2(60.0, 60.0), pos2(100.0, 100.0)), presets::invert(1.0)),
+        ])
+        .paint(ui.painter());
+        ShaderLayer::new(Rect::from_min_max(pos2(150.0, 10.0), pos2(240.0, 100.0)), presets::invert(1.0)).paint(ui.painter());
+    };
+    for _ in 0..2 {
+        let pixels = harness.frame(&mut |ui| scene(ui));
+        assert_near(&pixels, 30, 30, [255, 0, 0], "the multi-entry layer is refused: the backdrop stays");
+        assert_near(&pixels, 80, 80, [255, 0, 0], "its second entry too");
+        assert_near(&pixels, 190, 50, [255, 255, 0], "the single-entry layer still inverts the blue half");
     }
     assert_active(&harness.ctx);
 }

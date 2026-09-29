@@ -295,16 +295,40 @@ impl OfflineOptions {
         InputUniforms { delta_time: self.delta_time(), frame: self.frame(), pointer: pointer_uniform(pointer, 1.0, geometry.capture) }
     }
 
+    /// The input members of the uniform block of one ENTRY's run (`process_layer`) whose capture
+    /// is `capture` (frame pixels) in a frame of `frame_px` pixels: the pointer (frame uv) goes to
+    /// frame pixels, then through the UI's conversion into that capture's uv.
+    pub(super) fn input_uniforms_in(&self, frame_px: [u32; 2], capture: crate::geometry::PxRect) -> InputUniforms {
+        let side = |pixels: u32| i32::try_from(pixels).map_or(f32::MAX, px_f32);
+        let pointer = self.pointer.map(|pointer| (pos2(pointer.uv[0] * side(frame_px[0]), pointer.uv[1] * side(frame_px[1])), pointer.pressed));
+        InputUniforms { delta_time: self.delta_time(), frame: self.frame(), pointer: pointer_uniform(pointer, 1.0, capture) }
+    }
+
     /// Background colour, if any.
     #[must_use]
     pub fn background(&self) -> Option<Color32> {
         self.background
     }
 
+    /// The first per-layer option set away from its default (`"mask"`, `"texture"`, `"state"`):
+    /// `process_layer` takes those per `OfflineEntry`, so a set one would be silently ignored
+    /// there and is refused instead. `None` when all three are at their defaults.
+    pub(super) fn set_entry_option(&self) -> Option<&'static str> {
+        if self.mask != Mask::default() {
+            Some("mask")
+        } else if self.textures.iter().any(Option::is_some) || self.invalid_texture_slot.is_some() {
+            Some("texture")
+        } else if self.state != StateOptions::default() {
+            Some("state")
+        } else {
+            None
+        }
+    }
+
     /// Checks the numeric options and the texture slots.
     pub(super) fn validate(&self) -> Result<(), OfflineError> {
         if let Some(slot) = self.invalid_texture_slot {
-            return Err(OfflineError::Texture(TextureError::InvalidSlot { slot }));
+            return Err(OfflineError::Texture(TextureError::InvalidSlot { entry: 0, slot }));
         }
         self.mask.check_offline()?;
         if !(self.pixels_per_point.is_finite() && self.pixels_per_point > 0.0) {
@@ -372,6 +396,9 @@ mod tests {
         assert_eq!((input.frame, input.delta_time.to_bits()), (4, 0.5_f32.to_bits()));
         assert_eq!(input.pointer.map(f32::to_bits), [0.25_f32, 0.75, 1.0, 1.0].map(f32::to_bits), "frame uv is capture uv");
         assert_eq!(options.explicit_counters(), (true, true));
+        assert_eq!(options.set_entry_option(), None, "frame-wide options only");
+        assert_eq!(OfflineOptions::default().with_corner_radius(2).set_entry_option(), Some("mask"));
+        assert_eq!(OfflineOptions::default().with_state(StateOptions::default().with_scale(0.5)).set_entry_option(), Some("state"));
         assert_eq!(OfflineOptions::default().explicit_counters(), (false, false));
     }
 }

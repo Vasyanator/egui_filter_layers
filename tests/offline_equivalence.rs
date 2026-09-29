@@ -30,6 +30,10 @@
 //! * Region masks (R1): a 2x2 grid of abutting regions plus an overlapping circle matches the UI
 //!   the same way; each cell's effect sees its own id, shared edges belong to the later region
 //!   and show no backdrop; tiled equals whole (ids identical, one step on the outer outline).
+//! * Entries (R3): a layer of three overlapping entries (rounded blur, shape-masked tint, pixelate)
+//!   processed with `process_layer` equals the UI bit for bit in both overlap modes, at 1 and 2
+//!   pixels per point; layer runs refuse tiling (`NotTileable`) and per-entry options set on the
+//!   options; per-entry states accumulate across runs.
 //! * The GPU tests of this file share one device (`GPU`, a test-only static; see there) and run
 //!   in parallel on it.
 //!
@@ -782,7 +786,7 @@ fn missing_and_invalid_textures_are_typed_errors() {
         other => panic!("slot 2 is read but empty: {:?}", other.map(|frame| frame.width())),
     }
     match offline.process(&frame, &chain, &two.clone().with_texture(3, texture.clone())) {
-        Err(egui_shader_layers::OfflineError::Texture(egui_shader_layers::TextureError::InvalidSlot { slot: 3 })) => {}
+        Err(egui_shader_layers::OfflineError::Texture(egui_shader_layers::TextureError::InvalidSlot { entry: 0, slot: 3 })) => {}
         other => panic!("slot 3 does not exist: {:?}", other.map(|frame| frame.width())),
     }
     assert!(offline.process(&frame, &chain, &two.clone().with_texture(2, texture)).is_ok());
@@ -1163,4 +1167,122 @@ fn tiled_region_masks_equal_whole() {
     let empty = OfflineOptions::default().with_mask(egui_shader_layers::Mask::Regions(Vec::new()));
     let kept = offline.process(&frame, &chain, &empty).unwrap_or_else(|error| panic!("empty: {error}"));
     assert_eq!(kept.pixels(), image.as_slice(), "an empty region list covers nothing");
+}
+
+// ---- R3: several entries in one layer ----
+
+impl Ui {
+    /// The image (1:1, the whole screen) under `layer`, as egui-wgpu draws it; the second frame.
+    fn render_layer(&self, layer: &ShaderLayer) -> Vec<u8> {
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(px(WIDTH) / self.ppp, px(HEIGHT) / self.ppp));
+        let mut pixels = Vec::new();
+        for _ in 0..2 {
+            let viewports = std::iter::once((ViewportId::ROOT, ViewportInfo { native_pixels_per_point: Some(self.ppp), ..Default::default() })).collect();
+            let input = egui::RawInput { screen_rect: Some(rect), time: Some(f64::from(TIME)), viewports, ..Default::default() };
+            let mut output = self.ctx.run_ui(input, |ui| {
+                let painter = ui.painter();
+                painter.image(self.texture.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                layer.clone().paint(painter);
+            });
+            let mut textures_delta = std::mem::take(&mut output.textures_delta);
+            let primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
+            pixels = self.draw(&primitives, &mut textures_delta);
+            textures_delta.clear();
+        }
+        assert!(matches!(egui_shader_layers::status(&self.ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&self.ctx));
+        pixels
+    }
+}
+
+/// The three overlapping entries of the R3 equivalence cases at `ppp`, as `(rect in points, chain,
+/// mask)`: a rounded blur + invert, a circle-masked tint reading `fl.size_px` / `fl.rect_uv` (its
+/// own capture), a pixelate; entry 1 overlaps both others.
+fn entry_cases(ppp: f32) -> Vec<(Rect, FilterChain, egui_shader_layers::Mask)> {
+    let rect = |x0: f32, y0: f32, x1: f32, y1: f32| Rect::from_min_max(pos2(x0 / ppp, y0 / ppp), pos2(x1 / ppp, y1 / ppp));
+    let tint = Effect::new("own capture tint", "fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let c = src(uv);
+    let k = fract(fl.size_px.x / 37.0) * 0.5 + fl.rect_uv.x * 0.25;
+    return vec4<f32>(mix(c.rgb, vec3<f32>(0.9, 0.2, 0.1) * c.a, k), c.a);
+}").unwrap_or_else(|error| panic!("{error}"));
+    let circle = egui::Shape::circle_filled(pos2(125.3 / ppp, 80.2 / ppp), 38.0 / ppp, Color32::WHITE);
+    vec![
+        (rect(10.0, 10.0, 110.0, 90.0), presets::gaussian_blur(3.0).then(presets::invert(1.0)), egui_shader_layers::Mask::RoundedRect(egui::CornerRadius::same(10))),
+        (rect(70.0, 40.0, 180.0, 122.0), FilterChain::from(Pass::new(&tint)), egui_shader_layers::Mask::Shape(circle)),
+        (rect(150.0, 5.0, 190.0, 60.0), FilterChain::from(presets::pixelate(4.0)), egui_shader_layers::Mask::default()),
+    ]
+}
+
+/// R3 (§19.4.6): a layer of three overlapping entries (rounded, shape-masked, plain; a padded
+/// blur) processed offline equals the UI BIT FOR BIT in both overlap modes and at 1 and 2 pixels
+/// per point: the same geometry per entry, the same chain executor, the same `Stacked` hand-off
+/// (`chain::record_handoff`) and the same blended composite (non-sRGB target, no dithering). The
+/// modes differ where the entries overlap.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn entries_offline_equal_the_ui_in_both_modes() {
+    let image = test_image(WIDTH, HEIGHT, |_, _| 255);
+    for ppp in [1.0, 2.0] {
+        let mut results = Vec::new();
+        for overlap in [egui_shader_layers::Overlap::Independent, egui_shader_layers::Overlap::Stacked] {
+            let ui = Ui::new(wgpu::TextureFormat::Rgba8Unorm, false, ppp, &image);
+            let mut offline = OfflineRenderer::from_render_state(&ui.state).unwrap_or_else(|error| panic!("{error}"));
+            let cases = entry_cases(ppp);
+            let layer = ShaderLayer::from_entries(cases.iter().map(|(rect, chain, mask)| egui_shader_layers::Entry::new(*rect, chain.clone()).mask(mask.clone()))).overlap(overlap);
+            let offline_layer = egui_shader_layers::OfflineLayer::new(cases.iter().map(|(rect, chain, mask)| egui_shader_layers::OfflineEntry::new(*rect, chain.clone()).mask(mask.clone()))).overlap(overlap);
+            let expected = ui.render_layer(&layer);
+            let options = OfflineOptions::default().with_pixels_per_point(ppp).with_time(TIME).with_output_alpha(AlphaMode::Premultiplied);
+            let result = offline.process_layer(&FrameRef::new(&image, WIDTH, HEIGHT, AlphaMode::Straight), &offline_layer, &options).unwrap_or_else(|error| panic!("{error}"));
+            let (count, max, first) = compare(&expected, result.pixels(), WIDTH, false);
+            eprintln!("entries {overlap:?}, ppp {ppp}: {count} differing values, max diff {max}, first at {first:?}");
+            assert_eq!(count, 0, "{overlap:?}, ppp {ppp}: max diff {max}, first at {first:?}");
+            // Outside every entry: the frame.
+            assert_eq!(rgb_at(result.pixels(), 3, 125), rgb_at(&image, 3, 125), "{overlap:?}, ppp {ppp}: outside the entries");
+            results.push(result);
+        }
+        let (count, _, _) = compare(results[0].pixels(), results[1].pixels(), WIDTH, true);
+        assert!(count > 1000, "ppp {ppp}: the modes must differ where the entries overlap ({count} values)");
+    }
+}
+
+/// R3 (D6): a layer run is never tiled — a frame above the tile limit is `NotTileable`, the same
+/// frame with the limit lifted runs; masks / textures / state set on the options (per-entry
+/// settings) and a bad entry are refused before any GPU work; per-entry states accumulate across
+/// runs and `reset_state` restarts them all.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn multi_entry_layers_refuse_tiling() {
+    let (_instance, adapter, device, queue) = gpu();
+    let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
+    let image = test_image(WIDTH, HEIGHT, |_, _| 255);
+    let frame = FrameRef::new(&image, WIDTH, HEIGHT, AlphaMode::Straight);
+    let layer = egui_shader_layers::OfflineLayer::new([
+        egui_shader_layers::OfflineEntry::new(Rect::from_min_max(pos2(0.0, 0.0), pos2(90.0, 60.0)), presets::invert(1.0)),
+        egui_shader_layers::OfflineEntry::new(Rect::from_min_max(pos2(100.0, 60.0), pos2(190.0, 128.0)), presets::grayscale(1.0)),
+    ]);
+    let tiled = offline.process_layer(&frame, &layer, &OfflineOptions::default().with_max_tile_size(Some(64)));
+    assert!(matches!(tiled, Err(egui_shader_layers::OfflineError::NotTileable { .. })), "{:?}", tiled.map(|frame| frame.width()));
+    let whole = offline.process_layer(&frame, &layer, &OfflineOptions::default().with_max_tile_size(None)).unwrap_or_else(|error| panic!("{error}"));
+    let inverted = rgb_at(&image, 20, 20).map(|value| 255 - value);
+    assert_eq!(rgb_at(whole.pixels(), 20, 20), inverted, "entry 0 inverts");
+    assert_eq!(rgb_at(whole.pixels(), 95, 20), rgb_at(&image, 95, 20), "between the entries: the frame");
+    let refused = offline.process_layer(&frame, &layer, &OfflineOptions::default().with_corner_radius(4));
+    assert!(matches!(refused, Err(egui_shader_layers::OfflineError::InvalidOption { option: "mask", .. })), "{:?}", refused.map(|frame| frame.width()));
+    let reads_texture = Effect::new("textured", "fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(0u, uv); }").unwrap_or_else(|error| panic!("{error}"));
+    let missing = layer.clone().with_entry(egui_shader_layers::OfflineEntry::new(Rect::from_min_max(pos2(0.0, 0.0), pos2(10.0, 10.0)), Pass::new(&reads_texture)));
+    let refused = offline.process_layer(&frame, &missing, &OfflineOptions::default());
+    assert!(matches!(refused, Err(egui_shader_layers::OfflineError::Texture(egui_shader_layers::TextureError::NotAttached { entry: 2, slot: 0, .. }))), "{:?}", refused.map(|frame| frame.width()));
+
+    // Two stateful entries: each keeps its own state across runs; reset_state restarts both.
+    let stateful = egui_shader_layers::OfflineLayer::new([
+        egui_shader_layers::OfflineEntry::new(Rect::from_min_max(pos2(0.0, 0.0), pos2(90.0, 128.0)), accumulator()),
+        egui_shader_layers::OfflineEntry::new(Rect::from_min_max(pos2(100.0, 0.0), pos2(192.0, 128.0)), accumulator()),
+    ]);
+    let grey = |pixels: &[u8], x: u32, runs: usize| rgb_at(pixels, x, 64).iter().all(|value| value.abs_diff(accumulated(runs)) <= 1);
+    for runs in 1..=3 {
+        let out = offline.process_layer(&frame, &stateful, &OfflineOptions::default()).unwrap_or_else(|error| panic!("{error}"));
+        assert!(grey(out.pixels(), 40, runs) && grey(out.pixels(), 150, runs), "run {runs}: {:?} {:?}", rgb_at(out.pixels(), 40, 64), rgb_at(out.pixels(), 150, 64));
+    }
+    offline.reset_state();
+    let out = offline.process_layer(&frame, &stateful, &OfflineOptions::default()).unwrap_or_else(|error| panic!("{error}"));
+    assert!(grey(out.pixels(), 40, 1) && grey(out.pixels(), 150, 1), "after reset_state");
 }

@@ -16,7 +16,7 @@ Key structures:
 - `GrowBuffer`: grow-only buffer written with `Queue::write_buffer`.
 
 Key functions:
-- `ErrorScopes` (out-of-memory + validation + internal), `with_error_scope()`, `pass_pipeline()`, `begin_pass()`, `renderable_and_filterable()`.
+- `ErrorScopes` (out-of-memory + validation + internal), `with_error_scope()`, `pass_pipeline()`, `begin_pass()` / `begin_pass_load()` (load, not clear: hand-offs), `renderable_and_filterable()`.
 
 Notes:
 Everything here takes `&wgpu::Device` / `&wgpu::Queue` explicitly, so it works on any device.
@@ -323,6 +323,20 @@ pub(crate) fn begin_pass<'e>(encoder: &'e mut wgpu::CommandEncoder, view: &wgpu:
     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store } })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    })
+}
+
+/// A render pass on `view` that KEEPS its content (`LoadOp::Load`), single colour attachment, no
+/// depth: the `Stacked` hand-off into an entry's capture (R3) and the offline multi-entry
+/// composites over the output.
+pub(crate) fn begin_pass_load<'e>(encoder: &'e mut wgpu::CommandEncoder, view: &wgpu::TextureView, label: &str) -> wgpu::RenderPass<'e> {
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,

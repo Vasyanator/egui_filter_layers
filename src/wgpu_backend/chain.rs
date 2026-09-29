@@ -32,6 +32,8 @@ Key functions:
   one buffer at the device's offset alignment (`ChainUniforms`, `DrawUniforms`).
 - `draw_composite()` / `draw_composite_over()`: the composite draw(s) into a caller-owned render
   pass (replace: offline; blended over the pass's pixels: the UI).
+- `ChainResources::record_handoff()`: a `Stacked` hand-off (R3) — the replace composite of an
+  earlier entry's run drawn into a later entry's capture (UI and offline share it).
 
 Notes:
 One uniform buffer per run holds, for draw `i` (plan step `i`; draw `n` = the composite), its
@@ -51,6 +53,10 @@ State (F7): the caller owns a layer's two state textures (`ChainState`); `record
 plan's size KEEPING their content (`Target::ensure_kept`, a copy recorded first), clears the one
 the plan says, and maps `Slot::StateA` / `StateB` to them. A state pass's pipeline renders into
 the state format, so the pipeline cache is keyed by module AND output format.
+Entries (R3): a multi-entry layer is one run per entry; `plan::schedule` orders them. A run whose
+composite is handed off (`Stacked`) gets one extra composite block per target entry
+(`ChainJob::handoff_origins`, `plan::composite_for_origin`) and returns their bind groups;
+`record_handoff` draws one with the cached replace pipeline into the later capture (`LoadOp::Load`).
 Textures are stored top-down on wgpu, so `flip_y` is false.
 A run computes a WINDOW of the capture (`ChainWindow`): the UI always uses the whole capture; the
 offline tiler runs one window per tile. Fragments derive their capture uv from their pixel
@@ -62,7 +68,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use super::coverage::{CoverageJob, CoverageRasterizer, CoverageTargets};
-use super::gpu::{GrowBuffer, Target, begin_pass, egui_texture_entries, pass_pipeline, renderable_and_filterable, sampler_entry, texture_entry, uniform_entry, with_error_scope};
+use super::gpu::{GrowBuffer, Target, begin_pass, begin_pass_load, egui_texture_entries, pass_pipeline, renderable_and_filterable, sampler_entry, texture_entry, uniform_entry, with_error_scope};
 use crate::effect::{
     BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_REGION_TEXTURE, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, CompiledModule, TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING, USER_TEXTURE_GROUP_BASE,
     composite_add_linear_module, composite_add_module, composite_erase_module, composite_linear_module, composite_module,
@@ -70,7 +76,7 @@ use crate::effect::{
 use crate::geometry::{LayerGeometry, PxRect, px_f32};
 use crate::pass::{FrameUniforms, InputUniforms, Pass, UNIFORM_BLOCK_SIZE};
 use crate::state::StateFormat;
-use crate::plan::{Allocations, Bindings, ChainPlan, Slot, StatePlan, StatePlanInput, composite_params_block, composite_uniforms, params_block, plan, step_uniforms};
+use crate::plan::{Allocations, Bindings, ChainPlan, Slot, StatePlan, StatePlanInput, composite_for_origin, composite_params_block, composite_step_uniforms, composite_uniforms, params_block, plan, step_uniforms};
 
 /// Blend of the blended composite's erase draw: `dst * (1 - src.a)` on colour and alpha (the
 /// shader outputs `(0, 0, 0, coverage)`, so the source term is zero).
@@ -138,7 +144,14 @@ pub(crate) struct ChainResources {
     pipelines: HashMap<(u64, wgpu::TextureFormat), CachedPipeline>,
     /// The shape-mask coverage rasterizer (F9).
     coverage: CoverageRasterizer,
+    /// The REPLACE composite into `HANDOFF_FORMAT` (single-sampled, no depth): the `Stacked`
+    /// hand-off of an earlier entry into a later entry's capture (R3), UI and offline.
+    handoff: wgpu::RenderPipeline,
 }
+
+/// Format of every texture a hand-off writes: an entry's capture (`Rgba8Unorm`, the UI's
+/// `CAPTURE_FORMAT` and the offline frame format).
+pub(crate) const HANDOFF_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 impl ChainResources {
     /// Builds the samplers, the layout and the dummies (the white one is uploaded with
@@ -151,6 +164,7 @@ impl ChainResources {
         let float_intermediates = renderable_and_filterable(adapter, wgpu::TextureFormat::Rgba16Float);
         let intermediate_format = if float_intermediates { wgpu::TextureFormat::Rgba16Float } else { wgpu::TextureFormat::Rgba8Unorm };
         let uniform_alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment.max(1));
+        let handoff_module = composite_module().map_err(|error| format!("the composite pass does not compile (crate bug): {error}"))?;
 
         with_error_scope(device, || {
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -198,6 +212,7 @@ impl ChainResources {
             queue.write_texture(white_texture.as_image_copy(), &[u8::MAX; 4], wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) }, wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 });
             let white = white_texture.create_view(&wgpu::TextureViewDescriptor::default());
             let coverage = CoverageRasterizer::create(device, &user_layout, &white, &sampler);
+            let handoff = pass_pipeline(device, &pipeline_layout, &handoff_module, HANDOFF_FORMAT, None, wgpu::MultisampleState::default(), None);
             Self {
                 float_intermediates,
                 intermediate_format,
@@ -212,6 +227,7 @@ impl ChainResources {
                 white,
                 pipelines: HashMap::new(),
                 coverage,
+                handoff,
             }
         })
     }
@@ -333,8 +349,10 @@ impl ChainResources {
     /// a partial window is not planned (`None`; tiling callers refuse such chains first).
     ///
     /// A stateful job (`job.state`) needs `state` (the layer's two state textures, grown here
-    /// keeping their content); the returned [`StatePlan`] says where the latest state is afterwards.
-    pub(crate) fn record(&self, rec: &mut ChainRecording<'_>, targets: &mut ChainTargets, job: &ChainJob<'_>, state: Option<&mut ChainState<'_>>) -> Option<(wgpu::BindGroup, Option<StatePlan>)> {
+    /// keeping their content); the returned [`RecordedRun::state`] says where the latest state is
+    /// afterwards. Every origin of `job.handoff_origins` gets a bind group of this run's composite
+    /// at that origin ([`RecordedRun::handoffs`], same order) for [`ChainResources::record_handoff`].
+    pub(crate) fn record(&self, rec: &mut ChainRecording<'_>, targets: &mut ChainTargets, job: &ChainJob<'_>, state: Option<&mut ChainState<'_>>) -> Option<RecordedRun> {
         if job.pipelines.len() != job.passes.len() {
             return None;
         }
@@ -387,7 +405,7 @@ impl ChainResources {
 
         let allocations = Allocations { source: job.source.allocated, ping_pong: [first.size, second.size], state: state_views.map_or([[0, 0]; 2], |[a, b]| [a.size, b.size]), coverage: coverage_target.map_or([0, 0], |target| target.size), region: region_target.map_or([0, 0], |target| target.size) };
         let alignment = usize::try_from(self.uniform_alignment).unwrap_or(UNIFORM_BLOCK_SIZE);
-        let uniforms = chain_uniforms(&frame_uniforms(&job.geometry, job.time).with_input(&job.input), &plan, job.passes, &job.geometry, &allocations, alignment);
+        let uniforms = chain_uniforms(&frame_uniforms(&job.geometry, job.time).with_input(&job.input), &plan, job.passes, &job.geometry, &allocations, alignment, job.handoff_origins);
         let uniform_buffer = targets.uniforms.write(rec.device, rec.queue, &uniforms.bytes).clone();
         let view_of = |slot: Slot| match (slot, state_views) {
             (Slot::Source, _) => job.source.view,
@@ -442,8 +460,31 @@ impl ChainResources {
             }
             pass.draw(0..3, 0..1);
         }
-        Some((bind_group(uniforms.draws.get(plan.steps.len())?, plan.composite.bindings), plan.state))
+        let composite = bind_group(uniforms.draws.get(plan.steps.len())?, plan.composite.bindings);
+        // The hand-off composites share the composite's bindings; only their `fl` block differs.
+        let handoffs = uniforms.draws.get(plan.steps.len() + 1..)?.iter().map(|draw| bind_group(draw, plan.composite.bindings)).collect();
+        Some(RecordedRun { composite, handoffs, state: plan.state })
     }
+
+    /// Records a `Stacked` hand-off (R3, `plan::Op::HandOff`): the REPLACE composite of an earlier
+    /// entry's run (`bind_group`, one of its [`RecordedRun::handoffs`]) drawn into a later
+    /// entry's capture `target` (a `HANDOFF_FORMAT` view, loaded, not cleared) over `viewport`
+    /// (that capture's pixels, from the plan). The later run must be recorded after this.
+    pub(crate) fn record_handoff(&self, encoder: &mut wgpu::CommandEncoder, bind_group: &wgpu::BindGroup, target: &wgpu::TextureView, viewport: PxRect) {
+        let mut pass = begin_pass_load(encoder, target, "egui_shader_layers stacked hand-off");
+        draw_composite(&mut pass, &self.handoff, bind_group, viewport);
+    }
+}
+
+/// What [`ChainResources::record`] leaves for the caller.
+#[derive(Debug)]
+pub(crate) struct RecordedRun {
+    /// The composite's bind group (`draw_composite` / `draw_composite_over`).
+    pub composite: wgpu::BindGroup,
+    /// One bind group per `ChainJob::handoff_origins` entry: the composite at that origin.
+    pub handoffs: Vec<wgpu::BindGroup>,
+    /// Where the latest state is afterwards (stateful runs).
+    pub state: Option<StatePlan>,
 }
 
 /// The wgpu format of a state texture.
@@ -567,6 +608,10 @@ pub(crate) struct ChainJob<'a> {
     /// region mask, R1, its region ids into the region-id texture); `None` = the rounded-rect
     /// mask of `geometry`.
     pub coverage: Option<CoverageJob<'a>>,
+    /// Where capture pixel `(0, 0)` of this run lies in each later entry's capture this run's
+    /// composite is handed off to (`Stacked`, R3; `plan::Op::HandOff::origin`), in order. Empty
+    /// for every single-entry run.
+    pub handoff_origins: &'a [[i32; 2]],
 }
 
 /// The layer's `FrameUniforms` with the wgpu flags: textures are stored top-down, like the effect
@@ -593,15 +638,16 @@ pub(crate) struct DrawUniforms {
 pub(crate) struct ChainUniforms {
     /// The buffer contents (padding between blocks is zero).
     pub bytes: Vec<u8>,
-    /// `draws[i]` = plan step `i`; the last entry is the composite.
+    /// `draws[i]` = plan step `i`; then the composite; then one composite per hand-off origin.
     pub draws: Vec<DrawUniforms>,
 }
 
 /// Lays out the blocks `plan.rs` produces for every draw of one run in one buffer: per draw, the
 /// `fl` block then the named-parameter block, each at an offset that is a multiple of
 /// `alignment` (the device's `min_uniform_buffer_offset_alignment`; values below 1 count as 1).
+/// After the composite, one composite draw per `handoff_origins` entry (`plan::composite_for_origin`).
 #[must_use]
-pub(crate) fn chain_uniforms(frame: &FrameUniforms, plan: &ChainPlan, passes: &[Pass], geometry: &LayerGeometry, allocations: &Allocations, alignment: usize) -> ChainUniforms {
+pub(crate) fn chain_uniforms(frame: &FrameUniforms, plan: &ChainPlan, passes: &[Pass], geometry: &LayerGeometry, allocations: &Allocations, alignment: usize, handoff_origins: &[[i32; 2]]) -> ChainUniforms {
     let alignment = alignment.max(1);
     let mut bytes = Vec::new();
     // Appends `block` at the next aligned offset, returning its byte range.
@@ -625,13 +671,17 @@ pub(crate) fn chain_uniforms(frame: &FrameUniforms, plan: &ChainPlan, passes: &[
     let fl = push(&composite_uniforms(frame, plan, allocations, geometry));
     let params = push(composite_params_block());
     draws.push(DrawUniforms { fl, params });
+    for &origin in handoff_origins {
+        let fl = push(&composite_step_uniforms(frame, plan, &composite_for_origin(plan, origin), allocations, geometry));
+        let params = push(composite_params_block());
+        draws.push(DrawUniforms { fl, params });
+    }
     ChainUniforms { bytes, draws }
 }
 
 /// Draws the REPLACE composite of a recorded run into `render_pass` over `region` (target
 /// pixels, top-left origin). `pipeline` must come from `ChainResources::composite_pipeline` for
 /// the pass's format / sample count / depth format, `bind_group` from `ChainResources::record`.
-#[cfg_attr(not(any(feature = "image", feature = "video")), allow(dead_code))] // The replace composite serves the offline renderer only.
 pub(crate) fn draw_composite(render_pass: &mut wgpu::RenderPass<'_>, pipeline: &wgpu::RenderPipeline, bind_group: &wgpu::BindGroup, region: PxRect) {
     render_pass.set_viewport(px_f32(region.x), px_f32(region.y), px_f32(region.w), px_f32(region.h), 0.0, 1.0);
     render_pass.set_pipeline(pipeline);
@@ -658,7 +708,8 @@ mod tests {
     use crate::effect::Effect;
 
     /// Every draw's `fl` block and named-parameter block land at aligned offsets, byte-identical
-    /// to the blocks `plan.rs` produces, in the order `[fl_0, p_0, fl_1, p_1, …, fl_c, p_c]`.
+    /// to the blocks `plan.rs` produces, in the order `[fl_0, p_0, fl_1, p_1, …, fl_c, p_c]`, then
+    /// one composite block per hand-off origin (R3) with its own fragment offset.
     #[test]
     fn uniform_blocks_hold_the_plan_blocks_in_draw_order() {
         let Ok(effect) = Effect::new("id", "fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }") else { panic!("identity must compile") };
@@ -672,8 +723,9 @@ mod tests {
         let allocations = Allocations { source: [64, 64], ping_pong: [[40, 30], [128, 32]], state: [[0, 0]; 2], coverage: [0, 0], region: [0, 0] };
         let frame = frame_uniforms(&geometry, 0.5);
         let alignment = 256;
-        let uniforms = chain_uniforms(&frame, &plan, &passes, &geometry, &allocations, alignment);
-        assert_eq!(uniforms.draws.len(), 4);
+        let origins = [[-3, 4]];
+        let uniforms = chain_uniforms(&frame, &plan, &passes, &geometry, &allocations, alignment, &origins);
+        assert_eq!(uniforms.draws.len(), 5);
         let at = |range: &std::ops::Range<u64>| &uniforms.bytes[usize::try_from(range.start).unwrap_or(0)..usize::try_from(range.end).unwrap_or(0)];
         let mut previous_end = 0;
         for (index, draw) in uniforms.draws.iter().enumerate() {
@@ -682,7 +734,8 @@ mod tests {
             previous_end = draw.params.end;
             let expected_fl = match plan.steps.get(index) {
                 Some(step) => step_uniforms(&frame, &plan, step, &allocations, &passes[step.pass]),
-                None => composite_uniforms(&frame, &plan, &allocations, &geometry),
+                None if index == plan.steps.len() => composite_uniforms(&frame, &plan, &allocations, &geometry),
+                None => composite_step_uniforms(&frame, &plan, &composite_for_origin(&plan, origins[0]), &allocations, &geometry),
             };
             assert_eq!(at(&draw.fl), &expected_fl[..], "draw {index}: fl block");
             let expected_params = plan.steps.get(index).map_or(composite_params_block(), |step| params_block(&passes[step.pass]));
@@ -691,5 +744,6 @@ mod tests {
         assert_eq!(uniforms.draws[1].params.end - uniforms.draws[1].params.start, 16 + 20 * 16, "the named block keeps its layout size");
         assert_eq!(uniforms.draws[0].params.end - uniforms.draws[0].params.start, 16, "no Params: the empty block");
         assert!(uniforms.bytes[UNIFORM_BLOCK_SIZE..512].iter().all(|&byte| byte == 0), "alignment padding stays zero");
+        assert_ne!(at(&uniforms.draws[3].fl), at(&uniforms.draws[4].fl), "a hand-off block differs from the composite's (its origin)");
     }
 }

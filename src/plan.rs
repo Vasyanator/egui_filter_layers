@@ -27,6 +27,7 @@ Key structures:
   `regions > 0` also the region-id passes (R1), `ChainPlan::with_regions`.
 - `TextureMapping`: capture uv -> storage uv of one texture content (`clamp(uv) * scale -
   offset`, the prelude's `internal_*_scale` / `internal_*_offset`).
+- `CaptureSource`, `Op`: the steps of a multi-entry paint (R3) and what a backend's captures see.
 
 Key functions:
 - `plan()`: the draws of a run over a window of the capture.
@@ -34,7 +35,10 @@ Key functions:
   attached (the one check the UI layer and the offline renderer run before drawing).
 - `scaled_px()`: the output size of a scaled pass (`ceil(side * scale)`, at least 1).
 - `TextureMapping::of()`: the ONE formula for a texture's storage-uv mapping.
-- `step_uniforms()` / `composite_uniforms()`: the full `FlUniforms` block of one draw.
+- `step_uniforms()` / `composite_uniforms()` / `composite_step_uniforms()`: the full `FlUniforms`
+  block of one draw (the last for a composite at another origin: `composite_for_origin()`).
+- `schedule()`: the ONE order of captures, runs, `Stacked` hand-offs and composites of a
+  multi-entry layer (R3) for every backend; `entry_state_key()`: one state per entry.
 - `params_block()` / `composite_params_block()`: the bytes bound at binding 4 (`p: Params`) for a
   step / the composite; `EMPTY_PARAMS_BLOCK` (16 zero bytes) when a module declares none.
 - `mesh_locals()` / `coverage_locals()` / `region_locals()`: the `MeshLocals` block of
@@ -77,6 +81,11 @@ region deterministically, independent of the window origin). So no pixel of the 
 edge keeps the sentinel, and interior boundaries sit at the later region's 50 % contour. Every
 PASS step binds the region texture (mapped like the coverage: the window in its own allocation,
 `internal_region_*`); the composite does not read it (the white dummy = `REGION_NONE`).
+Entries (R3): a layer's entries are separate runs, each with its own plan over its own capture.
+`schedule` orders them; a `Stacked` hand-off on a pristine source is the replace composite of an
+earlier entry drawn into a later entry's capture (`composite_for_origin`, viewport = the earlier
+region ∩ the later capture), so the later entry filters `mix(capture, earlier, coverage)`. Outside
+the earlier mask it writes the earlier capture, which holds the same backdrop there.
 Scale (F6): a pass with `scale < 1` renders `scaled_px(capture, scale)` pixels holding the WHOLE
 capture at that resolution (at the texture origin); readers map it with `TextureMapping::of(
 scaled, allocated, 0)`, so `uv` keeps its capture meaning and bilinear sampling resamples (the
@@ -88,8 +97,10 @@ every step.
 
 use crate::backend::TextureError;
 use crate::effect::TEXTURE_SLOTS;
+use crate::entry::Overlap;
 use crate::geometry::{LayerGeometry, MaskTransform, PxRect, px_f32};
 use crate::pass::{FrameUniforms, Params, Pass, UNIFORM_BLOCK_SIZE, pack_uniforms};
+use crate::state::StateKey;
 
 /// One texture of a chain run. Backends map every variant to their own texture object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -467,15 +478,134 @@ pub(crate) fn plan(passes: &[Pass], capture: [i32; 2], window: PxRect, composite
     Some(ChainPlan { steps, composite, source, target_px, state, coverage: None })
 }
 
-/// Checks that every user texture slot an effect of `passes` may read
-/// (`Effect::reads_texture`) has a texture attached (`attached[i]`).
+/// The composite of `plan`'s run drawn into a render target where capture pixel `(0, 0)` lies at
+/// `composite_origin` (target pixels): `plan.composite` with that fragment offset. The run's own
+/// composite uses the origin it was planned with; a `Stacked` hand-off ([`Op::HandOff`]) draws the
+/// composite of an earlier entry into a later entry's capture, whose origin is
+/// `capture_from.xy - capture_into.xy`.
+#[must_use]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
+pub(crate) fn composite_for_origin(plan: &ChainPlan, composite_origin: [i32; 2]) -> CompositeStep {
+    CompositeStep { frag_offset: [-px_f32(composite_origin[0]), -px_f32(composite_origin[1])], ..plan.composite }
+}
+
+/// Whether a backend's entry captures see the results of earlier composites of the same layer
+/// (`Framebuffer`: glow copies the framebuffer inside the paint callback) or not (`Pristine`: the
+/// wgpu re-render and the offline copy of the unfiltered frame).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
+pub(crate) enum CaptureSource {
+    /// Captures copy the framebuffer: an entry captured after an earlier entry's composite sees it.
+    Framebuffer,
+    /// Captures hold the pristine backdrop: `Stacked` needs explicit hand-offs.
+    Pristine,
+}
+
+/// One step of a multi-entry paint ([`schedule`]); indices are entry indices of the layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
+pub(crate) enum Op {
+    /// Fill entry `k`'s capture (a framebuffer copy, a re-render or a copy of the frame).
+    Capture(usize),
+    /// Run entry `k`'s chain over its capture.
+    Run(usize),
+    /// `Stacked` on a `Pristine` source: draw the REPLACE composite of entry `from` (gamma, the
+    /// capture format) into entry `into`'s capture, so `into` filters `from`'s result.
+    HandOff {
+        /// The earlier entry, already run.
+        from: usize,
+        /// The later entry, not run yet.
+        into: usize,
+        /// The draw's viewport in `into`'s capture pixels: `from`'s region ∩ `into`'s capture.
+        viewport: PxRect,
+        /// Where `from`'s capture pixel `(0, 0)` lies in `into`'s capture:
+        /// `capture_from.xy - capture_into.xy` (the argument of [`composite_for_origin`]).
+        origin: [i32; 2],
+    },
+    /// Composite entry `k` over the screen / output (its region, blended by its coverage).
+    Composite(usize),
+}
+
+/// The ops of one multi-entry paint, in execution order. `geometry[k]` is entry `k`'s
+/// `LayerGeometry` in screen pixels (`None`: the entry is invisible and gets no op). This is the
+/// ONE place that decides the order of captures, runs, hand-offs and composites (roadmap §19.4.3):
+///
+/// * `Framebuffer` + `Stacked`: `[Capture0 Run0 Composite0, Capture1 Run1 Composite1, …]` — every
+///   capture copies the framebuffer after the earlier composites.
+/// * `Framebuffer` + `Independent`: `[Capture0..CaptureN, Run0 Composite0, Run1 Composite1, …]` —
+///   every capture before any composite.
+/// * `Pristine` (either mode): `[Capture0..CaptureN, Run0 HandOff(0→k)* Composite0, Run1 …]`, the
+///   hand-offs only for `Stacked`, into every later visible entry `k` whose capture intersects
+///   entry 0's region (in list order of `k`).
+///
+/// Composites are always in list order. A backend that defers composites (the wgpu UI draws them
+/// in its paint callback) keeps that order.
+#[must_use]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
+pub(crate) fn schedule(geometry: &[Option<LayerGeometry>], overlap: Overlap, source: CaptureSource) -> Vec<Op> {
+    let visible: Vec<usize> = geometry.iter().enumerate().filter_map(|(index, geometry)| geometry.map(|_| index)).collect();
+    let mut ops = Vec::with_capacity(visible.len() * 3);
+    let capture_first = !(source == CaptureSource::Framebuffer && overlap == Overlap::Stacked);
+    if capture_first {
+        ops.extend(visible.iter().map(|&index| Op::Capture(index)));
+    }
+    for (position, &from) in visible.iter().enumerate() {
+        if !capture_first {
+            ops.push(Op::Capture(from));
+        }
+        ops.push(Op::Run(from));
+        if source == CaptureSource::Pristine && overlap == Overlap::Stacked
+            && let Some(from_geometry) = geometry[from]
+        {
+            for &into in &visible[position + 1..] {
+                let Some(into_geometry) = geometry[into] else {
+                    continue;
+                };
+                if let Some(viewport) = intersect(from_geometry.region, into_geometry.capture) {
+                    let (capture_from, capture_into) = (from_geometry.capture, into_geometry.capture);
+                    ops.push(Op::HandOff {
+                        from,
+                        into,
+                        viewport: PxRect { x: viewport.x - capture_into.x, y: viewport.y - capture_into.y, w: viewport.w, h: viewport.h },
+                        origin: [capture_from.x - capture_into.x, capture_from.y - capture_into.y],
+                    });
+                }
+            }
+        }
+        ops.push(Op::Composite(from));
+    }
+    ops
+}
+
+/// The intersection of two pixel rects, `None` when it is empty (touching edges do not overlap).
+#[must_use]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
+fn intersect(a: PxRect, b: PxRect) -> Option<PxRect> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = a.x.saturating_add(a.w).min(b.x.saturating_add(b.w));
+    let bottom = a.y.saturating_add(a.h).min(b.y.saturating_add(b.h));
+    (right > left && bottom > top).then(|| PxRect { x: left, y: top, w: right - left, h: bottom - top })
+}
+
+/// The state key of entry `index` of a layer whose key is `layer` (D5): `layer.id.with(index)`,
+/// same viewport. Every entry keeps its own state; `reset_state(ctx, layer id)` reaches them all
+/// through the layer's one reset ticket.
+#[must_use]
+pub(crate) fn entry_state_key(layer: StateKey, index: usize) -> StateKey {
+    StateKey { viewport: layer.viewport, id: layer.id.with(index) }
+}
+
+/// Checks that every user texture slot an effect of `passes` (the chain of layer entry `entry`)
+/// may read (`Effect::reads_texture`) has a texture attached (`attached[i]`).
 ///
 /// # Errors
-/// [`TextureError::NotAttached`] naming the first pass (in chain order) and slot that lacks one.
-pub(crate) fn check_textures(passes: &[Pass], attached: [bool; TEXTURE_SLOTS]) -> Result<(), TextureError> {
+/// [`TextureError::NotAttached`] naming `entry`, the first pass (in chain order) and the slot
+/// that lacks one.
+pub(crate) fn check_textures(passes: &[Pass], attached: [bool; TEXTURE_SLOTS], entry: usize) -> Result<(), TextureError> {
     for (pass_index, pass) in passes.iter().enumerate() {
         if let Some(slot) = (0..TEXTURE_SLOTS).find(|&slot| pass.effect().reads_texture(slot) && !attached[slot]) {
-            return Err(TextureError::NotAttached { effect: pass.effect().label().to_owned(), pass: pass_index, slot });
+            return Err(TextureError::NotAttached { entry, effect: pass.effect().label().to_owned(), pass: pass_index, slot });
         }
     }
     Ok(())
@@ -599,7 +729,13 @@ pub(crate) fn step_uniforms(frame: &FrameUniforms, plan: &ChainPlan, step: &Pass
 /// composite then takes the coverage from that texture's alpha instead of the rounded-rect SDF.
 #[must_use]
 pub(crate) fn composite_uniforms(frame: &FrameUniforms, plan: &ChainPlan, allocations: &Allocations, geometry: &LayerGeometry) -> [u8; UNIFORM_BLOCK_SIZE] {
-    let composite = &plan.composite;
+    composite_step_uniforms(frame, plan, &plan.composite, allocations, geometry)
+}
+
+/// [`composite_uniforms`] for another composite draw of `plan`'s run (`composite`, e.g. a
+/// hand-off's [`composite_for_origin`]): the same bindings and parameters, its own fragment offset.
+#[must_use]
+pub(crate) fn composite_step_uniforms(frame: &FrameUniforms, plan: &ChainPlan, composite: &CompositeStep, allocations: &Allocations, geometry: &LayerGeometry) -> [u8; UNIFORM_BLOCK_SIZE] {
     let draw = Draw { bindings: composite.bindings, input: composite.input, original: plan.source, frag_offset: composite.frag_offset, written: None, scale: 1.0, state: None, pass_index: 0 };
     let mut params = geometry.composite_params();
     if composite.bindings.coverage.is_some() {
@@ -886,9 +1022,9 @@ mod tests {
         let Some(plan) = plan(&chain, [8, 8], window, [0, 0], attached, None) else { panic!("planned") };
         assert!(plan.steps.iter().all(|step| step.bindings.user == attached));
         assert_eq!(plan.composite.bindings.user, NO_TEXTURES);
-        assert_eq!(check_textures(&chain, attached), Ok(()));
-        assert_eq!(check_textures(&chain, [true, false, true]), Err(TextureError::NotAttached { effect: "one".to_owned(), pass: 1, slot: 1 }));
-        assert_eq!(check_textures(&passes(2), NO_TEXTURES), Ok(()), "effects reading no texture need none");
+        assert_eq!(check_textures(&chain, attached, 0), Ok(()));
+        assert_eq!(check_textures(&chain, [true, false, true], 4), Err(TextureError::NotAttached { entry: 4, effect: "one".to_owned(), pass: 1, slot: 1 }));
+        assert_eq!(check_textures(&passes(2), NO_TEXTURES, 0), Ok(()), "effects reading no texture need none");
     }
 
     /// A state pass effect writing `state + 0.25`.
@@ -1096,5 +1232,83 @@ mod tests {
         assert!((px_ratio(70_000, 65_536) - 70_000.0 / 65_536.0).abs() < f32::EPSILON);
         assert!((to_f32_exact((1 << 24) - 1) - 16_777_215.0).abs() < f32::EPSILON);
         assert!((to_f32_exact(u32::MAX) - 16_777_216.0).abs() < f32::EPSILON, "saturates at 2^24");
+    }
+
+    /// A geometry whose region is `region` and whose capture is `region` padded by `pad` pixels
+    /// (only `region` / `capture` matter to the schedule).
+    fn entry_geometry(region: PxRect, pad: i32) -> LayerGeometry {
+        let capture = PxRect { x: region.x - pad, y: region.y - pad, w: region.w + 2 * pad, h: region.h + 2 * pad };
+        LayerGeometry { region, capture, rect_uv: [0.0; 4], region_uv: [0.0; 4], mask_rect_px: [0.0; 4], mask_radii_px: [0.0; 4], pixels_per_layer_point: 1.0 }
+    }
+
+    /// R3 (§19.4.3): the three emitted orders for two overlapping entries.
+    #[test]
+    fn schedule_orders_follow_the_capture_source_and_mode() {
+        use Op::{Capture, Composite, HandOff, Run};
+        let geometry = [Some(entry_geometry(PxRect { x: 10, y: 10, w: 40, h: 20 }, 4)), Some(entry_geometry(PxRect { x: 30, y: 15, w: 40, h: 20 }, 2))];
+        assert_eq!(schedule(&geometry, Overlap::Stacked, CaptureSource::Framebuffer), [Capture(0), Run(0), Composite(0), Capture(1), Run(1), Composite(1)]);
+        assert_eq!(schedule(&geometry, Overlap::Independent, CaptureSource::Framebuffer), [Capture(0), Capture(1), Run(0), Composite(0), Run(1), Composite(1)]);
+        assert_eq!(schedule(&geometry, Overlap::Independent, CaptureSource::Pristine), [Capture(0), Capture(1), Run(0), Composite(0), Run(1), Composite(1)]);
+        // Region 0 (10..50, 10..30) ∩ capture 1 (28..72, 13..37) = (28..50, 13..30), in capture-1
+        // pixels (0..22, 0..17); capture 0 starts at (6, 6): origin (6 - 28, 6 - 13).
+        let handoff = HandOff { from: 0, into: 1, viewport: PxRect { x: 0, y: 0, w: 22, h: 17 }, origin: [-22, -7] };
+        assert_eq!(schedule(&geometry, Overlap::Stacked, CaptureSource::Pristine), [Capture(0), Capture(1), Run(0), handoff, Composite(0), Run(1), Composite(1)]);
+        assert!(schedule(&[], Overlap::Stacked, CaptureSource::Pristine).is_empty());
+        // An invisible entry gets no op; indices stay the layer's.
+        assert_eq!(schedule(&[None, geometry[1]], Overlap::Stacked, CaptureSource::Framebuffer), [Capture(1), Run(1), Composite(1)]);
+    }
+
+    /// Hand-offs only where the earlier REGION meets the later CAPTURE: touching rects and
+    /// disjoint rects get none, a region inside a later capture gets one covering the region.
+    #[test]
+    fn hand_offs_need_the_earlier_region_to_meet_the_later_capture() {
+        let stacked = |geometry: &[Option<LayerGeometry>]| schedule(geometry, Overlap::Stacked, CaptureSource::Pristine).into_iter().filter(|op| matches!(op, Op::HandOff { .. })).collect::<Vec<_>>();
+        // Capture 1 starts exactly where region 0 ends (50): touching, no overlap.
+        let touching = [Some(entry_geometry(PxRect { x: 10, y: 10, w: 40, h: 20 }, 0)), Some(entry_geometry(PxRect { x: 52, y: 10, w: 20, h: 20 }, 2))];
+        assert!(stacked(&touching).is_empty());
+        // The later entry's padding reaches into the earlier region: a hand-off of that strip.
+        let padded = [Some(entry_geometry(PxRect { x: 10, y: 10, w: 40, h: 20 }, 0)), Some(entry_geometry(PxRect { x: 51, y: 10, w: 20, h: 20 }, 2))];
+        assert_eq!(stacked(&padded), [Op::HandOff { from: 0, into: 1, viewport: PxRect { x: 0, y: 2, w: 1, h: 20 }, origin: [-39, 2] }]);
+        let disjoint = [Some(entry_geometry(PxRect { x: 0, y: 0, w: 10, h: 10 }, 1)), Some(entry_geometry(PxRect { x: 100, y: 100, w: 10, h: 10 }, 1))];
+        assert!(stacked(&disjoint).is_empty());
+        // Region 0 fully inside capture 1: the whole region, at its offset in capture 1.
+        let inside = [Some(entry_geometry(PxRect { x: 20, y: 20, w: 10, h: 10 }, 3)), Some(entry_geometry(PxRect { x: 10, y: 10, w: 40, h: 40 }, 0))];
+        assert_eq!(stacked(&inside), [Op::HandOff { from: 0, into: 1, viewport: PxRect { x: 10, y: 10, w: 10, h: 10 }, origin: [7, 7] }]);
+        // A LATER region over an EARLIER capture is no hand-off (only later entries read earlier ones).
+        let reversed = [inside[1], inside[0]];
+        assert!(stacked(&reversed).iter().all(|op| matches!(op, Op::HandOff { from: 0, into: 1, .. })));
+    }
+
+    /// Risk 1 of §19.10: three entries where entry 0 overlaps entry 2 but not entry 1, and entry 1
+    /// overlaps entry 2: hand-offs 0→2 then 1→2, each right after its source's run.
+    #[test]
+    fn three_entries_hand_off_only_where_they_overlap() {
+        use Op::{Capture, Composite, HandOff, Run};
+        let geometry = [
+            Some(entry_geometry(PxRect { x: 0, y: 0, w: 30, h: 30 }, 0)),
+            Some(entry_geometry(PxRect { x: 60, y: 0, w: 30, h: 30 }, 0)),
+            Some(entry_geometry(PxRect { x: 20, y: 10, w: 50, h: 10 }, 0)),
+        ];
+        let ops = schedule(&geometry, Overlap::Stacked, CaptureSource::Pristine);
+        let zero_to_two = HandOff { from: 0, into: 2, viewport: PxRect { x: 0, y: 0, w: 10, h: 10 }, origin: [-20, -10] };
+        let one_to_two = HandOff { from: 1, into: 2, viewport: PxRect { x: 40, y: 0, w: 10, h: 10 }, origin: [40, -10] };
+        assert_eq!(ops, [Capture(0), Capture(1), Capture(2), Run(0), zero_to_two, Composite(0), Run(1), one_to_two, Composite(1), Run(2), Composite(2)]);
+    }
+
+    /// The hand-off composite is the run's composite at another origin; every entry keeps its own
+    /// state key in the layer's viewport.
+    #[test]
+    fn hand_off_composites_and_entry_state_keys() {
+        let window = PxRect { x: 0, y: 0, w: 30, h: 20 };
+        let Some(plan) = plan(&passes(2), window.size(), window, [100, 50], NO_TEXTURES, None) else { panic!("planned") };
+        let moved = composite_for_origin(&plan, [-7, 3]);
+        assert_eq!((moved.bindings, moved.input), (plan.composite.bindings, plan.composite.input));
+        assert_eq!(moved.frag_offset.map(f32::to_bits), [7.0_f32, -3.0].map(f32::to_bits));
+        assert_eq!(composite_for_origin(&plan, [100, 50]), plan.composite, "its own origin gives the run's composite");
+        let layer = StateKey { viewport: egui::ViewportId::ROOT, id: egui::Id::new("layer") };
+        let keys = [entry_state_key(layer, 0), entry_state_key(layer, 1)];
+        assert_ne!(keys[0], keys[1]);
+        assert!(keys.iter().all(|key| key.viewport == layer.viewport && key.id != layer.id));
+        assert_eq!(keys[1], entry_state_key(layer, 1), "stable across frames");
     }
 }

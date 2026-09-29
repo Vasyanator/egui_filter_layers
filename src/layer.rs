@@ -2,15 +2,18 @@
 File: layer.rs
 
 Purpose:
-`ShaderLayer`, the user-facing shape: a rect (+ a mask: rounded rect or any shape) and a `FilterChain`,
-painted into an `egui::Painter`. Resolves the chain into a backend-neutral `LayerJob` and hands
-it to whichever backend is installed on the painter's context.
+`ShaderLayer`, the user-facing shape: one or more entries (`entry.rs`: a rect + a mask + a
+`FilterChain` + textures + state options; `ShaderLayer::new` builds one), painted into an
+`egui::Painter`. Resolves the entries into a backend-neutral `LayerJob` and hands it to whichever
+backend is installed on the painter's context.
 
 Key structures:
-- `ShaderLayer`.
+- `ShaderLayer`: entries, overlap mode (`Overlap`), id.
 
 Key functions:
 - `ShaderLayer::paint()`.
+- `ShaderLayer::from_entries()` / `with_entry()` / `overlap()` / `entries()`: multi-entry layers
+  (R3); the layer-level builders below apply to every entry, the accessors read the first.
 - `ShaderLayer::texture()` / `check_textures()`: user textures (F8) and the check `paint` runs.
 - `ShaderLayer::id()` / `state()` / `check_state()`: persistent state (F7) and its check.
 - `ShaderLayer::mask()` / `corner_radius()` / `regions()` / `check_mask()`: the mask (F9) and
@@ -28,7 +31,7 @@ effects (`TextureError`: an invalid slot, or a slot an effect reads with nothing
 skipped too, its error logged once per context and message (`log_texture_error_once`), and so
 is a layer with a state pass but no id (`StateError::MissingId`, same latch), and one whose mask
 shape contains a paint callback or a malformed mesh, or which has too many regions (`MaskError`,
-same latch). A pending
+same latch). Any failing entry skips the whole layer (the log names the entry). A pending
 `reset_state` request for the layer's id travels in its job as a ticket (`state::pending_reset`);
 the backend claims it where the state registry runs, so a paint that draws nothing keeps it.
 */
@@ -39,9 +42,9 @@ use egui::{Context, CornerRadius, Id, Painter, Rect, TextureId};
 
 use crate::backend::{FrameInput, LayerJob, PointerInput, TextureError, installed};
 use crate::effect::TEXTURE_SLOTS;
+use crate::entry::{Entry, Overlap};
 use crate::mask::{JobMask, Mask, MaskError, Region, tessellate, tessellate_regions};
 use crate::pass::FilterChain;
-use crate::plan::check_textures;
 use crate::state::{StateError, StateOptions, pending_reset};
 
 /// Sets `ctx`'s "no backend installed" latch; returns whether it was unset (i.e. whether to warn).
@@ -100,9 +103,9 @@ fn log_state_error_once(ctx: &Context, error: &StateError) {
     }
 }
 
-/// Logs `error` (a layer skipped for its mask) once per context and message.
-fn log_mask_error_once(ctx: &Context, error: &MaskError) {
-    let message = error.to_string();
+/// Logs `error` (a layer skipped for the mask of its entry `entry`) once per context and message.
+fn log_mask_error_once(ctx: &Context, entry: usize, error: &MaskError) {
+    let message = format!("layer entry {entry}: {error}");
     if first_layer_error(ctx, &message) {
         log::error!(
             "egui_shader_layers: a ShaderLayer was skipped (it draws nothing extra) because its mask cannot be rasterized.\n\
@@ -152,6 +155,11 @@ fn frame_input(ctx: &Context) -> FrameInput {
     })
 }
 
+/// The chain [`ShaderLayer::chain`] returns for a layer without entries.
+static EMPTY_CHAIN: FilterChain = FilterChain::new();
+/// The mask [`ShaderLayer::layer_mask`] returns for a layer without entries (the default).
+static DEFAULT_MASK: Mask = Mask::RoundedRect(CornerRadius::ZERO);
+
 /// A filter applied to everything painted beneath `rect`.
 ///
 /// "Beneath" means earlier in egui's paint order: lower layers and the shapes painted earlier into
@@ -166,38 +174,74 @@ fn frame_input(ctx: &Context) -> FrameInput {
 ///     .paint(ui.painter());
 /// # }
 /// ```
+///
+/// A layer holds one or more ENTRIES ([`Entry`]: rect, chain, mask, textures, state options);
+/// [`ShaderLayer::new`] builds one, [`ShaderLayer::from_entries`] / [`ShaderLayer::with_entry`]
+/// several, which then share one paint callback (and on wgpu one selection and tessellation of
+/// the content beneath) while each captures only its own padded rect. The layer-level builders
+/// ([`ShaderLayer::mask`], [`ShaderLayer::corner_radius`], [`ShaderLayer::regions`],
+/// [`ShaderLayer::texture`], [`ShaderLayer::state`]) apply to EVERY entry present when they are
+/// called; the accessors ([`ShaderLayer::chain`], [`ShaderLayer::layer_mask`],
+/// [`ShaderLayer::texture_at`], [`ShaderLayer::state_options`]) return the FIRST entry's.
 #[derive(Clone, Debug)]
 pub struct ShaderLayer {
-    /// The filtered rect, in points.
-    rect: Rect,
-    /// The passes to run.
-    chain: FilterChain,
-    /// The mask (rounded rect by default); outside it the backdrop is left untouched.
-    mask: Mask,
-    /// The user texture attached at each slot (`tex(i, uv)` in effects).
-    textures: [Option<TextureId>; TEXTURE_SLOTS],
-    /// The first out-of-range slot given to [`ShaderLayer::texture`], reported by
-    /// [`ShaderLayer::check_textures`] (the builder cannot return an error).
-    invalid_slot: Option<usize>,
+    /// The entries, in paint order.
+    entries: Vec<Entry>,
+    /// How overlapping entries see each other.
+    overlap: Overlap,
     /// The layer's identity (required by stateful chains, F7).
     id: Option<Id>,
-    /// How the persistent state is stored (stateful chains only).
-    state: StateOptions,
 }
 
 impl ShaderLayer {
-    /// A layer filtering `rect` (points) through `chain` (a `Pass`, `Vec<Pass>` or `FilterChain`).
+    /// A layer filtering `rect` (points) through `chain` (a `Pass`, `Vec<Pass>` or `FilterChain`):
+    /// one [`Entry`].
     #[must_use]
     pub fn new(rect: Rect, chain: impl Into<FilterChain>) -> Self {
-        Self { rect, chain: chain.into(), mask: Mask::default(), textures: [None; TEXTURE_SLOTS], invalid_slot: None, id: None, state: StateOptions::default() }
+        Self::from_entries([Entry::new(rect, chain)])
     }
 
-    /// Gives the layer a stable identity (e.g. `ui.id().with("water")`), REQUIRED when its
-    /// chain has a state pass ([`crate::Effect::new_state`]): the layer's persistent state is
-    /// found again by this id (and the painting viewport) every frame. Paint one id once per
-    /// frame: a second paint in the same frame shows the state without stepping it. A state not
-    /// painted for 120 frames of its viewport and 2 seconds is freed; [`crate::reset_state`]
-    /// zeroes it at the next paint the backend runs.
+    /// A layer of several entries, painted in this order (see [`Overlap`] for what a later entry
+    /// filters where entries overlap). [`ShaderLayer::rect`] is the union of their rects. An
+    /// empty list paints nothing.
+    #[must_use]
+    pub fn from_entries(entries: impl IntoIterator<Item = Entry>) -> Self {
+        Self { entries: entries.into_iter().collect(), overlap: Overlap::default(), id: None }
+    }
+
+    /// Appends `entry` (painted after the existing ones); the layer's rect grows to include it.
+    #[must_use]
+    pub fn with_entry(mut self, entry: Entry) -> Self {
+        self.entries.push(entry);
+        self
+    }
+
+    /// How overlapping entries see each other (default [`Overlap::Independent`]).
+    #[must_use]
+    pub fn overlap(mut self, overlap: Overlap) -> Self {
+        self.overlap = overlap;
+        self
+    }
+
+    /// The overlap mode.
+    #[must_use]
+    pub fn overlap_mode(&self) -> Overlap {
+        self.overlap
+    }
+
+    /// The entries, in paint order.
+    #[must_use]
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// Gives the layer a stable identity (e.g. `ui.id().with("water")`), REQUIRED when a chain
+    /// has a state pass ([`crate::Effect::new_state`]): the layer's persistent state is found
+    /// again by this id (and the painting viewport) every frame; every stateful entry keeps its
+    /// own state under it. Paint one id once per frame: a second paint in the same frame shows the
+    /// state without stepping it. A state not painted for 120 frames of its viewport and 2
+    /// seconds is freed; [`crate::reset_state`] zeroes it (every entry's) at the next paint the
+    /// backend runs.
     #[must_use]
     pub fn id(mut self, id: Id) -> Self {
         self.id = Some(id);
@@ -210,138 +254,144 @@ impl ShaderLayer {
         self.id
     }
 
-    /// How the layer's persistent state is stored (resolution, format); ignored by chains
-    /// without a state pass. Default: full resolution, RGBA16F.
+    /// How the persistent state is stored (resolution, format), for EVERY entry; ignored by
+    /// chains without a state pass. Default: full resolution, RGBA16F.
     #[must_use]
     pub fn state(mut self, options: StateOptions) -> Self {
-        self.state = options;
+        self.entries.iter_mut().for_each(|entry| entry.set_state(options));
         self
     }
 
-    /// The state options.
+    /// The first entry's state options (the default for a layer without entries).
     #[must_use]
     pub fn state_options(&self) -> StateOptions {
-        self.state
+        self.entries.first().map(Entry::state_options).unwrap_or_default()
     }
 
-    /// Whether the layer can keep its state: a chain with a state pass needs an id.
-    /// [`ShaderLayer::paint`] runs this and skips the layer on an error (logged once per context).
+    /// Whether the layer can keep its states: an entry whose chain has a state pass needs the
+    /// layer's id. [`ShaderLayer::paint`] runs this and skips the layer on an error (logged once
+    /// per context).
     ///
     /// # Errors
-    /// [`StateError::MissingId`] naming the first state pass.
+    /// [`StateError::MissingId`] naming the first such entry and its first state pass.
     pub fn check_state(&self) -> Result<(), StateError> {
-        match self.chain.passes().iter().position(|pass| pass.effect().is_state()) {
-            Some(pass) if self.id.is_none() => Err(StateError::MissingId { effect: self.chain.passes()[pass].effect().label().to_owned(), pass }),
-            Some(_) | None => Ok(()),
-        }
+        self.entries.iter().enumerate().try_for_each(|(index, entry)| entry.check_state_at(index, self.id.is_some()))
     }
 
-    /// Attaches the egui texture `id` at user texture `slot` (`0..TEXTURE_SLOTS`), which effects
-    /// read with `tex(slot, uv)` (the texture's own uv and sampler, from the `TextureOptions` it
-    /// was loaded with), `tex_size(slot)` and `tex_load(slot, px)`. Any egui texture works: a
-    /// `TextureHandle` from `Context::load_texture` (`handle.id()`), a native texture registered
-    /// with the renderer. Replaces an earlier texture at that slot.
+    /// Attaches the egui texture `id` at user texture `slot` (`0..TEXTURE_SLOTS`) of EVERY entry,
+    /// which effects read with `tex(slot, uv)` (the texture's own uv and sampler, from the
+    /// `TextureOptions` it was loaded with), `tex_size(slot)` and `tex_load(slot, px)`. Any egui
+    /// texture works: a `TextureHandle` from `Context::load_texture` (`handle.id()`), a native
+    /// texture registered with the renderer. Replaces an earlier texture at that slot; use
+    /// [`Entry::texture`] for per-entry textures.
     ///
     /// Keep the texture alive while the layer is painted: a freed `id` makes the backend skip the
     /// layer and report it in [`crate::failed_textures`]. A `slot` out of range makes the layer
     /// fail [`ShaderLayer::check_textures`] (and so draw nothing).
     #[must_use]
     pub fn texture(mut self, slot: usize, id: TextureId) -> Self {
-        match self.textures.get_mut(slot) {
-            Some(entry) => *entry = Some(id),
-            None => {
-                self.invalid_slot.get_or_insert(slot);
-            }
-        }
+        self.entries.iter_mut().for_each(|entry| entry.set_texture(slot, id));
         self
     }
 
-    /// The texture attached at `slot`, if any.
+    /// The texture attached at `slot` of the first entry, if any.
     #[must_use]
     pub fn texture_at(&self, slot: usize) -> Option<TextureId> {
-        self.textures.get(slot).copied().flatten()
+        self.entries.first().and_then(|entry| entry.texture_at(slot))
     }
 
-    /// Whether the attached textures can serve the chain: every slot given to
-    /// [`ShaderLayer::texture`] exists, and every slot an effect reads
+    /// Whether the attached textures can serve the chains: in every entry, every slot given to
+    /// a `texture` builder exists, and every slot an effect reads
     /// ([`crate::Effect::reads_texture`]) has a texture. [`ShaderLayer::paint`] runs this and
     /// skips the layer on an error (logged once per context). It cannot see whether a texture id
     /// is still alive; the backend reports that ([`crate::failed_textures`]).
     ///
     /// # Errors
-    /// [`TextureError::InvalidSlot`] or [`TextureError::NotAttached`].
+    /// [`TextureError::InvalidSlot`] or [`TextureError::NotAttached`], naming the entry.
     pub fn check_textures(&self) -> Result<(), TextureError> {
-        if let Some(slot) = self.invalid_slot {
-            return Err(TextureError::InvalidSlot { slot });
-        }
-        check_textures(self.chain.passes(), self.textures.map(|texture| texture.is_some()))
+        self.entries.iter().enumerate().try_for_each(|(index, entry)| entry.check_textures_at(index))
     }
 
-    /// Restricts the filter to a rounded rect (anti-aliased edge): shorthand for
+    /// Restricts EVERY entry to a rounded rect (anti-aliased edge): shorthand for
     /// `mask(Mask::RoundedRect(corner_radius))`, replacing any earlier mask.
     #[must_use]
-    pub fn corner_radius(mut self, corner_radius: impl Into<CornerRadius>) -> Self {
-        self.mask = Mask::RoundedRect(corner_radius.into());
-        self
+    pub fn corner_radius(self, corner_radius: impl Into<CornerRadius>) -> Self {
+        self.mask(Mask::RoundedRect(corner_radius.into()))
     }
 
-    /// Restricts the filter to `mask` (replacing any earlier mask or corner radius); outside it,
-    /// and outside the layer rect, the backdrop stays untouched. A [`Mask::Shape`] is in layer
+    /// Restricts EVERY entry to `mask` (replacing any earlier mask or corner radius); outside it,
+    /// and outside the entry's rect, the backdrop stays untouched. A [`Mask::Shape`] is in layer
     /// points (the space of the layer's rect, so it follows layer transforms), its alpha is the
     /// coverage, and it is tessellated when the layer is painted (with egui's anti-aliasing
     /// feather of one pixel at the context's pixels per point; under a zoomed layer transform the
-    /// feather scales with the zoom). Text galleys work in the UI (not offline).
+    /// feather scales with the zoom). Text galleys work in the UI (not offline). Use
+    /// [`Entry::mask`] for per-entry masks.
     #[must_use]
     pub fn mask(mut self, mask: Mask) -> Self {
-        self.mask = mask;
+        if let Some((last, others)) = self.entries.split_last_mut() {
+            for entry in others {
+                entry.set_mask(mask.clone());
+            }
+            last.set_mask(mask);
+        }
         self
     }
 
     /// Splits the layer into REGIONS (R1): shorthand for `mask(Mask::Regions(..))`, replacing any
-    /// earlier mask. The union of the regions is the mask; every pass reads the id of the region
-    /// that owns a pixel with the prelude's `region()` (see [`Mask::Regions`]). More than
-    /// [`crate::MAX_REGIONS`] regions are refused ([`MaskError::TooManyRegions`]).
+    /// earlier mask (of every entry). The union of the regions is the mask; every pass reads the id
+    /// of the region that owns a pixel with the prelude's `region()` (see [`Mask::Regions`]). More
+    /// than [`crate::MAX_REGIONS`] regions are refused ([`MaskError::TooManyRegions`]).
     #[must_use]
     pub fn regions(self, regions: impl IntoIterator<Item = Region>) -> Self {
         self.mask(Mask::Regions(regions.into_iter().collect()))
     }
 
-    /// The layer's mask.
+    /// The first entry's mask (the default rounded rect for a layer without entries).
     #[must_use]
     pub fn layer_mask(&self) -> &Mask {
-        &self.mask
+        self.entries.first().map_or(&DEFAULT_MASK, Entry::layer_mask)
     }
 
-    /// Whether the mask can be rasterized ([`Mask::check`]: no paint callbacks, no malformed
-    /// meshes, at most [`crate::MAX_REGIONS`] regions). [`ShaderLayer::paint`] runs this and skips
-    /// the layer on an error (logged once per context).
+    /// Whether every entry's mask can be rasterized ([`Mask::check`]: no paint callbacks, no
+    /// malformed meshes, at most [`crate::MAX_REGIONS`] regions). [`ShaderLayer::paint`] runs this
+    /// and skips the layer on an error (logged once per context, naming the entry).
     ///
     /// # Errors
-    /// [`MaskError::Callback`], [`MaskError::InvalidMesh`] or [`MaskError::TooManyRegions`].
+    /// [`MaskError::Callback`], [`MaskError::InvalidMesh`] or [`MaskError::TooManyRegions`] of the
+    /// first entry that fails.
     pub fn check_mask(&self) -> Result<(), MaskError> {
-        self.mask.check()
+        self.check_mask_entry().map_err(|(_, error)| error)
     }
 
-    /// The filtered rect, in points.
+    /// [`ShaderLayer::check_mask`] with the index of the entry that failed.
+    fn check_mask_entry(&self) -> Result<(), (usize, MaskError)> {
+        self.entries.iter().enumerate().try_for_each(|(index, entry)| entry.check_mask().map_err(|error| (index, error)))
+    }
+
+    /// The filtered rect, in points: the union of the entries' rects (`Rect::NOTHING` without
+    /// entries).
     #[must_use]
     pub fn rect(&self) -> Rect {
-        self.rect
+        self.entries.iter().fold(Rect::NOTHING, |union, entry| union.union(entry.rect()))
     }
 
-    /// The chain this layer runs.
+    /// The first entry's chain (an empty chain for a layer without entries).
     #[must_use]
     pub fn chain(&self) -> &FilterChain {
-        &self.chain
+        self.entries.first().map_or(&EMPTY_CHAIN, Entry::chain)
     }
 
     /// Adds the layer to `painter` at the current position in its paint list.
     ///
-    /// Does nothing for an empty chain or a non-positive rect. Requests a repaint when the chain
-    /// is animated. With no backend installed on the painter's context, logs a warning once per
-    /// context and paints nothing; with a failed backend, paints nothing (the failure was logged
-    /// when it happened). Neither case requests repaints — see [`crate::status`].
+    /// Entries with an empty chain or a non-positive rect are left out; a layer with none left
+    /// does nothing. Requests a repaint when a chain is animated. With no backend installed on
+    /// the painter's context, logs a warning once per context and paints nothing; with a failed
+    /// backend, paints nothing (the failure was logged when it happened). Neither case requests
+    /// repaints — see [`crate::status`]. A layer ANY of whose entries fails
+    /// [`ShaderLayer::check_textures`], [`ShaderLayer::check_state`] or
+    /// [`ShaderLayer::check_mask`] draws nothing (one layer, one decision; logged once).
     pub fn paint(self, painter: &Painter) {
-        if self.chain.is_empty() || !self.rect.is_positive() {
+        if !self.entries.iter().any(Entry::is_drawable) {
             return;
         }
         let ctx = painter.ctx();
@@ -364,12 +414,13 @@ impl ShaderLayer {
             log_state_error_once(ctx, &error);
             return;
         }
-        if let Err(error) = self.check_mask() {
-            log_mask_error_once(ctx, &error);
+        if let Err((entry, error)) = self.check_mask_entry() {
+            log_mask_error_once(ctx, entry, &error);
             return;
         }
+        let entries: Vec<Entry> = self.entries.into_iter().filter(Entry::is_drawable).collect();
         // An effect reading `fl.time` must keep moving in an otherwise idle app.
-        if self.chain.is_animated() {
+        if entries.iter().any(|entry| entry.chain().is_animated()) {
             ctx.request_repaint();
         }
         // f64 seconds -> f32: effects only need a smooth phase, and f32 keeps millisecond
@@ -377,14 +428,14 @@ impl ShaderLayer {
         #[allow(clippy::cast_possible_truncation)] // Intentional precision reduction, see above.
         let time = ctx.input(|input| input.time) as f32;
         let frame_input = frame_input(ctx);
-        let padding_points = self.chain.padding_points();
-        let stateful = self.chain.passes().iter().any(|pass| pass.effect().is_state());
+        let stateful = entries.iter().any(Entry::is_stateful);
         // Handed only to a stateful layer's paint, so a request waits for the layer it targets;
         // the backend claims it where the state registry actually runs.
         let reset_state = if stateful { self.id.and_then(|id| pending_reset(ctx, id)) } else { None };
         let viewport = ctx.viewport_id();
-        let mask = resolve_mask(ctx, self.mask, self.rect);
-        let job = LayerJob { rect: self.rect, mask, passes: self.chain.into_passes(), padding_points, time, frame_input, textures: self.textures, id: self.id, viewport, state: self.state, reset_state };
+        let rect = entries.iter().fold(Rect::NOTHING, |union, entry| union.union(entry.rect()));
+        let entries = entries.into_iter().map(|entry| entry.resolve(|mask, rect| resolve_mask(ctx, mask, rect))).collect();
+        let job = LayerJob { rect, entries, overlap: self.overlap, time, frame_input, id: self.id, viewport, reset_state };
         backend.paint_layer(painter, job);
     }
 }
@@ -540,9 +591,9 @@ mod tests {
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0));
         let id = TextureId::User(7);
         let layer = ShaderLayer::new(rect, crate::Pass::new(&effect));
-        assert_eq!(layer.check_textures(), Err(TextureError::NotAttached { effect: "textured".to_owned(), pass: 0, slot: 2 }));
+        assert_eq!(layer.check_textures(), Err(TextureError::NotAttached { entry: 0, effect: "textured".to_owned(), pass: 0, slot: 2 }));
         assert_eq!(layer.clone().texture(0, id).check_textures().map_err(|error| matches!(error, TextureError::NotAttached { slot: 2, .. })), Err(true));
-        assert_eq!(layer.clone().texture(2, id).texture(3, id).check_textures(), Err(TextureError::InvalidSlot { slot: 3 }));
+        assert_eq!(layer.clone().texture(2, id).texture(3, id).check_textures(), Err(TextureError::InvalidSlot { entry: 0, slot: 3 }));
         assert_eq!(layer.clone().texture(2, id).texture_at(2), Some(id));
 
         let ctx = Context::default();
@@ -586,7 +637,7 @@ mod tests {
             0
         }
         fn paint_layer(&self, _painter: &Painter, job: LayerJob) {
-            let stateful = job.state_key().is_some();
+            let stateful = job.state_key(0).is_some();
             let claimed = self.claim.load(Ordering::Relaxed) && job.claim_reset();
             self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((job.id, claimed, stateful));
         }
@@ -603,7 +654,7 @@ mod tests {
         let Ok(state) = crate::Effect::new_state("sim", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state(uv); }") else { panic!("must compile") };
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0));
         let (id, other) = (Id::new("water"), Id::new("other"));
-        assert_eq!(ShaderLayer::new(rect, crate::Pass::new(&state)).check_state(), Err(StateError::MissingId { effect: "sim".to_owned(), pass: 0 }));
+        assert_eq!(ShaderLayer::new(rect, crate::Pass::new(&state)).check_state(), Err(StateError::MissingId { effect: "sim".to_owned(), pass: 0, entry: 0 }));
         assert_eq!(ShaderLayer::new(rect, crate::Pass::new(&state)).id(id).check_state(), Ok(()));
         assert_eq!(ShaderLayer::new(rect, presets::invert(1.0)).check_state(), Ok(()), "no state pass, no id needed");
 
@@ -662,7 +713,7 @@ mod tests {
             0
         }
         fn paint_layer(&self, _painter: &Painter, job: LayerJob) {
-            self.masks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(job.mask);
+            self.masks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(job.entries.into_iter().map(|entry| entry.mask));
         }
         fn as_any(&self) -> &dyn Any {
             self
@@ -704,6 +755,78 @@ mod tests {
         let bounds = meshes.meshes.iter().fold(Rect::NOTHING, |bounds, mesh| bounds.union(mesh.calc_bounds()));
         // Radius 30 plus half a feather pixel (ppp 1), in layer points.
         assert!((bounds.width() - 61.0).abs() < 0.01 && (bounds.center() - pos2(60.0, 60.0)).length() < 0.01, "{bounds:?}");
+    }
+
+    /// A backend that keeps `(rect, entry rects, overlap)` of every job.
+    struct EntryJobs {
+        jobs: std::sync::Mutex<Vec<(Rect, Vec<Rect>, Overlap)>>,
+    }
+
+    impl Backend for EntryJobs {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Glow
+        }
+        fn status(&self) -> BackendStatus {
+            BackendStatus::Installed { backend: BackendKind::Glow }
+        }
+        fn failed_effects(&self) -> Vec<EffectFailure> {
+            Vec::new()
+        }
+        fn failed_textures(&self) -> Vec<TextureFailure> {
+            Vec::new()
+        }
+        fn failed_states(&self) -> Vec<crate::state::StateFailure> {
+            Vec::new()
+        }
+        fn state_count(&self) -> usize {
+            0
+        }
+        fn paint_layer(&self, _painter: &Painter, job: LayerJob) {
+            let rects = job.entries.iter().map(|entry| entry.rect).collect();
+            self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((job.rect, rects, job.overlap));
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// R3: `new` is one entry; `rect()` is the union; the layer-level builders reach every entry
+    /// present, the accessors read the first; checks name the failing entry; `paint` sends one job
+    /// with every drawable entry (empty chains left out) and skips the whole layer when one entry
+    /// fails a check.
+    #[test]
+    fn entries_share_one_job_and_one_decision() {
+        let a = Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0));
+        let b = Rect::from_min_size(pos2(50.0, 20.0), vec2(10.0, 30.0));
+        assert_eq!(ShaderLayer::new(a, presets::invert(1.0)).entries().len(), 1);
+        let id = TextureId::User(9);
+        let layer = ShaderLayer::from_entries([Entry::new(a, presets::invert(1.0)), Entry::new(b, presets::grayscale(1.0))]).corner_radius(3).texture(1, id).state(StateOptions::default().with_scale(0.5));
+        assert_eq!(layer.rect(), a.union(b));
+        assert!(layer.entries().iter().all(|entry| entry.layer_mask() == &Mask::RoundedRect(CornerRadius::same(3)) && entry.texture_at(1) == Some(id) && (entry.state_options().scale() - 0.5).abs() < f32::EPSILON));
+        assert_eq!((layer.texture_at(1), layer.layer_mask()), (Some(id), &Mask::RoundedRect(CornerRadius::same(3))));
+        assert_eq!(layer.chain().len(), 1);
+        let empty = ShaderLayer::from_entries([]);
+        assert!(empty.chain().is_empty() && empty.layer_mask() == &Mask::default() && empty.rect() == Rect::NOTHING && empty.texture_at(0).is_none());
+        let callback = egui::Shape::Callback(egui::PaintCallback { rect: a, callback: Arc::new(()) });
+        let bad = layer.clone().with_entry(Entry::new(a, presets::invert(1.0)).mask(Mask::Shape(callback)));
+        assert_eq!(bad.check_mask(), Err(MaskError::Callback));
+        let Ok(textured) = crate::Effect::new("textured", "fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(2u, uv); }") else { panic!("must compile") };
+        let missing = layer.clone().with_entry(Entry::new(b, crate::Pass::new(&textured)));
+        assert_eq!(missing.check_textures(), Err(TextureError::NotAttached { entry: 2, effect: "textured".to_owned(), pass: 0, slot: 2 }));
+
+        let ctx = Context::default();
+        let backend = Arc::new(EntryJobs { jobs: std::sync::Mutex::new(Vec::new()) });
+        register(&ctx, Arc::clone(&backend) as Arc<dyn Backend>);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = Painter::new(ui.ctx().clone(), LayerId::background(), Rect::EVERYTHING);
+            layer.clone().with_entry(Entry::new(a, FilterChain::new())).overlap(Overlap::Stacked).paint(&painter);
+            bad.clone().paint(&painter);
+            missing.clone().paint(&painter);
+            ShaderLayer::from_entries([Entry::new(a, FilterChain::new())]).paint(&painter);
+        });
+        output.textures_delta.clear();
+        let jobs = std::mem::take(&mut *backend.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        assert_eq!(jobs, [(a.union(b), vec![a, b], Overlap::Stacked)], "one job, the empty-chain entry left out; failing layers and a layer of empty chains send none");
     }
 
     /// The "no backend installed" latch is per `Context`: set once per context, independent between contexts.

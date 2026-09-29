@@ -7,8 +7,10 @@ The crate-internal backend boundary and the per-`egui::Context` backend registry
 Key structures:
 - `Backend` (crate-internal trait): what a GPU backend must provide. Each backend module
   (`glow_backend`, and the `wgpu` backend) implements it; core code never names a backend type.
-- `LayerJob` (crate-internal): one `ShaderLayer::paint` call, resolved for the backend (its mask
-  is a `mask::JobMask`: rounded-rect radii or the shape tessellated on the GUI thread).
+- `LayerJob` / `EntryJob` (crate-internal): one `ShaderLayer::paint` call, resolved for the
+  backend: layer-wide values (union rect, overlap mode, time, input, id, reset ticket) and one
+  `EntryJob` per entry (rect, passes, padding, textures, state options; its mask a
+  `mask::JobMask`: rounded-rect radii or the shape tessellated on the GUI thread).
 - `FrameInput` / `PointerInput` (crate-internal): the per-frame input a layer reads on the GUI
   thread (`fl.delta_time`, `fl.frame`, `fl.pointer`), resolved per capture by `FrameInput::resolve`.
 - `BackendKind`, `BackendStatus`, `EffectFailure`, `InstallError` (public).
@@ -17,7 +19,8 @@ Key structures:
 
 Key functions:
 - `register()` / `installed()` / `uninstall()` (crate-internal): the per-context registry.
-- `LayerJob::is_stateful()`: whether a job carries persistent state (a state pass, F7).
+- `LayerJob::state_key(index)` / `EntryJob::is_stateful()`: an entry's state key (a state pass
+  and a layer id, F7) and whether it has a state pass.
 - `status()`, `failed_effects()`, `failed_textures()` (public, re-exported at the crate root).
 
 Notes:
@@ -34,6 +37,7 @@ use std::sync::Arc;
 use egui::{Context, Id, Painter, Pos2, Rect, TextureId, ViewportId};
 
 use crate::effect::TEXTURE_SLOTS;
+use crate::entry::Overlap;
 use crate::geometry::{PxRect, pointer_uniform};
 use crate::mask::JobMask;
 use crate::pass::{InputUniforms, Pass};
@@ -125,15 +129,21 @@ pub struct EffectFailure {
 #[non_exhaustive]
 pub enum TextureError {
     /// A texture was attached at a slot that does not exist.
-    #[error("texture slot {slot} does not exist; the slots are 0..{TEXTURE_SLOTS}")]
+    #[error("texture slot {slot} (layer entry {entry}) does not exist; the slots are 0..{TEXTURE_SLOTS}")]
     InvalidSlot {
+        /// Index of the layer entry ([`crate::Entry`]) it was attached to (0 for a single-entry
+        /// layer and offline `process` runs).
+        entry: usize,
         /// The slot given.
         slot: usize,
     },
     /// An effect of the chain reads a slot (`tex`, `tex_size`, `tex_load`; see
     /// [`crate::Effect::reads_texture`]) where nothing is attached.
-    #[error("effect `{effect}` (pass {pass}) reads texture slot {slot}, but no texture is attached there")]
+    #[error("effect `{effect}` (pass {pass} of layer entry {entry}) reads texture slot {slot}, but no texture is attached there")]
     NotAttached {
+        /// Index of the layer entry ([`crate::Entry`]) whose chain reads it (0 for a single-entry
+        /// layer and offline `process` runs).
+        entry: usize,
         /// The effect's label.
         effect: String,
         /// Index of its pass in the chain.
@@ -170,49 +180,76 @@ pub enum InstallError {
     },
 }
 
-/// One `ShaderLayer::paint` call, resolved and handed to the backend.
+/// One `ShaderLayer::paint` call, resolved and handed to the backend: the layer-wide values and
+/// its entries (R3; a `ShaderLayer::new` layer has exactly one).
 #[derive(Clone, Debug)]
 pub(crate) struct LayerJob {
-    /// The layer's rect in points (painter space, before layer transforms).
+    /// The layer's rect in points (painter space, before layer transforms): the union of the
+    /// entries' rects (the paint callback's rect).
     pub rect: Rect,
-    /// The mask: rounded-rect radii (layer points), or the tessellated shape (F9).
+    /// The entries, in list order (never empty; every one with passes and a positive rect).
+    pub entries: Vec<EntryJob>,
+    /// How overlapping entries see each other (`plan::schedule` decides the order from it).
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
+    pub overlap: Overlap,
+    /// egui input time in seconds at paint time, for `fl.time`.
+    pub time: f32,
+    /// Per-frame input read at paint time (`fl.delta_time`, `fl.frame`, `fl.pointer`).
+    pub frame_input: FrameInput,
+    /// `ShaderLayer::id`; `Some` whenever an entry has a state pass (checked before the job is
+    /// built).
+    pub id: Option<Id>,
+    /// The viewport whose pass painted the layer (states are kept per viewport and id).
+    pub viewport: ViewportId,
+    /// The pending `reset_state` request for `id`, if any. The backend claims it only where the
+    /// state registry starts this layer's run ([`LayerJob::claim_reset`], once per paint for every
+    /// entry); a paint that returns earlier leaves it pending for the next paint.
+    pub reset_state: Option<crate::state::ResetTicket>,
+}
+
+/// One entry of a [`LayerJob`], resolved for the backend.
+#[derive(Clone, Debug)]
+pub(crate) struct EntryJob {
+    /// The entry's rect in points (painter space, before layer transforms).
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
+    pub rect: Rect,
+    /// The mask: rounded-rect radii (layer points), or the tessellated shape / regions (F9, R1).
     pub mask: JobMask,
     /// The passes to run, in order (never empty).
     pub passes: Vec<Pass>,
     /// Total capture padding in points (`FilterChain::padding_points`).
     pub padding_points: f32,
-    /// egui input time in seconds at paint time, for `fl.time`.
-    pub time: f32,
-    /// Per-frame input read at paint time (`fl.delta_time`, `fl.frame`, `fl.pointer`).
-    pub frame_input: FrameInput,
-    /// The user texture attached at each slot (`ShaderLayer::texture`); every slot an effect of
-    /// `passes` reads is `Some` (checked by `plan::check_textures` before the job is built).
+    /// The user texture attached at each slot; every slot an effect of `passes` reads is `Some`
+    /// (checked by `plan::check_textures` before the job is built).
     pub textures: [Option<TextureId>; TEXTURE_SLOTS],
-    /// `ShaderLayer::id`; `Some` whenever a pass is a state pass (checked before the job is built).
-    pub id: Option<Id>,
-    /// The viewport whose pass painted the layer (states are kept per viewport and id).
-    pub viewport: ViewportId,
-    /// `ShaderLayer::state`.
+    /// The entry's state options.
     pub state: StateOptions,
-    /// The pending `reset_state` request for `id`, if any. The backend claims it only where the
-    /// state registry starts this layer's run ([`LayerJob::claim_reset`]); a paint that returns
-    /// earlier leaves it pending for the next paint.
-    pub reset_state: Option<crate::state::ResetTicket>,
+}
+
+impl EntryJob {
+    /// Whether the entry has a state pass (F7).
+    #[must_use]
+    pub(crate) fn is_stateful(&self) -> bool {
+        self.passes.iter().any(|pass| pass.effect().is_state())
+    }
 }
 
 impl LayerJob {
     /// Claims this job's pending `reset_state` request (at most one run claims it): call exactly
-    /// where the state registry's `begin` runs for this job.
+    /// once per paint where the state registry's `begin` runs for this job (the result applies to
+    /// every stateful entry).
     #[must_use]
     pub(crate) fn claim_reset(&self) -> bool {
         self.reset_state.as_ref().is_some_and(crate::state::ResetTicket::claim)
     }
 
-    /// The layer's state key when the job is stateful (a state pass and an id), else `None`.
+    /// The state key of entry `index` when it is stateful (a state pass and a layer id), else
+    /// `None`: `plan::entry_state_key` of the layer's key (one state per entry, D5).
     #[must_use]
-    pub(crate) fn state_key(&self) -> Option<crate::state::StateKey> {
+    pub(crate) fn state_key(&self, index: usize) -> Option<crate::state::StateKey> {
         let id = self.id?;
-        self.passes.iter().any(|pass| pass.effect().is_state()).then_some(crate::state::StateKey { viewport: self.viewport, id })
+        let entry = self.entries.get(index)?;
+        entry.is_stateful().then(|| crate::plan::entry_state_key(crate::state::StateKey { viewport: self.viewport, id }, index))
     }
 }
 
