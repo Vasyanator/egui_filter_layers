@@ -314,6 +314,13 @@ impl<T> StateRegistry<T> {
         (entry, run, replaced)
     }
 
+    /// The entry of `key`, if `begin` created it: for a backend that runs and composites an entry
+    /// in separate steps (glow keeps no borrow of the registry across its schedule's ops).
+    #[cfg_attr(not(feature = "glow"), allow(dead_code))] // Only glow composites after the run returns.
+    pub(crate) fn get_mut(&mut self, key: StateKey) -> Option<&mut StateEntry<T>> {
+        self.entries.get_mut(&key)
+    }
+
     /// Records a paint of `viewport` at `frame` / `time` as that viewport's latest clock.
     fn observe(&mut self, viewport: ViewportId, frame: u32, time: f64) {
         self.viewports.insert(viewport, (frame, time));

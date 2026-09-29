@@ -4,16 +4,19 @@
 //! into an egui `Painter`; each test file renders and reads back frames with its own helper, so
 //! a timed frame includes egui's CPU work, tessellation, the GPU work and its completion.
 //!
-//! Every mode runs the SAME chain ([`glass_chain`]): a Gaussian blur, then a tint read from
-//! `p.tint[region()]`, or `p.tint[p.index]` on a layer without regions. Only the parameters and
-//! the number of layers differ, so the modes are comparable.
+//! The UNIFORM modes run the SAME chain on every tile ([`glass_chain`]): a Gaussian blur, then a
+//! tint read from `p.tint[region()]`, or `p.tint[p.index]` on a layer without regions. Only the
+//! parameters, the number of layers and the number of entries differ, so the modes are
+//! comparable. The MIXED modes give every odd tile a different chain (pixelate, [`PIXELATE_CELL`])
+//! — the case entries exist for (R3); their Regions equivalent is one "uber" chain that blurs
+//! every tile and branches on the region id ([`MIXED_TINT_WGSL`]).
 //!
 //! Included as `mod common;` by both files; each uses every item (a test crate warns on dead code).
 
 use std::time::{Duration, Instant};
 
 use egui::{Color32, Pos2, Rect, Stroke, pos2, vec2};
-use egui_shader_layers::{Effect, FilterChain, Pass, Region, ShaderLayer, presets};
+use egui_shader_layers::{Effect, Entry, FilterChain, Overlap, Pass, Region, ShaderLayer, presets};
 
 /// The element counts every benchmark runs.
 pub const ELEMENT_COUNTS: [usize; 3] = [4, 16, 64];
@@ -44,6 +47,27 @@ fn effect(uv: vec2<f32>) -> vec4<f32> {
     return premultiply(vec4<f32>(mix(c.rgb, t.rgb, t.a), c.a));
 }";
 
+/// Cell size of the pixelate chain of the odd tiles in the mixed modes, points.
+pub const PIXELATE_CELL: f32 = 4.0;
+
+/// The mixed-modes Regions equivalent, run after the blur: even region ids get
+/// [`GLASS_TINT_WGSL`]'s tint, odd ids pixelate the ORIGINAL (unblurred) backdrop with cells of
+/// `p.cell` points aligned to the layer rect. The blur still runs under the odd tiles: that waste
+/// is what one chain for two looks costs.
+pub const MIXED_TINT_WGSL: &str = "struct Params { tint: array<vec4<f32>, 64>, index: u32, cell: f32 }
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let r = region();
+    let i = min(select(r, p.index, r == REGION_NONE), 63u);
+    if (i % 2u) == 1u {
+        let cell = max(p.cell * fl.pixels_per_point, 1.0) * fl.texel;
+        let origin = fl.rect_uv.xy;
+        return original((floor((uv - origin) / cell) + vec2<f32>(0.5)) * cell + origin);
+    }
+    let t = p.tint[i];
+    let c = unpremultiply(src(uv));
+    return premultiply(vec4<f32>(mix(c.rgb, t.rgb, t.a), c.a));
+}";
+
 /// How the N elements are painted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -52,17 +76,35 @@ pub enum Mode {
     /// ONE `ShaderLayer` over the tiles' union with a `Mask::Regions` of N regions (`region()`
     /// selects the tint).
     Regions,
+    /// ONE `ShaderLayer` with N entries (`Overlap::Independent`), one per tile, each its own
+    /// capture of its tile and the glass chain with its own `p.index`.
+    Entries,
+    /// As [`Mode::Entries`] with `Overlap::Stacked`. The tiles do not overlap, but every tile's
+    /// padded capture (the blur radius) reaches its neighbours, so on wgpu each earlier neighbour
+    /// is handed off into it: the cost of the stacked contract, not of overlap.
+    EntriesStacked,
+    /// N layers, odd tiles pixelate instead of the glass.
+    LayersMixed,
+    /// ONE layer, N regions, one chain: blur + [`MIXED_TINT_WGSL`].
+    RegionsMixed,
+    /// ONE layer, N entries (independent) alternating the glass chain and pixelate.
+    EntriesMixed,
 }
 
 impl Mode {
     /// Every benchmarked mode, in table order.
-    pub const ALL: [Self; 2] = [Self::Layers, Self::Regions];
+    pub const ALL: [Self; 7] = [Self::Layers, Self::Regions, Self::Entries, Self::EntriesStacked, Self::LayersMixed, Self::RegionsMixed, Self::EntriesMixed];
 
     /// The table label.
     pub fn name(self) -> &'static str {
         match self {
             Self::Layers => "layers",
             Self::Regions => "regions",
+            Self::Entries => "entries",
+            Self::EntriesStacked => "entries-stacked",
+            Self::LayersMixed => "layers-mixed",
+            Self::RegionsMixed => "regions-mixed",
+            Self::EntriesMixed => "entries-mixed",
         }
     }
 }
@@ -97,6 +139,24 @@ pub fn glass_chain(count: usize, index: u32) -> FilterChain {
     presets::gaussian_blur(3.0).then(tint)
 }
 
+/// The mixed-modes Regions chain: a Gaussian blur (sigma 3 points) then [`MIXED_TINT_WGSL`] with
+/// the tints of `count` tiles and [`PIXELATE_CELL`].
+///
+/// # Panics
+/// On a WGSL or parameter error: the snippet and its parameters are fixed test data.
+pub fn mixed_region_chain(count: usize) -> FilterChain {
+    let effect = match Effect::new("bench mixed tint", MIXED_TINT_WGSL) {
+        Ok(effect) => effect,
+        Err(error) => panic!("{error}"),
+    };
+    let tints: Vec<[f32; 4]> = (0..count.min(TINT_SLOTS)).map(|tile| tile_tint(tile, count)).collect();
+    let mut pass = Pass::new(&effect).with_sample_radius(PIXELATE_CELL);
+    if let Err(error) = pass.set_slice("tint", &tints).and_then(|()| pass.set("cell", PIXELATE_CELL)) {
+        panic!("{error}");
+    }
+    presets::gaussian_blur(3.0).then(pass)
+}
+
 /// N glass tiles laid out in a grid over an area, ready to paint in either [`Mode`].
 #[derive(Debug)]
 pub struct GridScene {
@@ -104,8 +164,12 @@ pub struct GridScene {
     area: Rect,
     /// The tiles, in id order.
     tiles: Vec<Rect>,
-    /// [`Mode::Layers`]: one chain per tile (its own `p.index`).
+    /// [`Mode::Layers`] / [`Mode::Entries`]: one chain per tile (its own `p.index`).
     layer_chains: Vec<FilterChain>,
+    /// The mixed modes: the glass chain on even tiles, pixelate on odd ones.
+    mixed_chains: Vec<FilterChain>,
+    /// [`Mode::RegionsMixed`]: the one chain.
+    mixed_region_chain: FilterChain,
     /// [`Mode::Regions`]: the one chain.
     region_chain: FilterChain,
     /// [`Mode::Regions`]: one region per tile, in id order.
@@ -133,9 +197,10 @@ impl GridScene {
             })
             .collect();
         let union = tiles.iter().fold(Rect::NOTHING, |union, tile| union.union(*tile));
-        let layer_chains = (0..count).map(|tile| glass_chain(count, u32::try_from(tile).unwrap_or(0))).collect();
+        let layer_chains: Vec<FilterChain> = (0..count).map(|tile| glass_chain(count, u32::try_from(tile).unwrap_or(0))).collect();
+        let mixed_chains = layer_chains.iter().enumerate().map(|(tile, chain)| if tile % 2 == 1 { FilterChain::from(presets::pixelate(PIXELATE_CELL)) } else { chain.clone() }).collect();
         let regions = tiles.iter().map(|tile| Region::rounded_rect(*tile, TILE_CORNER)).collect();
-        Self { area, tiles, layer_chains, region_chain: glass_chain(count, 0), regions, union }
+        Self { area, tiles, layer_chains, mixed_chains, mixed_region_chain: mixed_region_chain(count), region_chain: glass_chain(count, 0), regions, union }
     }
 
     /// The centre of tile 0 (a probe pixel for "was the glass applied").
@@ -174,13 +239,26 @@ impl GridScene {
     /// Paints the tiles' glass in `mode` (the backdrop must already be painted).
     pub fn paint(&self, painter: &egui::Painter, mode: Mode) {
         match mode {
-            Mode::Layers => {
-                for (tile, chain) in self.tiles.iter().zip(&self.layer_chains) {
-                    ShaderLayer::new(*tile, chain.clone()).corner_radius(TILE_CORNER).paint(painter);
-                }
-            }
+            Mode::Layers => self.paint_layers(painter, &self.layer_chains),
+            Mode::LayersMixed => self.paint_layers(painter, &self.mixed_chains),
             Mode::Regions => ShaderLayer::new(self.union, self.region_chain.clone()).regions(self.regions.clone()).paint(painter),
+            Mode::RegionsMixed => ShaderLayer::new(self.union, self.mixed_region_chain.clone()).regions(self.regions.clone()).paint(painter),
+            Mode::Entries => self.entries_layer(&self.layer_chains).paint(painter),
+            Mode::EntriesStacked => self.entries_layer(&self.layer_chains).overlap(Overlap::Stacked).paint(painter),
+            Mode::EntriesMixed => self.entries_layer(&self.mixed_chains).paint(painter),
         }
+    }
+
+    /// One layer per tile, tile `i` running `chains[i]`.
+    fn paint_layers(&self, painter: &egui::Painter, chains: &[FilterChain]) {
+        for (tile, chain) in self.tiles.iter().zip(chains) {
+            ShaderLayer::new(*tile, chain.clone()).corner_radius(TILE_CORNER).paint(painter);
+        }
+    }
+
+    /// One layer with one entry per tile, tile `i` running `chains[i]` (overlap: independent).
+    fn entries_layer(&self, chains: &[FilterChain]) -> ShaderLayer {
+        ShaderLayer::from_entries(self.tiles.iter().zip(chains).map(|(tile, chain)| Entry::new(*tile, chain.clone()).corner_radius(TILE_CORNER)))
     }
 }
 
@@ -224,9 +302,9 @@ pub struct BenchRow {
 /// Prints the rows as a table under a `backend` heading (visible with `--nocapture`).
 pub fn print_table(backend: &str, frame_px: [u32; 2], rows: &[BenchRow]) {
     println!("\nbench_many_elements [{backend}], {}x{} px, {WARM_UP_FRAMES} warm-up + {TIMED_FRAMES} timed frames, wall time incl. GPU completion + readback", frame_px[0], frame_px[1]);
-    println!("{:<10} {:>4} {:>12}", "mode", "N", "ms/frame");
+    println!("{:<16} {:>4} {:>12}", "mode", "N", "ms/frame");
     for row in rows {
         let mode = row.mode.map_or("backdrop", Mode::name);
-        println!("{mode:<10} {:>4} {:>12.3}", row.count, row.per_frame.as_secs_f64() * 1000.0);
+        println!("{mode:<16} {:>4} {:>12.3}", row.count, row.per_frame.as_secs_f64() * 1000.0);
     }
 }

@@ -8,9 +8,12 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
 `egui_glow::CallbackFn`; inside it `render::paint_layer` runs one layer:
 1. save the caller's DRAW/READ framebuffer bindings and `SAMPLES` FIRST (resource creation binds
    framebuffer 0); every exit path restores them;
-2. lazily create `Resources` (empty VAO, UBO, capture/ping-pong targets, composite program);
-3. fetch or build each pass program (`GlowState::program_for`, cached by module id, evicted when
-   the effect is dropped);
+2. lazily create `Resources` (empty VAO, UBO, capture pool / ping-pong targets, composite program;
+   the blended composite programs with the first multi-entry layer);
+3. compute every entry's geometry (`geometry::entry_rect` + `layer_geometry`) and the op list
+   (`plan::schedule`, framebuffer source); fetch or build each visible entry's pass programs
+   (`GlowState::program_for`, cached by module id, evicted when the effect is dropped). Steps
+   4-6 then run per op: `Capture(k)` = 4 into capture `k`, `Run(k)` = 5, `Composite(k)` = 6;
 4. disable scissor + blend; query the read buffer's `ReadFormat` (cached for framebuffer 0); reject
    the layer for non-normalized formats; multisampled -> resolve with identical rects into a
    renderbuffer of the SAME internal format, then blit the padded capture rect into the RGBA8
@@ -27,8 +30,9 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
    unit per draw (the plan's `@group(0)` slots and attached user textures, dummies elsewhere) and
    uploading `plan::step_uniforms` (binding point 0) and `plan::params_block` (binding point 1,
    a grow-only buffer written with `glBufferSubData`, re-allocated only when a block outgrows it);
-6. composite back into the original framebuffer over the visible region, scissor re-enabled
-   (`plan::composite_uniforms`);
+6. composite back into the original framebuffer over the entry's visible region, scissor
+   re-enabled (`plan::composite_uniforms`; replace program for one entry, blended erase + add for
+   several), scissor + blend off again;
 7. `apply_outcome`: latch / per-effect failure / suspects / once-per-format rejection log.
 
 ## Files
@@ -42,7 +46,8 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   the reflected `fl` and named-parameter block names (by `@binding` 0 / 4), and the texture-unit table of the prelude's layout (`GROUP0_TEXTURE_BINDINGS`,
   `USER_UNIT_BASE`).
 - `resources.rs`: `GlError`, `RenderTarget` (incl. `ensure_kept` / `clear` for state targets),
-  `ParamsBuffer` (grow-only params UBO), `Resources`
+  `ParamsBuffer` (grow-only params UBO), `BlendedComposite` (erase + add programs), `Resources`
+  (incl. the per-entry capture pool, `ensure_captures`)
   (incl. dummy textures), `build_program` (all GL object code).
 - `render.rs`: the per-layer GL sequence and state restoration.
 - `coverage.rs`: the mask rasterizer: shape-mask coverage (F9) and region ids (R1). Two mesh
@@ -83,10 +88,20 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   PASS step (`target_of(Slot::RegionId)`, `allocations().region`); the composite and layers
   without regions get the white dummy (`REGION_NONE`). A packed mask that does not match its plan
   (`CoverageResources::fits`) latches (crate bug).
-- Entries (R3): until roadmap phase R3b a layer of more than one entry is refused on the GUI
-  thread (`Unsupported::MultiEntryLayers`, logged once, draws nothing extra — temporary, removed
-  by R3b); a single-entry layer runs exactly as before, from its `EntryJob` (state key
-  `LayerJob::state_key(0)`).
+- Entries (R3): one paint callback runs every entry. `render.rs` executes `plan::schedule(..,
+  CaptureSource::Framebuffer)` op by op and decides no order itself (`Stacked`: capture, run,
+  composite per entry, so later captures see earlier composites; `Independent`: every capture
+  first). Entry k captures into `Resources::captures[k]` (a grow-only pool); ping-pong, coverage
+  and region-id targets are shared (each run is composited before the next; a schedule that
+  breaks this, or a hand-off op, latches as a crate bug). A layer of several entries composites
+  each with the BLENDED composite (`BlendedComposite`: erase `ZERO, ONE_MINUS_SRC_ALPHA` then add
+  `ONE, ONE`, D4), so a later entry lands over an earlier one; a single entry keeps the replace
+  composite, bit for bit as before. Programs, the blended programs, the rasterizer, state formats
+  and every entry's textures are settled before the first capture (one failure skips the whole
+  layer); a failing op later stops the layer, earlier composites stay. States per entry
+  (`LayerJob::state_key(k)`, reset ticket claimed once per paint), started at `Run(k)` and
+  finished after `Composite(k)` (`StateRegistry::get_mut`). The blended composite rounds twice,
+  so AA edges of overlapping entries may differ from wgpu by one 8-bit step.
 - Backend-wide failures (resource creation, unexplained capture / composite GL error) latch
   `GlowState::failure`; per-effect failures (translation, compile/link, a GL error of that
   effect's draw — attributed directly for single-effect chains, else by per-pass checks on later
@@ -107,7 +122,9 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   (invert, lossless identity, rounded mask, multi-pass chains, zoom, alpha, per-effect failure,
   named parameters per pass, `original()` in later passes, pointer / frame counters, scaled
   passes, user textures: exact / nearest / linear, updates, three slots, unknown / freed ids,
-  shape masks, regions: grid without seam / fringe incl. 4x MSAA, `REGION_NONE`, later-wins overlap).
+  shape masks, regions: grid without seam / fringe incl. 4x MSAA, `REGION_NONE`, later-wins overlap,
+  entries: far-apart windows, `Independent` / `Stacked` overlap incl. AA edge and 4x MSAA, three
+  stacked entries, `Stacked` == `Independent` outside the earlier mask, per-entry states / textures).
   Extend it with every change to this backend; the demo example needs a display and is no test.
 
 ## Editing map

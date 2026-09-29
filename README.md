@@ -371,20 +371,7 @@ them. A layer whose ANY entry fails a check is skipped whole. Offline: `OfflineL
 frame above the tile limit is `NotTileable`). In this build the glow backend skips layers of more
 than one entry (logged once); single-entry layers are unaffected.
 
-**Regions, entries or layers?** Regions are the cheapest (one capture of the layer rect, one run
-for every area) when the areas share one effect and differ in parameters; entries when each area
-needs its own chain, mask or state, or areas are far apart (no capture of the space between);
-separate layers when they must sit at different positions of egui's paint order (they cost a
-selection, tessellation and re-render each on wgpu). Measured by `bench_many_elements` (N frosted,
-tinted tiles over a busy 256x128 backdrop; release build, Ryzen 5 9600X iGPU, Mesa 26.0.3; wall
-time per frame incl. GPU completion and readback; N = 4 / 16 / 64):
-
-| backend | backdrop only | N layers | one layer, N regions |
-|---|---|---|---|
-| wgpu (Vulkan) | 0.09 ms | 0.56 / 1.34 / 5.54 ms | 0.41 / 0.44 / 0.52 ms |
-| glow | 0.15 ms | 0.48 / 0.76 / 1.57 ms | 0.41 / 0.43 / 0.56 ms |
-
-Entry numbers follow with the glow implementation of entries.
+**Regions, entries or layers?** See [Performance: many elements](#performance-many-elements).
 
 ### Named parameters
 
@@ -436,6 +423,55 @@ if let Some(error) = hot.error() {
     ui.label(error.to_string()); // the last good effect keeps rendering meanwhile
 }
 ```
+
+## Performance: many elements
+
+Three ways to filter N areas, and what each costs:
+
+- **N layers** (`ShaderLayer` per area): N egui paint callbacks, N captures, N chain runs. On wgpu
+  every layer also pays its own beneath selection, tessellation and backdrop re-render, so the
+  cost grows steeply with N. The only choice when the areas must sit at different positions of
+  egui's paint order.
+- **One layer, N regions** (`Mask::Regions`): one callback, ONE capture of the layer rect (the
+  union of the areas), one run of one chain; the shader tells the areas apart by `region()`. Nearly
+  flat in N. Costs the union's area, so it wastes work on sparse areas spread over a large screen,
+  and every area runs the same chain (different looks mean one branching "uber" chain whose
+  passes run under every area).
+- **One layer, N entries** (`ShaderLayer::from_entries`): one callback and, on wgpu, one beneath
+  selection; each entry still captures its own padded rect and runs its own chain. The
+  flexible option: a different chain, mask, textures and state per area, no capture of the space
+  between them. Its cost is close to N layers, not to regions. `Overlap::Stacked` adds, on wgpu,
+  a hand-off draw from every earlier entry into each later entry whose PADDED capture it reaches
+  — neighbours within the blur radius count even when the areas do not overlap.
+
+Rule of thumb: the same effect with different parameters → regions; different chains, masks or
+state per area → entries (or regions with a branching chain when N is large and the areas are
+dense); different paint-order positions → layers. Prefer `Independent` unless a later entry must
+see an earlier entry's result.
+
+Measured by `bench_many_elements` (`tests/wgpu_headless.rs`, `tests/glow_headless.rs`, scene in
+`tests/common/mod.rs`): N frosted tiles (Gaussian blur sigma 3 + per-tile tint, rounded corners)
+in a grid filling a busy 256x128 px backdrop. "Mixed" = every odd tile pixelates instead (its
+Regions version: blur + one pass branching on the region id). Dev machine: Ryzen 5 9600X iGPU,
+Mesa 26.0.3 (wgpu on RADV Vulkan, glow on radeonsi GL 4.6), release build; mean wall time per
+frame over 100 frames after 10 warm-up, including egui, tessellation, GPU completion and readback;
+ms for N = 4 / 16 / 64. The backdrop alone costs 0.09 ms (wgpu) / 0.16 ms (glow).
+
+| mode | wgpu (Vulkan) | glow |
+|---|---|---|
+| N layers | 0.57 / 1.39 / 5.75 | 0.50 / 0.80 / 1.64 |
+| 1 layer, N regions | 0.41 / 0.42 / 0.53 | 0.41 / 0.43 / 0.56 |
+| 1 layer, N entries | 0.57 / 1.38 / 5.97 | 0.49 / 0.81 / 1.61 |
+| 1 layer, N entries, stacked | 0.60 / 2.23 / 9.74 | 0.49 / 0.82 / 1.60 |
+| mixed: N layers | 0.40 / 1.10 / 3.78 | 0.37 / 0.60 / 1.22 |
+| mixed: 1 layer, N regions | 0.41 / 0.44 / 0.55 | 0.42 / 0.43 / 0.57 |
+| mixed: 1 layer, N entries | 0.43 / 1.09 / 4.03 | 0.36 / 0.60 / 1.19 |
+
+The tiles fill the frame here, which is the best case for regions (the union is barely larger
+than the tiles). With a few small areas far apart on a large screen the regions capture grows
+with the screen while layers and entries stay at their areas' size. Run it yourself:
+`cargo test --release --all-features --test wgpu_headless bench_many_elements -- --ignored --nocapture`
+(same for `glow_headless`); the demo's `grid` scene shows the same modes live.
 
 ## Semantics and limitations
 

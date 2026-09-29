@@ -45,9 +45,11 @@ processors. They are also the manual test bench for both backends.
     painted after the layer, splashes, pointer wake, rain, `reset_state`); `trails.rs` (scene
     "trails": `presets::trails` on a `DragRect` over the moving circles, an orbiting comet and a
     pointer brush); `grid.rs` (scene "grid": the many-elements benchmark made visible — N pulsing,
-    individually tinted frosted tiles as N layers or one layer with N regions, tint by `region()`
-    with a per-layer `p.index` fallback so both modes run one chain; `GridMode` is the extension
-    point for the entry modes of phase R2b; `FrameTimer` + layers-per-frame readout).
+    individually tinted frosted tiles as N layers, one layer with N regions, or one layer with N
+    entries (independent / stacked); tint by `region()` with a per-layer `p.index` fallback so
+    every mode runs one chain; a "mixed" toggle gives odd tiles a pixelate chain (in Regions:
+    one uber chain branching on the region id); `GridMode` + `paint_tiles` is the one dispatch;
+    `FrameTimer` + layers-per-frame readout).
 - `process_image.rs` (feature `image`): offline processing of an image file on a headless wgpu
   device (`OfflineRenderer::headless` + `process_file`) with a fixed stack incl. a custom effect;
   `--ppp`, `--time`, `--max-tile` map to `OfflineOptions`. JPEG output of translucent input relies
@@ -60,7 +62,8 @@ processors. They are also the manual test bench for both backends.
 ## Benchmark (tests, not examples)
 `bench_many_elements` (`#[ignore]`, at the end of `tests/wgpu_headless.rs` and
 `tests/glow_headless.rs`) is the headless counterpart of the grid scene; its scene builder, timing
-loop and table live in `tests/common/mod.rs` (shared by both files). Run with
+loop and table live in `tests/common/mod.rs` (shared by both files); `common::Mode` lists the
+modes (layers / regions / entries / entries-stacked, and the mixed variants). Run with
 `cargo test --release --all-features --test wgpu_headless bench_many_elements -- --ignored --nocapture`
 (same for `glow_headless`).
 

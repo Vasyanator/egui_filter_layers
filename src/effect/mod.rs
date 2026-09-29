@@ -445,7 +445,7 @@ const COMPOSITE_GAMMA_TAIL: &str = "fn effect(frag_uv: vec2<f32>) -> vec4<f32> {
 /// premultiplied gamma colour is decoded per channel first (what egui-wgpu does for such targets).
 const COMPOSITE_LINEAR_TAIL: &str = "fn effect(frag_uv: vec2<f32>) -> vec4<f32> {\n    return to_linear(fl_composite(frag_uv));\n}\n";
 
-/// `effect` wrapper of the blended composite's ERASE draw (wgpu UI only): outputs the mask
+/// `effect` wrapper of the blended composite's ERASE draw (wgpu UI, glow multi-entry layers): outputs the mask
 /// coverage as alpha under a `{Zero, OneMinusSrcAlpha}` blend, scaling the pass's pixels by
 /// `1 - coverage` on all four channels; uncovered fragments are discarded (left untouched). Zero
 /// colour needs no sRGB variant.
@@ -497,7 +497,6 @@ pub(crate) fn composite_linear_module() -> Result<Arc<CompiledModule>, EffectErr
 ///
 /// # Errors
 /// As [`composite_module`].
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Only the wgpu UI backend blends its composite.
 pub(crate) fn composite_erase_module() -> Result<Arc<CompiledModule>, EffectError> {
     static COMPOSITE: OnceLock<Result<Arc<CompiledModule>, EffectError>> = OnceLock::new();
     COMPOSITE.get_or_init(|| compile_composite("egui_shader_layers::composite_erase", COMPOSITE_ERASE_TAIL)).clone()
@@ -507,7 +506,6 @@ pub(crate) fn composite_erase_module() -> Result<Arc<CompiledModule>, EffectErro
 ///
 /// # Errors
 /// As [`composite_module`].
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Only the wgpu UI backend blends its composite.
 pub(crate) fn composite_add_module() -> Result<Arc<CompiledModule>, EffectError> {
     static COMPOSITE: OnceLock<Result<Arc<CompiledModule>, EffectError>> = OnceLock::new();
     COMPOSITE.get_or_init(|| compile_composite("egui_shader_layers::composite_add", COMPOSITE_ADD_GAMMA_TAIL)).clone()

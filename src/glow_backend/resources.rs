@@ -14,13 +14,15 @@ Key structures:
   a multisample resolve must use to match it (GLES 3 / WebGL2 require identical formats).
 - `ResolveTarget`: renderbuffer + framebuffer for that resolve, reallocated on format change.
 - `ParamsBuffer`: the grow-only named-parameter uniform buffer and its allocated size.
-- `Resources`: the shared set (VAO, `fl` and named-parameter uniform buffers, capture / resolve / ping-pong targets,
-  composite program, dummy textures for the texture units a draw leaves unused, cached
-  default-framebuffer format).
+- `Resources`: the shared set (VAO, `fl` and named-parameter uniform buffers, the capture pool
+  (one capture target per entry index, R3) / resolve / ping-pong targets, composite program,
+  the blended composite's programs (`BlendedComposite`, multi-entry layers), dummy textures for
+  the texture units a draw leaves unused, cached default-framebuffer format).
 
 Key functions:
 - `build_program()`: compile + link a translated `GlslProgram` and bind its block / samplers.
-- `Resources::create()` / `Resources::destroy()`.
+- `Resources::create()` / `Resources::destroy()`, `Resources::ensure_captures()` (grows the pool).
+- `BlendedComposite::create()`: the erase + add programs of the blended composite.
 - `grown_size()`: pure growth policy of every target.
 
 Notes:
@@ -35,7 +37,7 @@ use glow::HasContext as _;
 
 use super::coverage::CoverageResources;
 use super::glsl::{GlslProgram, GlslTarget, TranslateError, translate};
-use crate::effect::composite_module;
+use crate::effect::{composite_add_module, composite_erase_module, composite_module};
 use crate::pass::UNIFORM_BLOCK_SIZE;
 
 /// Converts a GL enum (`u32` in glow) to the `i32` the `*_i32` entry points take.
@@ -549,8 +551,10 @@ pub(super) struct Resources {
     pub uniform_buffer: glow::Buffer,
     /// The named-parameter uniform buffer (grow-only; each draw writes its block at offset 0).
     pub params: ParamsBuffer,
-    /// 8-bit copy of the backdrop.
-    pub capture: RenderTarget,
+    /// 8-bit copies of the backdrop, one per entry index of a layer (R3; index 0 serves every
+    /// single-entry layer). Never empty; grown by `ensure_captures`, never shrunk (each keeps
+    /// the largest size its entry index needed, like every target).
+    pub captures: Vec<RenderTarget>,
     /// Screen-sized renderbuffer for resolving a multisampled framebuffer (format matched to it);
     /// created on first need.
     pub resolve: Option<ResolveTarget>,
@@ -563,8 +567,10 @@ pub(super) struct Resources {
     pub rejected_formats: HashSet<ReadFormat>,
     /// Ping-pong pass outputs.
     pub ping_pong: [RenderTarget; 2],
-    /// The composite program writing the result back.
+    /// The composite program writing the result back (REPLACE: single-entry layers).
     pub composite: glow::Program,
+    /// The blended composite (erase + add) of multi-entry layers (D4), built with the first one.
+    pub blended: Option<BlendedComposite>,
     /// 1x1 transparent texture for texture units a draw leaves unused (original, state, user
     /// texture slots with nothing attached).
     pub transparent: glow::Texture,
@@ -604,6 +610,29 @@ impl Resources {
         self.ping_pong[0].format == TargetFormat::Rgba16F
     }
 
+    /// Grows the capture pool to at least `count` targets (RGBA8, allocated 1x1 until a capture
+    /// sizes them), so every entry index below `count` has its own capture.
+    ///
+    /// # Errors
+    /// [`GlError`] when a target cannot be created; the targets created before stay in the pool.
+    ///
+    /// # Safety
+    /// `gl` must be current on this thread.
+    pub unsafe fn ensure_captures(&mut self, gl: &glow::Context, count: usize) -> Result<(), GlError> {
+        while self.captures.len() < count {
+            // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); a target whose sizing fails is freed before the error is returned.
+            unsafe {
+                let mut capture = RenderTarget::create(gl, TargetFormat::Rgba8)?;
+                if let Err(error) = capture.ensure_size(gl, [1, 1], i32::MAX) {
+                    capture.destroy(gl);
+                    return Err(error);
+                }
+                self.captures.push(capture);
+            }
+        }
+        Ok(())
+    }
+
     /// Frees every object.
     ///
     /// # Safety
@@ -614,7 +643,9 @@ impl Resources {
             gl.delete_vertex_array(self.vertex_array);
             gl.delete_buffer(self.uniform_buffer);
             gl.delete_buffer(self.params.buffer);
-            self.capture.destroy(gl);
+            for capture in self.captures {
+                capture.destroy(gl);
+            }
             if let Some(resolve) = self.resolve {
                 resolve.destroy(gl);
             }
@@ -622,11 +653,66 @@ impl Resources {
             a.destroy(gl);
             b.destroy(gl);
             gl.delete_program(self.composite);
+            if let Some(blended) = self.blended {
+                blended.destroy(gl);
+            }
             gl.delete_texture(self.transparent);
             gl.delete_texture(self.white);
             if let Some(coverage) = self.coverage {
                 coverage.destroy(gl);
             }
+        }
+    }
+}
+
+/// The two programs of the blended composite (roadmap §19.4.2, D4): multi-entry layers draw
+/// every entry's result with `erase` (coverage as alpha, blend `ZERO, ONE_MINUS_SRC_ALPHA`) then
+/// `add` (`coverage * filtered`, blend `ONE, ONE`), i.e. `mix(framebuffer, filtered, coverage)`
+/// OVER what earlier entries composited — the replace composite would overwrite an earlier
+/// entry's result with this entry's capture outside its mask.
+#[derive(Debug)]
+pub(super) struct BlendedComposite {
+    /// `effect::composite_erase_module` (output-format independent).
+    pub erase: glow::Program,
+    /// `effect::composite_add_module` (gamma output: `egui_glow`'s framebuffers are gamma).
+    pub add: glow::Program,
+}
+
+impl BlendedComposite {
+    /// Translates and links both programs.
+    ///
+    /// # Errors
+    /// [`GlError::Composite`] when the crate's own modules fail to compile (crate bug), a
+    /// translation or link error otherwise; nothing is left allocated on error.
+    ///
+    /// # Safety
+    /// `gl` must be current on this thread.
+    pub unsafe fn create(gl: &glow::Context, target: GlslTarget) -> Result<Self, GlError> {
+        let erase = composite_erase_module().map_err(|error| GlError::Composite(error.to_string()))?;
+        let add = composite_add_module().map_err(|error| GlError::Composite(error.to_string()))?;
+        let (erase, add) = (translate(&erase, target)?, translate(&add, target)?);
+        // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); the erase program is freed if the add program fails.
+        unsafe {
+            let erase = build_program(gl, &erase)?;
+            match build_program(gl, &add) {
+                Ok(add) => Ok(Self { erase, add }),
+                Err(error) => {
+                    gl.delete_program(erase);
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    /// Frees both programs.
+    ///
+    /// # Safety
+    /// `gl` must be current on this thread and own the programs.
+    pub unsafe fn destroy(self, gl: &glow::Context) {
+        // SAFETY: forwarded contract; `self` is consumed, so the programs are not used again.
+        unsafe {
+            gl.delete_program(self.erase);
+            gl.delete_program(self.add);
         }
     }
 }
@@ -689,13 +775,14 @@ impl Partial {
                         vertex_array,
                         uniform_buffer,
                         params: ParamsBuffer { buffer: params_buffer, capacity: 0 },
-                        capture,
+                        captures: vec![capture],
                         resolve: None,
                         max_size,
                         default_read_format: None,
                         rejected_formats: HashSet::new(),
                         ping_pong: [first, second],
                         composite,
+                        blended: None,
                         transparent,
                         white,
                         coverage: None,

@@ -190,7 +190,6 @@ pub(crate) struct LayerJob {
     /// The entries, in list order (never empty; every one with passes and a positive rect).
     pub entries: Vec<EntryJob>,
     /// How overlapping entries see each other (`plan::schedule` decides the order from it).
-    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
     pub overlap: Overlap,
     /// egui input time in seconds at paint time, for `fl.time`.
     pub time: f32,
@@ -211,7 +210,6 @@ pub(crate) struct LayerJob {
 #[derive(Clone, Debug)]
 pub(crate) struct EntryJob {
     /// The entry's rect in points (painter space, before layer transforms).
-    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
     pub rect: Rect,
     /// The mask: rounded-rect radii (layer points), or the tessellated shape / regions (F9, R1).
     pub mask: JobMask,

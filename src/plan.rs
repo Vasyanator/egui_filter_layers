@@ -484,7 +484,7 @@ pub(crate) fn plan(passes: &[Pass], capture: [i32; 2], window: PxRect, composite
 /// composite of an earlier entry into a later entry's capture, whose origin is
 /// `capture_from.xy - capture_into.xy`.
 #[must_use]
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Only the pristine-source backends (wgpu UI, offline) draw hand-offs; glow's framebuffer captures need none.
 pub(crate) fn composite_for_origin(plan: &ChainPlan, composite_origin: [i32; 2]) -> CompositeStep {
     CompositeStep { frag_offset: [-px_f32(composite_origin[0]), -px_f32(composite_origin[1])], ..plan.composite }
 }
@@ -493,7 +493,6 @@ pub(crate) fn composite_for_origin(plan: &ChainPlan, composite_origin: [i32; 2])
 /// (`Framebuffer`: glow copies the framebuffer inside the paint callback) or not (`Pristine`: the
 /// wgpu re-render and the offline copy of the unfiltered frame).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
 pub(crate) enum CaptureSource {
     /// Captures copy the framebuffer: an entry captured after an earlier entry's composite sees it.
     Framebuffer,
@@ -503,7 +502,6 @@ pub(crate) enum CaptureSource {
 
 /// One step of a multi-entry paint ([`schedule`]); indices are entry indices of the layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
 pub(crate) enum Op {
     /// Fill entry `k`'s capture (a framebuffer copy, a re-render or a copy of the frame).
     Capture(usize),
@@ -541,7 +539,6 @@ pub(crate) enum Op {
 /// Composites are always in list order. A backend that defers composites (the wgpu UI draws them
 /// in its paint callback) keeps that order.
 #[must_use]
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
 pub(crate) fn schedule(geometry: &[Option<LayerGeometry>], overlap: Overlap, source: CaptureSource) -> Vec<Op> {
     let visible: Vec<usize> = geometry.iter().enumerate().filter_map(|(index, geometry)| geometry.map(|_| index)).collect();
     let mut ops = Vec::with_capacity(visible.len() * 3);
@@ -579,7 +576,6 @@ pub(crate) fn schedule(geometry: &[Option<LayerGeometry>], overlap: Overlap, sou
 
 /// The intersection of two pixel rects, `None` when it is empty (touching edges do not overlap).
 #[must_use]
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
 fn intersect(a: PxRect, b: PxRect) -> Option<PxRect> {
     let left = a.x.max(b.x);
     let top = a.y.max(b.y);

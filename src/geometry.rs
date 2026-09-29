@@ -192,7 +192,6 @@ pub(crate) fn mask_transform(painted: Rect, rendered: Rect, pixels_per_point: f3
 /// bit for bit, so single-entry geometry is unchanged; an untransformed layer maps every entry
 /// onto itself exactly (`s = 1`, `t = 0`).
 #[must_use]
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // TEMPORARY: read by the wgpu UI and offline; glow executes the schedule from roadmap phase R3b (this release), which removes this allow.
 pub(crate) fn entry_rect(painted: Rect, rendered: Rect, entry: Rect) -> Rect {
     if entry == painted {
         return rendered;

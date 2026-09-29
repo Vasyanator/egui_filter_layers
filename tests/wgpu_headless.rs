@@ -1711,7 +1711,8 @@ fn entry_textures_are_per_entry() {
 
 mod common;
 
-/// R2 benchmark on wgpu: N glass tiles as N layers vs one layer with N regions, mean wall time per
+/// R2 benchmark on wgpu: N glass tiles as N layers vs one layer with N regions vs one layer with N
+/// entries, each with one chain for every tile and mixed (odd tiles pixelate; `common::Mode`), mean wall time per
 /// frame (egui + tessellation + GPU + readback; `render_frame` waits for the GPU). Run in release:
 /// `cargo test --release --all-features --test wgpu_headless bench_many_elements -- --ignored --nocapture`.
 /// Asserts only that every mode applied the glass (a timed frame that draws nothing is no data).
