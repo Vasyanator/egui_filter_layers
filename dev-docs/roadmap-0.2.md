@@ -679,3 +679,458 @@ Each phase is marked done here in the same commit that lands it.
 - Phase 5: equivalence measured: a star mask over invert + blur, UI vs offline: exact where the
   coverage is 0 or 1, max 1 step on the anti-aliased outline (~450 values at 1 and 2 ppp); tiled vs
   whole offline: bit-identical.
+
+# 19. Multi-region layers (R1 regions, R2 benchmark, R3 entries) — design and phases
+
+Draft section for `dev-docs/roadmap-0.2.md` (append as §19; §17 gets one progress line per phase
+below). Baseline: commit 223daf1, version 0.2.0 prepared and unpublished, so changes against the
+0.2 working tree are free; the only 0.1.0 surface touched is listed in §19.9.
+
+Owner's request, restated: several effects / areas under ONE layer instead of many layers —
+(R1) one chain whose effect behaves differently per REGION of the layer (non-overlapping regions,
+priority when they overlap), (R3) several independent (mask, chain) ENTRIES in one layer, each
+capturing only its own window, and (R2) a benchmark that tells users when either pays off.
+
+## 19.0 Architectural check (AGENTS.md §2.5)
+
+* Trigger 1 (no seam): none. R1 is a second rasterized texture next to the F9 coverage step,
+  read by the prelude; R3 is a loop over entries around the existing single-entry pipeline.
+* Trigger 2 (one decision, many owners): R3 WOULD fire it if written naively — "in which order
+  are entries captured, run and composited, and which earlier entry is copied into a later one's
+  capture" would be decided in `wgpu_backend/render.rs`, `glow_backend/render.rs` and
+  `offline/mod.rs`, the exact failure `plan.rs` was created against (§0). The design therefore
+  puts that schedule in `plan.rs` (`plan::schedule`, §19.4.3) BEFORE any backend loops over
+  entries; no refactor of existing code is required first, so no §2.5 stop is raised.
+* File size: `plan.rs` 956 → ~1250, `layer.rs` 692 (new `Entry` goes to a new `src/entry.rs`),
+  `glow_backend/render.rs` 845 → ~1100, `offline/mod.rs` 853 → ~1050. All under the 3000 line
+  awareness mark; report sizes in each phase.
+* §14 temporary: phase R3a leaves glow refusing multi-entry layers (logged once, typed
+  `LayerOutcome`), removed by R3b in the same release. Stated here, bounded by the phase table.
+
+## 19.1 Decisions the manager must confirm (D1–D9)
+
+| # | decision (recommended first) | alternative |
+|---|---|---|
+| D1 | Mask coverage union becomes ADDITIVE (`One, One`, saturating) instead of egui "over": abutting pieces / regions get coverage 1 at the shared edge (feathers are complementary ramps), so adjacent regions show no seam. Changes F9 output only at junction pixels where two pieces' OUTER feathers cross (over-estimate ≤ 0.25, one pixel) | keep "over"; document "regions must overlap by ≥ 1 px" and accept the 0.75 seam of §18 phase 5 |
+| D2 | Regions are a mask variant `Mask::Regions(Vec<Region>)` (+ `FilterLayer::regions(..)` shorthand); the union of the regions IS the mask | a separate `FilterLayer::regions` field beside the mask (two sources of coverage) |
+| D3 | R3 API: `Entry` per (rect, chain, mask, textures, state); `FilterLayer::new(rect, chain)` = one entry; layer-level builders (`mask`, `corner_radius`, `texture`, `state`) apply to EVERY entry; accessors `chain()` / `layer_mask()` / `texture_at()` return the FIRST entry's (documented) | make the layer-level builders errors on multi-entry layers |
+| D4 | glow composites every entry of a multi-entry layer with the BLENDED erase+add composite (the wgpu UI's two modules, GL blend funcs); single-entry layers keep the replace composite unchanged | replace in `Stacked`, blended only in `Independent` (two glow paths) |
+| D5 | State per entry, key `layer_id.with(entry_index)`; `reset_state(ctx, layer_id)` resets all entries; offline keeps one state per entry index | refuse stateful chains in multi-entry layers in 0.2 (`StateError::MultiEntry`, later removed = churn) |
+| D6 | Offline multi-entry layers refuse tiling (`OfflineError::NotTileable`): the frame must fit `max_tile_size` (default 4096; raise it for larger frames). R1 (regions) tiles like F9 | per-entry tiling (+M, a second tiler over sub-rects) |
+| D7 | R2 measures wall time per frame including GPU completion (the harnesses already wait / read back), K frames after warm-up; no timestamp queries | `TIMESTAMP_QUERY` in every pass (intrusive in `chain.rs`, native only) |
+| D8 | `Stacked` on wgpu (UI and offline) = a HAND-OFF: the replace composite of an earlier entry drawn into a later entry's capture texture (one implementation in `chain.rs`); glow = natural blit order. Both meet one contract (§19.4.2); glow differs ≤ 1 step at AA edges | offline copies from its output texture (natural, but UI ≠ offline by ≤ 1 step at overlaps) |
+| D9 | Phases R3a (core + schedule + wgpu UI + offline) then R3b (glow) sequential, glow refusing multi-entry in between | one L worker for both backends |
+
+## 19.2 Shared foundations touched
+
+### 19.2.1 Binding layout: binding 7 returns as the region-id texture
+Binding 7 (`fl_nearest_sampler`) was removed in phase 3c (§18), so `@group(0)` has a free slot.
+New row of the §1.1 table:
+
+| binding | name | type | filled by | notes |
+|---|---|---|---|---|
+| 7 | `fl_region_texture` | texture_2d | both | R1: region ids, RGBA8, `.r * 255` = id, 255 = none; 1x1 WHITE dummy (id 255) without regions |
+
+`effect/mod.rs`: `BINDING_REGION_TEXTURE = 7`; `effect/interface.rs:25` `PRELUDE_RESOURCES` gains
+`("fl_region_texture", 0, 7)` (13 entries). wgpu `chain.rs:162-173` layout gets an 8th
+`texture_entry`; every draw's bind group (`chain.rs:404`) binds the region target or the white
+dummy. glow `glsl.rs:42` `GROUP0_TEXTURE_BINDINGS` becomes `[src, original, state, coverage,
+region]` (units 0..=4), `glsl.rs:46` `USER_UNIT_BASE = 5` (user units 5..=7; 8 < 16 GLES 3.0
+units). `glow_backend/render.rs` `bind_textures` / `cleanup` follow the table (no other change:
+the unit order IS the table). Budget check: WebGL2 4 bind groups unchanged, 8 sampled textures,
+4 samplers.
+
+### 19.2.2 `FlUniforms` growth (pinned by `offsets_match_the_wgsl_struct_layout`)
+Two `vec2<f32>` after `internal_state_size` (176): `internal_region_scale` at 184,
+`internal_region_offset` at 192; `params` moves 192 → 208; `UNIFORM_BLOCK_SIZE` 448 → 464
+(`pass.rs:348`, `offsets::PARAMS`, `FrameUniforms.region: [[f32; 2]; 2]` neutral identity).
+`plan::draw_uniforms` sets it exactly like `cover` (`plan.rs:513-516`) for a draw whose
+`Bindings.region` is `Some`.
+
+### 19.2.3 `mesh.wgsl` and `MeshLocals`
+`MeshLocals.reserved: vec2<f32>` (`mesh.wgsl:30`) becomes `region_id: f32, alpha_threshold: f32`
+— same 32 bytes, `MESH_LOCALS_SIZE` unchanged; `plan::mesh_locals` (`plan.rs:558`) takes the two
+values (the backdrop re-render and the coverage draw pass `0.0, 0.0`). New fragment entry:
+
+```wgsl
+// R1: writes the region id where the mesh covers the pixel more than `alpha_threshold`.
+@fragment
+fn fs_region(in: VertexOutput) -> @location(0) vec4<f32> {
+    let a = in.color.a * textureSample(tex_color, tex_sampler, in.tex_coord).a;
+    if a <= locals.alpha_threshold { discard; }
+    return vec4<f32>(locals.region_id / 255.0, 0.0, 0.0, 1.0);
+}
+```
+No blend (replace), so the LAST region drawn owns the pixel. glow's `glsl::translate_mesh`
+takes the fragment entry name (`fs_main` | `fs_region`); the existing
+`the_mesh_shader_translates_for_every_target` test covers both.
+
+## 19.3 R1 — regions inside one chain
+
+### 19.3.1 Public API (`mask.rs`, `layer.rs`, `lib.rs`)
+```rust
+/// One region of a `Mask::Regions` mask, in LAYER points. Its index in the list is its id.
+#[derive(Clone, Debug, PartialEq)] #[non_exhaustive]
+pub struct Region { shape: egui::Shape }
+impl Region {
+    pub fn rounded_rect(rect: Rect, corner_radius: impl Into<CornerRadius>) -> Self; // Shape::rect_filled(rect, r, WHITE)
+    pub fn shape(shape: egui::Shape) -> Self;   // any shape, alpha = its coverage (as Mask::Shape)
+    pub fn shape_ref(&self) -> &egui::Shape;
+}
+pub enum Mask { RoundedRect(CornerRadius), Shape(Shape), /* new */ Regions(Vec<Region>) }
+pub enum MaskError { .., /* new */ TooManyRegions { count: usize, max: usize } /* max = MAX_REGIONS */ }
+/// Ids are `0..MAX_REGIONS`; `REGION_NONE` (255) is "no region here" (the prelude's `region()`).
+pub const MAX_REGIONS: usize = 255; pub const REGION_NONE: u32 = 255;
+impl FilterLayer { pub fn regions(self, regions: impl IntoIterator<Item = Region>) -> Self; } // = mask(Mask::Regions(..))
+impl Effect { pub fn reads_regions(&self) -> bool; }  // IR scan for `fl_region_texture` (like reads_texture); informational
+```
+Semantics: the union of the regions is the layer's mask (coverage texture, F9 path); the region
+texture holds, per capture pixel, the id of the region that owns it. `Mask::Regions(vec![])` is
+a mask covering nothing (valid, draws nothing). `check` / `check_offline` visit every region's
+shape (callbacks, malformed meshes; offline: text, textured meshes) and reject > 255 regions.
+Per-region parameters need NO new mechanism: F4 arrays (`struct Params { tint: array<vec4<f32>,
+8> }`, `Pass::set_slice`) indexed by `region()`; scalars are packed four per `vec4`
+(`p.gain[r / 4u][r % 4u]`; `array<f32, N>` is rejected by F4, `effect/params.rs:403-407`).
+Documented in the README with this idiom.
+
+### 19.3.2 Prelude additions (`shaders/prelude.wgsl`)
+```wgsl
+@group(0) @binding(7) var fl_region_texture: texture_2d<f32>;
+const REGION_NONE: u32 = 255u;
+// Id of the region owning capture uv `uv` (exact texel: ids must never be interpolated), or
+// REGION_NONE outside every region and on layers without regions.
+fn region_at(uv: vec2<f32>) -> u32 {
+    let storage = fl_storage_uv(uv, fl.texel, fl.internal_region_scale, fl.internal_region_offset);
+    let px = vec2<i32>(floor(storage * vec2<f32>(textureDimensions(fl_region_texture))));
+    return u32(round(textureLoad(fl_region_texture, px, 0).r * 255.0));
+}
+fn region() -> u32 { return region_at(fl_frag_uv); }
+```
+One read path (`textureLoad`) → one GLSL combined sampler, no "two samplers" conflict (§18
+phase 1). `u8 → unorm → f32 * 255 → round` is exact. `region_at` lets a kernel stay inside its
+own region (`if region_at(uv + d) == region()`), the tool for "blur that does not bleed across
+regions". Public names added to the crate-docs table: `region()`, `region_at(uv)`, `REGION_NONE`.
+
+### 19.3.3 Ownership rule at edges (the seam / halo design)
+Two facts drive it: (a) effects run on every capture pixel, and the composite mixes the filtered
+value by coverage, so a pixel with coverage 0 < c < 1 whose id is NONE would be filtered with the
+wrong (sentinel) parameters and show as a fringe; (b) an id must switch HARD between two
+regions (an interpolated id is garbage). Rule, implemented as two id passes over all regions in
+list order into the region texture cleared to id 255:
+
+1. pass A, `alpha_threshold = 0.0`: every pixel a region touches at all gets that region's id
+   (later regions overwrite) — no touched pixel is ever NONE, so no sentinel fringe;
+2. pass B, `alpha_threshold = 0.5`: every pixel a region covers by more than half gets that
+   region's id — interior boundaries sit at the 50 % contour of the LATER region ("later in the
+   list wins"), not shifted by feathers.
+
+Result: within the mask the boundary between two regions is pixel-hard at the geometric edge;
+the silhouette of the union is antialiased by the coverage texture as in F9; with D1 an
+abutting edge has coverage 1 (no backdrop seam). A soft transition BETWEEN two regions with
+different parameters is not a region feature (it needs the effect evaluated twice and blended):
+that is R3 (two entries), documented as such. Cost: 2 × (mesh draws of all regions) per frame,
+meshes are tiny.
+
+### 19.3.4 Plan changes (`plan.rs`, single owner)
+```rust
+pub(crate) enum Slot { Source, Ping, Pong, StateA, StateB, Coverage, /* new */ RegionId }
+pub(crate) struct Bindings { .., /* new */ pub region: Option<Slot> }   // Some(RegionId) for every PASS step of a region run; None for the composite
+pub(crate) struct CoverageStep { pub used_px, pub window_origin, /* new */ pub regions: u32 } // 0 = plain F9 mask; else id passes A and B run after the coverage draw
+impl ChainPlan { pub(crate) fn with_regions(self, count: u32) -> Self }  // with_coverage() + binds RegionId on every step; composite unchanged (COVERAGE_MASK_FLAG)
+pub(crate) struct Allocations { .., pub region: [u32; 2] }
+pub(crate) fn region_locals(transform: &MaskTransform, step: &CoverageStep, region: u32, threshold: f32) -> [u8; MESH_LOCALS_SIZE];
+```
+Both textures hold the run's WINDOW at their origin like the coverage (offline tiles rasterize
+their own window ⇒ R1 tiles exactly like F9). `draw_uniforms` maps `region` with the source's
+`Content` in the region allocation. Unit tests: `with_regions` binds `RegionId` on every pass
+step and not on the composite; the region mapping equals the coverage mapping when both
+allocations are equal and differs otherwise; `region_locals` packs id and threshold at bytes
+24 / 28.
+
+### 19.3.5 Mask plumbing (`mask.rs`, `layer.rs`, `backend.rs`)
+* `JobMask::Regions(Arc<RegionMeshes>)`, `RegionMeshes { regions: Vec<CoverageMeshes> }` —
+  `resolve_mask` tessellates each region with the one `mask::tessellate` (same ppp / options /
+  atlas size; a rounded-rect region is `Shape::rect_filled`, tessellated as a path since the
+  tessellator has no pre-rasterized discs).
+* `RegionMeshes::pack() -> PackedRegions { packed: PackedCoverage /* all meshes, list order */,
+  regions: Vec<Range<usize>> /* draw-index range per region */ }` — the coverage draw runs
+  `packed.draws` as today; id passes run `packed.draws[range]` per region with its locals.
+* `JobMask::corner_radius()` → `ZERO`, `coverage()` → the packed union (unchanged callers);
+  new `regions()` accessor. `CoverageJob` (wgpu) / glow `LayerTextures.coverage` gain
+  `regions: &[Range<usize>]` (empty for F9).
+
+### 19.3.6 Backends
+* wgpu `coverage.rs`: `CoverageRasterizer` gains `region_pipeline` (`mesh_pipeline` with
+  `fs_region`, `blend: None`) — `mesh_pipeline` takes `blend: Option<BlendState>`; the coverage
+  pipeline uses `COVERAGE_BLEND` (D1, additive), the backdrop keeps `EGUI_BLEND`.
+  `CoverageTargets` gains `region: Option<Target>` and a region-locals `GrowBuffer` whose bind
+  group has `has_dynamic_offset: true` (one 32-byte block per region per pass at the device's
+  uniform offset alignment, `set_bind_group(0, &group, &[offset])`). `record` clears the region
+  target to `(1, 0, 0, 0)` and runs passes A and B after the coverage draw; returns both targets.
+  `chain.rs` maps `Slot::RegionId` (view_of) and reports `Allocations.region`.
+* glow `coverage.rs`: `region_program` (translate_mesh `fs_region`), `region_target`
+  (`RenderTarget`, RGBA8, cleared to `(1, 0, 0, 0)`), blend disabled for id passes, locals
+  re-uploaded per draw (`buffer_sub_data`, as `upload_uniforms` does); coverage draw uses
+  `blend_func(ONE, ONE)` (D1). `render.rs`: `target_of(Slot::RegionId)`, `allocations().region`.
+* offline: nothing beyond `Mask::check_offline` visiting regions; the rasterizer is `chain.rs`'s.
+
+### 19.3.7 Refusals
+`MaskError::TooManyRegions` (UI: logged once, layer skipped; offline: `OfflineError::Mask`).
+`region()` on a layer without regions is DEFINED (NONE), not refused: a layer without regions
+is a valid input; `Effect::reads_regions` exists for UIs that want to warn.
+
+### 19.3.8 Tests
+* unit (`mask.rs`): regions tessellate in order, `pack` ranges partition the draws, > 255 refused,
+  `Mask::Regions(vec![])` valid; (`plan.rs`) §19.3.4; (`pass.rs`) offsets 27 members / 464;
+  (`effect/`) `reads_regions`, `region()` compiles, interface accepts binding 7 only from the
+  prelude; (`glsl.rs`) `region()` + `src()` + `tex()` translate with units `[0, 4, 5..]`;
+  `glow_and_wgpu_upload_identical_blocks` extended with a region plan.
+* `tests/wgpu_headless.rs`: `regions_tint_each_cell_and_own_their_edges` — a 2×2 grid of
+  abutting rounded-rect regions, effect `mix(src, p.tint[region()], 0.5)`; interior of each
+  cell has its tint, the shared edge shows NO backdrop (D1: coverage 1) and switches tint within
+  1 px of the geometric edge; `region_none_outside_regions` — an effect returning red where
+  `region() == REGION_NONE` paints nothing (masked out) and a plain rounded-rect layer with the
+  same effect is fully red (dummy = NONE).
+* `tests/glow_headless.rs`: the same two scenes (+ 4x MSAA).
+* `tests/offline_equivalence.rs`: `region_masks_offline_equal_the_ui` (exact at coverage 0 / 1,
+  ≤ 1 step on the outline, as F9) and `tiled_region_masks_equal_whole` (bit-identical).
+
+## 19.4 R3 — several (mask, chain) entries in one layer
+
+### 19.4.1 Public API (`src/entry.rs` new, `layer.rs`, `lib.rs`)
+```rust
+/// One filtered area of a `FilterLayer`: its own rect, mask, chain, textures and state options.
+#[derive(Clone, Debug)]
+pub struct Entry { rect: Rect, chain: FilterChain, mask: Mask, textures: [Option<TextureId>; 3], invalid_slot: Option<usize>, state: StateOptions }
+impl Entry {
+    pub fn new(rect: Rect, chain: impl Into<FilterChain>) -> Self;
+    pub fn mask(self, Mask) -> Self; pub fn corner_radius(self, impl Into<CornerRadius>) -> Self;
+    pub fn texture(self, slot: usize, id: TextureId) -> Self; pub fn state(self, StateOptions) -> Self;
+    pub fn rect(&self) -> Rect; pub fn chain(&self) -> &FilterChain; pub fn layer_mask(&self) -> &Mask; pub fn texture_at(&self, usize) -> Option<TextureId>; pub fn state_options(&self) -> StateOptions;
+}
+/// How entries that overlap see each other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)] #[non_exhaustive]
+pub enum Overlap { #[default] Independent, Stacked }
+impl FilterLayer {
+    pub fn new(rect, chain) -> Self;                         // one entry (unchanged call)
+    pub fn from_entries(entries: impl IntoIterator<Item = Entry>) -> Self; // rect() = union of entry rects
+    pub fn with_entry(self, entry: Entry) -> Self;           // appends; rect() grows
+    pub fn overlap(self, Overlap) -> Self; pub fn overlap_mode(&self) -> Overlap;
+    pub fn entries(&self) -> &[Entry];
+    // existing: mask / corner_radius / texture / state apply to EVERY entry (D3); chain() / layer_mask() / texture_at() / state_options() = the first entry's; rect() = union.
+    // check_textures / check_state / check_mask check every entry (error names the entry index: TextureError::NotAttached gains `entry: usize`, same for StateError::MissingId and a MaskError wrapper in the log message).
+}
+```
+`paint` skips the layer when ANY entry fails a check (one layer, one decision; logged once).
+An empty entry list or all entries with empty chains paints nothing. Contract: entries are
+painted in list order; a later entry is composited over an earlier one where they overlap,
+blended by its own coverage — identical on every backend.
+
+### 19.4.2 Overlap modes — exact contract
+Let `backdrop` be the screen content beneath the layer, `f_k` entry k's filtered image, `c_k`
+its coverage. Composite in list order: `screen ← mix(screen, f_k, c_k)`.
+* `Independent`: entry k's capture is `backdrop` (no entry's result). Where entries overlap,
+  the later entry's filtered backdrop wins, blended by `c_k` at its AA edge.
+* `Stacked`: entry k's capture is `backdrop` with every earlier entry j < k composited:
+  `mix(capture_k, f_j, c_j)` over `region_j ∩ capture_k`, in gamma space with the replace
+  composite's exact-at-0/1 mix. Like separate layers on glow today; UNLIKE separate layers on
+  wgpu today (§13 gap: a lower layer is a skipped callback) — within one layer both backends
+  give this contract.
+How each backend meets it (D4, D8):
+* glow: `Independent` = blit every entry's capture FIRST (a pool of capture targets), then per
+  entry run + BLENDED composite (erase+add programs, `glBlendFuncSeparate(ZERO, ONE_MINUS_SRC_
+  ALPHA, ZERO, ONE_MINUS_SRC_ALPHA)` then `(ONE, ONE, ONE, ONE)`, scissor on, into the caller's
+  framebuffer). `Stacked` = per entry: blit (sees the framebuffer with earlier composites), run,
+  blended composite. Single-entry layers: unchanged replace path (bit-identity of the suite).
+* wgpu UI: captures re-rendered per entry from ONE beneath selection / tessellation (the union of
+  the entries' padded capture rects clips the selection; per-entry scissors); `Independent`:
+  run every entry, composites (erase+add, existing) drawn in list order in `paint`. `Stacked`:
+  after entry j's chain, for every k > j whose capture intersects `region_j`: a HAND-OFF draw =
+  the replace composite of j (`composite_module`, gamma, `Rgba8Unorm`) into `capture_k` with
+  `LoadOp::Load`, viewport `region_j ∩ capture_k` in k's capture pixels, uniform block from
+  `plan::composite_for_origin(&plan_j, origin = capture_j.xy - capture_k.xy)`. Outside j's mask
+  the composite writes `original_j` = j's re-render, byte-identical to k's re-render there (same
+  meshes, same clear, dithering keyed on screen position), so the hand-off is exactly the
+  contract's `mix`.
+* offline: the same hand-off code (`chain.rs`), see §19.4.6 ⇒ UI == offline bit for bit for
+  both modes on a non-sRGB target; glow ≤ 1 step at AA pixels of overlaps (hardware blend
+  rounding), no cross-backend bit-identity is claimed today either.
+
+### 19.4.3 Schedule — the single owner (`plan.rs`)
+```rust
+/// Whether a backend's capture sees the results of earlier composites (a framebuffer blit) or not (a re-render / a copy of the pristine frame).
+pub(crate) enum CaptureSource { Framebuffer, Pristine }
+pub(crate) enum Op { Capture(usize), Run(usize), HandOff { from: usize, into: usize, viewport: PxRect /* in `into`'s capture pixels */, origin: [i32; 2] }, Composite(usize) }
+/// The ops of one multi-entry paint, in order. `geometry[k]` = entry k's LayerGeometry (screen pixels).
+pub(crate) fn schedule(geometry: &[LayerGeometry], overlap: Overlap, source: CaptureSource) -> Vec<Op>;
+pub(crate) fn composite_for_origin(plan: &ChainPlan, composite_origin: [i32; 2]) -> CompositeStep;
+```
+Emitted orders: `Framebuffer`+`Stacked` → `[Cap0 Run0 Comp0 Cap1 Run1 Comp1 …]`;
+`Framebuffer`+`Independent` → `[Cap0..CapN, Run0 Comp0, Run1 Comp1, …]`; `Pristine` (either
+mode) → `[Cap0..CapN, Run0, HandOff(0→k)*, Comp0, Run1, HandOff(1→k)*, Comp1, …]` with hand-offs
+only for `Stacked` and only where `region_j ∩ capture_k ≠ ∅`. Backends execute ops in order
+(wgpu UI defers every `Composite` to `paint`, keeping list order). Unit tests pin all three
+orders and the overlap test (touching rects, disjoint rects, a region fully inside a later
+capture). Also `entry_state_key(layer: StateKey, index) -> StateKey` (`id.with(index)`, D5).
+
+### 19.4.4 Core plumbing (`backend.rs`, `layer.rs`, `geometry.rs`, `state.rs`)
+* `LayerJob { rect: Rect /* union */, entries: Vec<EntryJob>, overlap, time, frame_input, id, viewport, reset_state }`,
+  `EntryJob { rect, mask: JobMask, passes, padding_points, textures, state: StateOptions }`;
+  `LayerJob::is_stateful()` any entry; `state_key(index)`.
+* `geometry::entry_rect(painted_union: Rect, rendered_union: Rect, entry: Rect) -> Rect` — the
+  entry's rect after the layer transform, derived like `mask_transform` (`geometry.rs:178`);
+  per entry then `layer_geometry(entry_rect, clip, ppp, screen, entry.padding, radius, scale)`.
+* Reset: `job.claim_reset()` once per paint (hoisted out of the entry loop), the bool passed to
+  every stateful entry's `StateRegistry::begin` (`state.rs:288`).
+
+### 19.4.5 wgpu UI (`wgpu_backend/{mod,plugin,beneath,render,resources,chain}.rs`)
+* `Pending`: per-entry `padding_points`, `textures`, plus the mask textures union;
+  `plan_layer` (`plugin.rs:128`): capture rect = union over entries of `capture_points(entry_rect,
+  clip, padding_k, scale, ppp)`; `user_textures: Vec<[Option<BindGroup>; 3]>`.
+* `LayerTargets` (`resources.rs:49`) becomes per ENTRY (one pool slot per entry; `next_targets`
+  per entry); `Drawn { generation, entries: Vec<(pool_index, region)> }`; `paint` draws every
+  entry's `draw_composite_over` in order after checking every region as today.
+* `render.rs::record`: pack the beneath meshes once (vertex / index buffers in the FIRST entry's
+  targets), render the backdrop per entry with per-entry scissors (`scissor_in_capture` with
+  `capture_k`); then execute `plan::schedule(.., CaptureSource::Pristine)`: `Run(k)` =
+  `chain.record` into `pool[k]`; `HandOff` = `chain.record_handoff(rec, &pool[from], &pool[into].capture, op)`;
+  states per `entry_state_key`.
+* `chain.rs`: `record` returns a `RecordedRun { composite: BindGroup, state: Option<StatePlan>, plan: ChainPlan, allocations }` (the plan is needed by hand-offs); new
+  `record_handoff` (replace composite pipeline into `CAPTURE_FORMAT`, cached in
+  `ChainResources`, `gpu::begin_pass_load`); `chain_uniforms` gains the hand-off composite blocks
+  (`extra_origins: &[[i32; 2]]`).
+
+### 19.4.6 offline (`offline/{mod,options}.rs`)
+```rust
+pub struct OfflineEntry { rect: Rect /* frame points */, chain: FilterChain, mask: Mask, textures: [Option<OfflineTexture>; 3], state: StateOptions } // builders as Entry
+pub struct OfflineLayer { entries: Vec<OfflineEntry>, overlap: Overlap }
+impl OfflineRenderer { pub fn process_layer(&mut self, frame, layer: &OfflineLayer, options) -> Result<RgbaFrame>; process_layer_into; process_layer_async; }
+```
+`process(frame, chain, options)` stays the single-entry-over-the-frame path, untouched
+(bit-identity suites). `process_layer`: refuse tiling when the frame exceeds the tile limit
+(D6, `NotTileable { reason: "multi-entry layers need the whole frame" }`); `output` texture =
+frame (`copy_texture_to_texture` from the uploaded source first); per entry a capture texture
+(pool) filled by `copy_texture_to_texture` of the entry's capture rect from the pristine source
+(`Pristine` schedule ⇒ hand-offs for `Stacked`); composites = `composite_over_pipelines(device,
+FRAME_FORMAT, default, None)` via `draw_composite_over` over `region_k`; readback of the whole
+output. `states: Vec<Option<OfflineState>>` per entry index (`reset_state` clears all).
+Video: `VideoProcessor` gets `process_layer` too only if trivial; otherwise documented as
+"0.2: images only" (manager call; it is a thin wrapper over `run`).
+
+### 19.4.7 glow (`glow_backend/{render,resources,coverage,mod}.rs`)
+* `Resources.capture` → `captures: Vec<RenderTarget>` (grown per entry index); lazily built
+  `composite_erase` / `composite_add` programs (`composite_erase_module()` /
+  `composite_add_module()` un-gated from `cfg(feature = "wgpu")`).
+* `paint_saved`: programs for every entry's passes first; per-entry `LayerTextures`; geometries
+  per entry (`entry_rect`); `plan::schedule(.., CaptureSource::Framebuffer)`; ops: `Capture(k)`
+  = today's `capture` into `captures[k]`; `Run(k)` = `run_passes` with `Slot::Source →
+  captures[k]`; `Composite(k)` = blended (multi-entry) or replace (single entry).
+* `LayerOutcome::PassFailed { index }` gains the entry index; suspects per module unchanged.
+
+### 19.4.8 Tests
+* unit: `plan::schedule` orders (§19.4.3); `entry_rect` under a TSTransform; `LayerJob` checks
+  name the entry; `FilterLayer::rect()` = union; layer-level builders reach every entry.
+* `tests/wgpu_headless.rs`: `two_entries_far_apart_capture_only_their_windows` (an inverting
+  entry left, a red-tint entry right; the middle stays untouched; `Independent`);
+  `overlapping_entries_independent_later_wins` (two overlapping rounded rects, invert + tint:
+  overlap shows tint(backdrop) not tint(invert(backdrop)); AA edge blends over the earlier
+  entry's result); `overlapping_entries_stacked_compose` (overlap shows tint(invert(backdrop)));
+  `stateful_entries_keep_separate_states` (two trails entries, one id, different decays);
+  `entry_textures_are_per_entry`.
+* `tests/glow_headless.rs`: the same four scenes (+ MSAA), single-entry scenes unchanged.
+* `tests/offline_equivalence.rs`: `entries_offline_equal_the_ui_in_both_modes` (bit for bit,
+  non-sRGB, no dithering), `multi_entry_layers_refuse_tiling`.
+
+## 19.5 R2 — benchmark: N layers vs 1 layer / N regions vs 1 layer / N entries
+
+* Demo scene "grid" (`examples/demo/scenes/grid.rs`, registry `SCENES`): an `N = cols × rows`
+  grid of small frosted glass tiles (`presets::frosted` + a tint effect `mix(src, p.tint[…], k)`)
+  over the busy backdrop; mode selector: **Layers** (N `FilterLayer`s), **Regions** (one layer,
+  `Mask::Regions`, tint by `region()`), **Entries / Independent**, **Entries / Stacked** (after
+  R3); N slider (4..=256); frame-time readout = a `FrameTimer` helper moved into
+  `scenes/mod.rs` from bloom's inline code (`bloom.rs:141-148`), plus the count of egui
+  callbacks. `--record` path periodic (tiles pulse).
+* Headless: `#[ignore]` tests `bench_many_elements` in `tests/wgpu_headless.rs` (using
+  `render_frame`, which waits for the GPU) and `tests/glow_headless.rs` (`Harness::frame`, which
+  reads pixels back): for N in [16, 64] and each mode, 10 warm-up frames then K = 100 timed
+  frames, printing `mode, N, ms/frame` with `--nocapture`. Same scene builder shared by both
+  files' own code (tests cannot share modules without a `tests/common/`; add
+  `tests/common/mod.rs` holding the scene builder used by both). The numbers land in the README
+  ("Many elements" section) and §18 with the machine named; the docs state the expected shape
+  (Layers: N beneath selections + tessellations + re-renders on wgpu, N callbacks on glow;
+  Regions: one of everything but a union-bbox capture; Entries: one selection, N small captures).
+
+## 19.6 Documentation
+`src/MODULE_README.md` (pipeline: entries, schedule owner, binding 7), `shaders/MODULE_README.md`
+(binding 7, `fs_region`, locals), `wgpu_backend/MODULE_README.md` (per-entry pool, hand-off),
+`glow_backend/MODULE_README.md` (capture pool, blended composite, units 0..=4 / 5..=7),
+`offline/MODULE_README.md` (`process_layer`, tiling refusal), `effect/MODULE_README.md`
+(`reads_regions`), `examples/MODULE_README.md` (grid scene, bench), `lib.rs` prelude table and a
+"Regions and entries" section, README (feature list, coverage rule change D1, bench numbers),
+CHANGELOG `[0.2.0]` (Added + the D1 behaviour note), roadmap §17 progress lines and §18 findings.
+
+## 19.7 Refusals (explicit, no fakes)
+* > 255 regions: `MaskError::TooManyRegions`. Regions with callbacks / malformed meshes: as F9.
+* Offline multi-entry layers that would need tiles: `OfflineError::NotTileable` (D6). Offline
+  text / textured-mesh regions: as F9.
+* A multi-entry layer whose ANY entry fails `check_textures` / `check_state` / `check_mask`:
+  the whole layer is skipped (error names the entry).
+* Stateful entries without a layer id: `StateError::MissingId { entry, .. }`.
+* glow between R3a and R3b: multi-entry layers skipped with a once-logged reason (temporary,
+  removed in R3b).
+
+## 19.8 Phases (each: worker → `cargo check-all`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, GPU suites `--ignored` where a GPU exists; manager re-runs the GPU suites)
+
+| # | phase | size | files owned (disjoint within a parallel group) | depends on | parallel with |
+|---|---|---|---|---|---|
+| R0 | Coverage union additive (D1): `COVERAGE_BLEND`, glow blend func, doc text (`mask.rs` docs, lib.rs / README "overlap" sentences), re-check F9 tests | S | `wgpu_backend/coverage.rs` (blend const + `mesh_pipeline` blend param), `glow_backend/coverage.rs`, docs | — | — (first; tiny, verified alone) |
+| R1a | Regions core + wgpu: `mask.rs` (`Region`, `Mask::Regions`, `RegionMeshes`, `PackedRegions`), `layer.rs::regions`, `entry`-free `backend.rs` untouched, `plan.rs` (§19.3.4), `pass.rs` offsets, `shaders/prelude.wgsl` + `mesh.wgsl`, `effect/{mod,interface}.rs`, wgpu `chain.rs` layout/dummy/slot, wgpu `coverage.rs` region pipeline + targets, `render.rs` CoverageJob ranges, unit + wgpu headless tests | L | all of the above | R0 | — |
+| R1b | Regions on glow: `glsl.rs` units + `translate_mesh(entry)`, `coverage.rs` region program/target/id passes, `render.rs` slot/allocations/bind, `resources.rs` if needed; glow headless tests | M | `glow_backend/**` | R1a | R1c, R2a |
+| R1c | Regions offline + equivalence: `Mask::check_offline` over regions, `offline/options.rs` docs, `tests/offline_equivalence.rs` region cases (UI vs offline, tiled vs whole) | S | `offline/**`, `tests/offline_equivalence.rs` | R1a | R1b, R2a |
+| R2a | Bench, part 1: `tests/common/mod.rs` scene builder, `bench_many_elements` in both headless files (modes Layers / Regions), demo scene `grid.rs` + `FrameTimer` in `scenes/mod.rs`, `examples/MODULE_README.md` | M | `tests/common/`, bench fns appended to both headless files, `examples/demo/**` | R1a (+R1b for the glow bench) | R1b, R1c |
+| R3a | Entries core + schedule + wgpu UI + offline: `src/entry.rs` (new), `layer.rs`, `backend.rs`, `geometry.rs::entry_rect`, `plan.rs` (`schedule`, `composite_for_origin`, `entry_state_key`), `effect/mod.rs` (un-gate erase/add modules), wgpu `{mod,plugin,beneath,render,resources,chain}.rs`, `gpu.rs::begin_pass_load`, `offline/{mod,options}.rs` (`OfflineEntry`, `OfflineLayer`, `process_layer*`, per-entry states); glow adapted to compile with the temporary multi-entry refusal; unit + wgpu headless + offline equivalence tests | L | all listed | R1a–R1c | — |
+| R3b | Entries on glow: capture pool, blended composite programs, schedule execution, per-entry textures / states, remove the R3a refusal; glow headless tests | M | `glow_backend/**` | R3a | R2b |
+| R2b | Bench, part 2: Entries modes in the bench tests and the grid scene; run both benches on the dev machine; record numbers in README + §18 | S | `tests/common/`, bench fns, `grid.rs`, README perf section | R3a (+R3b for glow) | R3b (files disjoint) |
+| R4 | Docs + review: every `MODULE_README.md`, `lib.rs` docs, README, CHANGELOG, roadmap §17/§18; cross-pool review of `plan::schedule` + hand-off + glow blended composite (Sol) | M | docs only (+ review fixes) | all | — |
+
+Ownership rule for parallel groups: R1b / R1c / R2a touch disjoint directories; R2a appends
+bench functions at the END of the two headless test files while R1b/R1c add scene tests — the
+manager sequences the glow headless file (R1b before R2a's glow bench) or gives R2a the wgpu
+bench only and R2b both.
+
+## 19.9 API surface changes vs 0.1.0 (for the CHANGELOG)
+Additive: `Region`, `Mask::Regions`, `MaskError::TooManyRegions`, `MAX_REGIONS`, `REGION_NONE`,
+`FilterLayer::regions` / `from_entries` / `with_entry` / `overlap` / `overlap_mode` /
+`entries`, `Entry`, `Overlap`, `Effect::reads_regions`, `OfflineEntry`, `OfflineLayer`,
+`OfflineRenderer::process_layer{,_into,_async}`, prelude `region()` / `region_at()` /
+`REGION_NONE`; `TextureError::NotAttached` and `StateError::MissingId` gain `entry: usize`
+(both `#[non_exhaustive]`: additive). Behaviour: `FilterLayer::rect()` = union of entries (equal
+to the rect for one entry); `chain()` = the first entry's; `OfflineRenderer::reset_state` resets
+every entry's state. Breaking vs 0.1.0: none beyond what 0.2 already lists (§10); vs the 0.2
+working tree: the coverage union rule (D1, F9 junction pixels).
+
+## 19.10 Risks (ranked)
+1. **Hand-off correctness** (wgpu `Stacked`): the viewport must be clipped to `capture_k` and the
+   uniform origin derived by `plan.rs`, not the backend; `LoadOp::Load` on a texture written by
+   the backdrop pass in the same encoder is ordinary wgpu. Test: three overlapping entries where
+   entry 0 overlaps 2 but not 1 (the case analysed in §19.4.2).
+2. **D1 changes F9 pixels**: only junction pixels; the F9 suites assert inside / outside and UI
+   vs offline (both change) — re-run before accepting R0; README text about "overlapping pieces"
+   must be rewritten in R0, not left stale.
+3. **Two id passes vs text regions**: thin glyph strokes with atlas alpha < 0.5 keep their pass-A
+   id unless a later region covers them by ≥ 0.5 — intended; document "text regions own their
+   antialiased pixels".
+4. **wgpu pool growth**: N entries per frame × layers; pool slots are per entry now; a layer with
+   many entries and large rects allocates N captures + N ping-pong pairs — inherent (the owner
+   refused union captures); documented, bounded by entry sizes.
+5. **glow blended composite on odd framebuffers**: MSAA + scissor + blend into the caller's
+   framebuffer is what egui_glow itself does; the RGB565 / RGB8 read formats already handled by
+   `ReadFormat` are unaffected (blend happens on the draw side).
+6. **Offline `process_layer` memory**: whole-frame output + per-entry captures; bounded by the
+   tile cap refusal (D6) — an 8K export needs `with_max_tile_size(None)` and enough VRAM.
+7. **Bench interpretation**: wall time in a 256×128 harness understates fill cost; the demo
+   scene at window size is the second data point; both are reported together.
+8. **`mesh_locals` reuse of `reserved`**: byte layout pinned by `mesh_locals_follow_the_wgsl_layout`
+   and `the_mesh_shader_validates_and_matches_the_locals_size`.
+
+Manager decision: D1–D9 accepted as recommended (additive coverage union; `Mask::Regions`; layer-level builders apply to every entry; glow blended composite for multi-entry layers; state per entry keyed `id.with(index)`; offline multi-entry refuses tiling; wall-time bench; wgpu Stacked via hand-off; R3a then R3b with a temporary once-logged glow refusal in between).
