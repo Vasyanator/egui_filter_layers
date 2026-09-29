@@ -65,9 +65,8 @@ adheres to [Semantic Versioning](https://semver.org/).
   `shape_ref`), up to `MAX_REGIONS` (255, `MaskError::TooManyRegions`): the union of the regions
   is the mask and every pass reads the owning region's id with the prelude's `region()` /
   `region_at(uv)` (`REGION_NONE` = 255 outside the regions; also `REGION_NONE` in Rust); later
-  regions win where they overlap; `Effect::reads_regions`. Runs on the wgpu backend; the glow
-  backend skips region-masked layers (logged once) and offline runs refuse them
-  (`OfflineError::InvalidOption`) in this build.
+  regions win where they overlap; `Effect::reads_regions`. Runs on the wgpu and glow
+  backends and offline (`OfflineOptions::with_mask`, tiled runs included).
 - Feature `hot-reload` (native only, no extra dependencies): `HotEffect` (`watch`,
   `watch_with` + `HotOptions`, `poll` -> `HotReloadEvent`, `current`, `error`, `status_text`)
   recompiles a WGSL file off the GUI thread and keeps the last good effect while the file is
@@ -102,6 +101,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   `TextureTooLarge`); it is `#[non_exhaustive]`, so exhaustive matches were already impossible.
 - `ShaderLayer::corner_radius` and `OfflineOptions::with_corner_radius` are shorthands for
   `Mask::RoundedRect`; a later `mask(...)` replaces them (and vice versa).
+- A shape or region mask's coverage from 254/255 up is treated as full (was: within 1/1024):
+  two pieces sharing an edge through pixel centres store their half feathers rounded separately
+  in the 8-bit coverage, and on `*Srgb` targets that one-step shortfall showed as a visible seam.
 - The crate-private `fl` uniform block grew from 352 to 448 bytes; its documented members keep
   their meaning (undocumented `internal_*` members changed). `presets::gaussian_blur` and
   `presets::ripple` step by `fl.texel` (bit-identical output at full resolution).

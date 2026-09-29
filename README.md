@@ -26,8 +26,8 @@ blur, colour adjustments, refraction, or your own WGSL shader.
 - User textures: attach up to three egui textures (noise, normal maps, LUTs) to a layer.
 - Masks: the rect, a rounded rect, or any egui shape (paths, circles, meshes, text), anti-aliased.
 - Regions: split one layer into up to 255 areas that share one capture and one chain run; every
-  pass knows which area a pixel is in (`region()`) and can use per-area parameters (wgpu UI in
-  this build; glow and offline refuse region masks for now).
+  pass knows which area a pixel is in (`region()`) and can use per-area parameters (wgpu and glow UI,
+  and offline).
 - Offline processing of images and video with the same chains (features `image` / `video`).
 - View-only: never touches egui textures or your data.
 - One shader language on every backend (WGSL, translated to GLSL for OpenGL).

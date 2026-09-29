@@ -12,7 +12,8 @@ Key structures:
 Key functions:
 - `glsl_target()`: picks the dialect for a GL version, or explains why the context is unsupported.
 - `translate()`: naga `glsl-out` for both entry points + reflection lookup.
-- `translate_mesh()`: the shape-mask coverage rasterizer's program (`shaders/mesh.wgsl`, F9).
+- `translate_mesh()`: the mask rasterizer's programs (`shaders/mesh.wgsl`): `fs_main` for the
+  shape-mask coverage (F9), `fs_region` for the region-id passes (R1).
 
 Notes:
 Writer flags are EMPTY on purpose: `ADJUST_COORDINATE_SPACE` (naga's default) would flip clip-space
@@ -174,8 +175,8 @@ pub(crate) fn translate(compiled: &CompiledModule, target: GlslTarget) -> Result
     Ok(GlslProgram { vertex, fragment, uniform_block, params_block, samplers })
 }
 
-/// The mesh program (`shaders/mesh.wgsl`, `vs_main` + `fs_main`) that rasterizes shape-mask
-/// coverage (F9), translated like an effect.
+/// A mesh program (`shaders/mesh.wgsl`, `vs_main` + one fragment entry) of the mask rasterizer:
+/// `fs_main` rasterizes shape-mask coverage (F9), `fs_region` region ids (R1).
 #[derive(Clone, Debug)]
 pub(crate) struct MeshProgram {
     /// Vertex shader source (attributes at locations 0 = pos, 1 = uv, 2 = packed colour `uint`).
@@ -189,19 +190,38 @@ pub(crate) struct MeshProgram {
     pub samplers: Vec<(String, u32)>,
 }
 
-/// Translates `shaders/mesh.wgsl` (the vertex stage and the gamma fragment entry `fs_main`) to
-/// `target` GLSL: the coverage rasterizer's program on glow. The module is parsed and validated
-/// here (once per `Resources` creation).
+/// The fragment entry of `shaders/mesh.wgsl` a mask-rasterizer program uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MeshEntry {
+    /// `fs_main`: the gamma colour (its alpha is the shape-mask coverage, F9).
+    Coverage,
+    /// `fs_region`: the region id where the coverage exceeds the locals' threshold (R1).
+    Region,
+}
+
+impl MeshEntry {
+    /// The WGSL entry-point name.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Coverage => "fs_main",
+            Self::Region => "fs_region",
+        }
+    }
+}
+
+/// Translates `shaders/mesh.wgsl` (the vertex stage and the fragment entry `entry`) to `target`
+/// GLSL: a mask rasterizer's program on glow. The module is parsed and validated here (once per
+/// program creation).
 ///
 /// # Errors
 /// [`TranslateError`] when the crate's mesh shader does not parse, validate or translate (a
 /// crate bug, pinned by `the_mesh_shader_translates_for_every_target`).
-pub(crate) fn translate_mesh(target: GlslTarget) -> Result<MeshProgram, TranslateError> {
+pub(crate) fn translate_mesh(target: GlslTarget, entry: MeshEntry) -> Result<MeshProgram, TranslateError> {
     let source = crate::mask::MESH_WGSL;
     let module = naga::front::wgsl::parse_str(source).map_err(|error| TranslateError { stage: "vertex", message: error.emit_to_string(source) })?;
     let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty()).validate(&module).map_err(|error| TranslateError { stage: "vertex", message: error.to_string() })?;
     let (vertex, vertex_reflection) = write_stage(&module, &info, target, naga::ShaderStage::Vertex, "vs_main")?;
-    let (fragment, fragment_reflection) = write_stage(&module, &info, target, naga::ShaderStage::Fragment, "fs_main")?;
+    let (fragment, fragment_reflection) = write_stage(&module, &info, target, naga::ShaderStage::Fragment, entry.name())?;
     let locals_blocks = vertex_reflection.uniforms.values().chain(fragment_reflection.uniforms.values()).cloned().collect();
     // The mesh module has exactly one texture (group 1, binding 0) read through one sampler.
     let samplers = fragment_reflection.texture_mapping.keys().map(|name| (name.clone(), 0)).collect();
@@ -394,14 +414,17 @@ mod tests {
         assert!(translate(effect.module(), GlslTarget::Desktop330).is_err_and(|error| error.message.contains("multiple samplers")));
     }
 
-    /// F9 (roadmap risk 3): naga's GLSL writer translates the mesh shader for every dialect —
-    /// three vertex attributes with explicit locations (the `u32` colour as an integer
-    /// attribute), one uniform block per stage, one combined sampler.
+    /// F9 (roadmap risk 3) and R1: naga's GLSL writer translates the mesh shader with either
+    /// fragment entry (`fs_main` coverage, `fs_region` ids) for every dialect — three vertex
+    /// attributes with explicit locations (the `u32` colour as an integer attribute), one uniform
+    /// block per stage, one combined sampler.
     #[test]
     fn the_mesh_shader_translates_for_every_target() {
-        for target in TARGETS {
-            let program = translate_mesh(target);
-            let Ok(program) = program else { panic!("{target:?}: {program:?}") };
+        for (target, entry) in TARGETS.into_iter().flat_map(|target| [(target, MeshEntry::Coverage), (target, MeshEntry::Region)]) {
+            let program = translate_mesh(target, entry);
+            let Ok(program) = program else { panic!("{target:?} {entry:?}: {program:?}") };
+            // The region entry reads the id and the threshold (and discards below it).
+            assert_eq!(program.fragment.contains("discard"), entry == MeshEntry::Region, "{target:?} {entry:?}\n{}", program.fragment);
             for location in 0..3 {
                 assert!(program.vertex.contains(&format!("layout(location = {location}) in")), "{target:?}: attribute {location}\n{}", program.vertex);
             }

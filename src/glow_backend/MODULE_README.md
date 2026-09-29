@@ -15,8 +15,9 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
    the layer for non-normalized formats; multisampled -> resolve with identical rects into a
    renderbuffer of the SAME internal format, then blit the padded capture rect into the RGBA8
    capture texture;
-5. plan the run (`plan::plan`, whole capture, `with_coverage` for a shape mask whose meshes are
-   then rasterized into the coverage target by `coverage.rs` before the passes; a stateful layer's `GlowState::states` entry, looked
+5. plan the run (`plan::plan`, whole capture, `with_regions(count)` for a mask — `count` = 0 for a
+   shape mask, i.e. `with_coverage` — whose meshes are then rasterized into the coverage target
+   and, for a region mask, into the region-id target by `coverage.rs` before the passes; a stateful layer's `GlowState::states` entry, looked
    up after evicting unpainted ones, where the job's reset ticket is claimed (`LayerJob::claim_reset`),
    feeds its state input), grow its state targets keeping their
    content (`RenderTarget::ensure_kept`: new texture + blit) and clear the one the plan names,
@@ -35,17 +36,19 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   the paint callback resolves the layer's user textures through `egui_glow::Painter::texture`
   (an unknown id skips the layer: `GlowState::fail_texture`, `failed_textures()`).
 - `glsl.rs`: pure WGSL->GLSL translation (naga `glsl-out`, empty writer flags; also
-  `translate_mesh`, the coverage rasterizer's program, whose `MeshLocals` block naga names per
-  stage, so both names are bound), dialect choice,
+  `translate_mesh(target, MeshEntry)`, the mask rasterizer's programs — `fs_main` coverage,
+  `fs_region` region ids — whose `MeshLocals` block naga names per stage, so both names are
+  bound), dialect choice,
   the reflected `fl` and named-parameter block names (by `@binding` 0 / 4), and the texture-unit table of the prelude's layout (`GROUP0_TEXTURE_BINDINGS`,
   `USER_UNIT_BASE`).
 - `resources.rs`: `GlError`, `RenderTarget` (incl. `ensure_kept` / `clear` for state targets),
   `ParamsBuffer` (grow-only params UBO), `Resources`
   (incl. dummy textures), `build_program` (all GL object code).
 - `render.rs`: the per-layer GL sequence and state restoration.
-- `coverage.rs`: shape-mask coverage (F9): the mesh program (`shaders/mesh.wgsl` via
-  `glsl::translate_mesh`), its VAO (float pos / uv, INTEGER colour attribute), VBO / EBO / locals
-  UBO and the RGBA8 coverage target; created with the first shape-masked layer, a failure latches.
+- `coverage.rs`: the mask rasterizer: shape-mask coverage (F9) and region ids (R1). Two mesh
+  programs (`shaders/mesh.wgsl` via `glsl::translate_mesh`), their shared VAO (float pos / uv,
+  INTEGER colour attribute), VBO / EBO / locals UBO, the RGBA8 coverage target and the RGBA8
+  region-id target; created with the first masked layer, a failure latches.
 
 ## Contracts and invariants
 - All GL calls happen with the context current (inside the callback or in `on_exit`).
@@ -72,9 +75,14 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   `texelFetch` for `state_load`); an entry is updated only by a clean run (`LayerOutcome::Done`),
   any other outcome forgets its content. Evicted / replaced targets are freed in the paint
   callback; `destroy_glow` frees all.
-- Region masks (R1) are refused in `paint_layer` on the GUI thread (`Unsupported::RegionMasks`,
-  logged once; the layer draws nothing extra) until glow rasterizes region ids (roadmap §19
-  phase R1b); unit 4 always gets the white dummy (`REGION_NONE`) meanwhile.
+- Region masks (R1): after the additive coverage draw, the region-id target (the window at its
+  origin, like the coverage) is cleared to id 255 (`REGION_NONE`) and every region's draw range is
+  drawn with `fs_region`, blending disabled, twice (`plan::REGION_PASS_THRESHOLDS`, pass A then B,
+  regions in id order, `plan::region_locals` re-uploaded per region) — the same sequence as
+  wgpu's `coverage.rs`, so the later region owns a pixel. The plan binds it on unit 4 for every
+  PASS step (`target_of(Slot::RegionId)`, `allocations().region`); the composite and layers
+  without regions get the white dummy (`REGION_NONE`). A packed mask that does not match its plan
+  (`CoverageResources::fits`) latches (crate bug).
 - Backend-wide failures (resource creation, unexplained capture / composite GL error) latch
   `GlowState::failure`; per-effect failures (translation, compile/link, a GL error of that
   effect's draw — attributed directly for single-effect chains, else by per-pass checks on later
@@ -94,11 +102,13 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   windowless EGL device context into a plain / 4x MSAA FBO and checks read-back pixels
   (invert, lossless identity, rounded mask, multi-pass chains, zoom, alpha, per-effect failure,
   named parameters per pass, `original()` in later passes, pointer / frame counters, scaled
-  passes, user textures: exact / nearest / linear, updates, three slots, unknown / freed ids).
+  passes, user textures: exact / nearest / linear, updates, three slots, unknown / freed ids,
+  shape masks, regions: grid without seam / fringe incl. 4x MSAA, `REGION_NONE`, later-wins overlap).
   Extend it with every change to this backend; the demo example needs a display and is no test.
 
 ## Editing map
 - GLSL dialect or translation issues: `glsl.rs`.
+- Mask coverage / region-id rasterization: `coverage.rs` (what the step does: `plan::CoverageStep`).
 - New GL object or format, resolve format mapping (`ReadFormat::resolve_format`): `resources.rs`.
 - Capture / pass / composite order or state handling: `render.rs` (what each draw binds:
   `src/plan.rs`).

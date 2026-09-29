@@ -35,7 +35,7 @@ Coverage is the ALPHA of the tessellated shape (vertex colour alpha x texture al
 its meshes and capped at 1 (the backends' additive union): paint the mask opaque for a
 full-strength filter; a translucent fill filters partially; abutting pieces leave no seam.
 Regions: the union of all regions is the coverage; the region-id texture gives each pixel the id
-of the LAST region (list order) covering it by more than half, else of the last one touching it
+of the LAST region (list order) covering it by about half or more (`plan::REGION_PASS_B_THRESHOLD`), else of the last one touching it
 at all (so no pixel of the mask's antialiased edge is left without an id). The feathered edge
 of egui's tessellator is the anti-aliasing. The tessellation uses the given pixels per point
 (the context's in the UI) WITHOUT egui's pre-rasterized discs, so solid shapes never sample the
@@ -287,8 +287,9 @@ impl JobMask {
         }
     }
 
-    /// The regions of a region mask (`None` otherwise).
-    #[cfg_attr(not(feature = "glow"), allow(dead_code))] // glow refuses region masks by this (until it runs them).
+    /// The regions of a region mask (`None` otherwise). Backends go through [`JobMask::pack`];
+    /// this accessor exists for the tessellation tests.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn regions(&self) -> Option<&RegionMeshes> {
         match self {

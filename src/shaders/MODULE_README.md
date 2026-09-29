@@ -27,7 +27,8 @@ WGSL sources compiled into the crate with `include_str!` (by `effect.rs`).
   a shape mask, whose coverage is the alpha of binding 6 mapped by `internal_cover_*`).
   In frag mode 0 the viewport is that region and the local uv maps through params[2]; in frag
   mode 1 `frag_uv` already is the capture uv. Helpers: `fl_composite_uv`, `fl_coverage` (snaps
-  within 1/1024 of 0 / 1 to exactly 0 / 1), `fl_coverage_or_discard`. `effect.rs` appends one
+  within 1/1024 of 0 / 1 to exactly 0 / 1; the coverage TEXTURE from 1 - 1.5/255 up to 1, so the
+  8-bit sum of two half feathers on a shared mid-pixel edge is full coverage on every backend), `fl_coverage_or_discard`. `effect.rs` appends one
   `effect` wrapper: the REPLACE composite `fl_composite` (gamma output, or `to_linear` for `*Srgb`
   targets; glow, offline), or one of the two draws of the BLENDED composite the wgpu UI uses
   (erase: `(0, 0, 0, coverage)`; add: `coverage * filtered`, linearised on `*Srgb`; both discard

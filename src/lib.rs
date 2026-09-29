@@ -294,8 +294,7 @@ module names a backend type.
 //! regions overlap the LATER one wins, and the boundary between two regions is pixel-hard (a soft
 //! transition between two parameter sets needs two layers). One capture and one chain run serve
 //! every region, which is what makes many small areas cheaper than many layers. Regions run on the
-//! wgpu backend; the glow backend skips region-masked layers (logged once) and offline runs refuse
-//! them (`OfflineError::InvalidOption`) for now.
+//! wgpu and glow backends; offline runs refuse them (`OfflineError::InvalidOption`) for now.
 //!
 //! ```no_run
 //! # fn frame(ui: &mut egui::Ui, rect: egui::Rect) -> Result<(), Box<dyn std::error::Error>> {

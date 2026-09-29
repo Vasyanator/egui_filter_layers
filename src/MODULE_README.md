@@ -188,10 +188,9 @@ user code ──► ShaderLayer::paint (layer.rs)
 - Regions (R1, `Mask::Regions` / `ShaderLayer::regions`, at most `MAX_REGIONS` = 255): the union
   of the regions is the coverage (F9 path); `plan::ChainPlan::with_regions` adds two id passes
   after the coverage draw into `Slot::RegionId` (window at the texture origin, cleared to 255,
-  no blend: pass A threshold 0 = every touched pixel, pass B threshold 0.5; later regions win),
+  no blend: pass A threshold 0 = every touched pixel, pass B threshold `0.5 - 1/128` (a shared mid-pixel edge goes to the later region whatever the window); later regions win),
   bound at binding 7 of every PASS step and read by the prelude's `region()` / `region_at(uv)`.
-  Per-region values are F4 arrays indexed by the id. Runs on wgpu (UI); glow refuses region masks
-  (logged once) until phase R1b, offline refuses them (`OfflineError::InvalidOption`) until R1c.
+  Per-region values are F4 arrays indexed by the id. Runs on wgpu (UI), glow and offline (the same `wgpu_backend/coverage.rs` rasterizer per tile window).
 - Chain padding is the SUM of pass sample radii; a preset whose passes reach along different axes
   (separable blur) declares its reach on one pass only.
 - Backend-specific public API lives in its module behind its feature; core never names backend types.

@@ -19,13 +19,13 @@ Key functions:
 Notes:
 Submodules: `glsl` (pure WGSL->GLSL translation), `resources` (GL objects), `render` (one layer
 per paint callback), `coverage` (shape-mask rasterizer, F9; a shape mask is packed on the GUI
-thread in `paint_layer`, its textures resolved in the callback like user textures). Failure policy: a resource failure or an unexplained capture / composite GL
+thread in `paint_layer` — a region mask with each region's draw range, R1 — its textures resolved
+in the callback like user textures). Failure policy: a resource failure or an unexplained capture / composite GL
 error latches the WHOLE backend (logged once at error level, reported by `status()`); a
 per-effect failure (GLSL translation, driver compile/link, or a GL error raised by that effect's
 draw) latches only that effect (layers using it are skipped, reported by `failed_effects()`); a
 framebuffer whose colour format cannot be captured skips only the layers painted into it (logged
-once per format). A region mask (R1) is refused on the GUI thread (`Unsupported`, logged once;
-temporary until glow rasterizes region ids). An attached user texture `egui_glow::Painter::texture` does not know (freed,
+once per format). An attached user texture `egui_glow::Painter::texture` does not know (freed,
 foreign) skips the layers attaching it (logged once per id, reported by `failed_textures()`);
 egui_glow applies a frame's texture deltas before painting and frees after, so a live id always
 resolves to its current texture. Nothing is retried per frame. Re-installing on the same context frees the
@@ -92,30 +92,8 @@ pub(crate) struct GlowState {
     states: StateRegistry<StateTargets>,
     /// State formats this context cannot render / filter, latched per format.
     failed_states: HashMap<StateFormat, StateFailure>,
-    /// Layer features refused on this backend, latched so each is logged once.
-    refused: HashSet<Unsupported>,
     /// Set by `destroy_glow`; a late callback must not recreate resources.
     destroyed: bool,
-}
-
-/// A layer feature the glow backend refuses (the layer draws nothing extra; logged once).
-///
-/// TEMPORARY (AGENTS.md §14): region masks run on wgpu since roadmap §19 phase R1a; glow gains
-/// the region-id rasterizer in phase R1b of the same release, which removes this refusal (and
-/// this type if nothing else is refused by then).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Unsupported {
-    /// A [`crate::Mask::Regions`] mask: glow does not rasterize region ids yet. Running it would
-    /// give every pixel `REGION_NONE`, a silent wrong answer.
-    RegionMasks,
-}
-
-impl std::fmt::Display for Unsupported {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::RegionMasks => f.write_str("region masks (Mask::Regions) are not supported by the glow backend yet"),
-        }
-    }
 }
 
 impl GlowState {
@@ -185,17 +163,6 @@ impl GlowState {
              Possible cause: the TextureHandle was dropped (egui freed the texture) while the layer still attaches its id."
         );
         self.failed_textures.insert(id, TextureFailure { id, error });
-    }
-
-    /// Records that layers using `feature` are refused on this backend (logged once per feature).
-    fn refuse(&mut self, feature: Unsupported) {
-        if self.refused.insert(feature) {
-            log::error!(
-                "egui_shader_layers (glow): a shader layer was skipped (it draws nothing extra).\n\
-                 Error: {feature}\n\
-                 Fix: use the wgpu backend for this layer, or a shape mask. Logged once per feature."
-            );
-        }
     }
 
     /// Records that stateful layers asking for `format` are refused and logs it once per format.
@@ -341,19 +308,15 @@ impl Backend for GlowBackend {
         let Ok(target) = self.target.clone() else {
             return;
         };
-        if job.mask.regions().is_some() {
-            self.lock().refuse(Unsupported::RegionMasks);
-            return;
-        }
         let state = Arc::clone(&self.state);
         let rect = job.rect;
-        // A shape mask (F9) is packed once here, on the GUI thread; the callback only resolves
-        // the textures its draws sample.
-        let packed = job.mask.pack().map(|packed| packed.packed);
+        // A shape or region mask (F9 / R1) is packed once here, on the GUI thread; the callback
+        // only resolves the textures its draws sample.
+        let packed = job.mask.pack();
         let callback = egui_glow::CallbackFn::new(move |info, glow_painter| {
             let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
-            let mut mask_textures = Vec::with_capacity(packed.as_ref().map_or(0, |packed| packed.draws.len()));
-            for draw in packed.iter().flat_map(|packed| &packed.draws) {
+            let mut mask_textures = Vec::with_capacity(packed.as_ref().map_or(0, |packed| packed.packed.draws.len()));
+            for draw in packed.iter().flat_map(|packed| &packed.packed.draws) {
                 let Some(texture) = glow_painter.texture(draw.texture) else {
                     state.fail_texture(draw.texture);
                     return;

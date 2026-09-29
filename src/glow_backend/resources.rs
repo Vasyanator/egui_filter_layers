@@ -272,10 +272,20 @@ impl RenderTarget {
     /// # Safety
     /// `gl` must be current on this thread with scissoring disabled; the target was created on it.
     pub unsafe fn clear(&self, gl: &glow::Context) {
+        // SAFETY: forwarded contract.
+        unsafe { self.clear_to(gl, [0.0; 4]) };
+    }
+
+    /// Clears the whole target to `rgba` (e.g. the region-id target to id 255 = `REGION_NONE`).
+    /// Same effects and contract as [`RenderTarget::clear`].
+    ///
+    /// # Safety
+    /// As [`RenderTarget::clear`].
+    pub unsafe fn clear_to(&self, gl: &glow::Context, rgba: [f32; 4]) {
         // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); the framebuffer is this target's own.
         unsafe {
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.framebuffer));
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear_color(rgba[0], rgba[1], rgba[2], rgba[3]);
             gl.clear(glow::COLOR_BUFFER_BIT);
         }
     }

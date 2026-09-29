@@ -10,6 +10,7 @@ Key structures:
 - SceneEntry / SCENES: the registry (command-line key, title, constructor), in selector order.
 - SceneInit: what a constructor gets; SceneFrame: what a scene gets every frame.
 - DragRect: a filter rect the user moves by dragging and resizes from its corner.
+- FrameTimer: an averaged frame-time readout (egui `unstable_dt` over a window of frames).
 
 Key functions:
 - find(): registry lookup by key; record_rect(): the closed recording path.
@@ -20,6 +21,7 @@ The scene module defines `pub const ENTRY: SceneEntry` and its `Scene` implement
 */
 
 mod bloom;
+mod grid;
 mod hot;
 mod mask;
 mod ripples;
@@ -28,13 +30,15 @@ mod textures;
 mod trails;
 mod water;
 
+use std::collections::VecDeque;
+
 use eframe::egui::{self, Color32, CornerRadius, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
 
 use crate::backdrop::Backdrop;
 use crate::stack::Entry;
 
 /// Every scene, in selector order; the first one is the default.
-pub const SCENES: &[SceneEntry] = &[stack::ENTRY, hot::ENTRY, ripples::ENTRY, water::ENTRY, trails::ENTRY, bloom::ENTRY, textures::ENTRY, mask::ENTRY];
+pub const SCENES: &[SceneEntry] = &[stack::ENTRY, hot::ENTRY, ripples::ENTRY, water::ENTRY, trails::ENTRY, bloom::ENTRY, textures::ENTRY, mask::ENTRY, grid::ENTRY];
 
 /// A registered scene: how to name it and how to build it.
 #[derive(Clone, Copy, Debug)]
@@ -138,4 +142,42 @@ pub fn record_rect(area: Rect, phase: f32) -> Rect {
     let turn = std::f32::consts::TAU * phase;
     let offset = terms.iter().fold(Vec2::ZERO, |sum, &(k, ax, px, ay, py)| sum + vec2(ax * (k * turn + px).sin(), ay * (k * turn + py).sin()));
     Rect::from_center_size(area.center() + offset, size)
+}
+
+/// An averaged frame-time readout: egui's `unstable_dt` (CPU + GPU wall time between frames,
+/// capped by vsync) over the last [`FrameTimer::WINDOW`] frames.
+#[derive(Debug, Default)]
+pub struct FrameTimer {
+    /// Recent frame durations in seconds, newest last; at most `WINDOW`.
+    times: VecDeque<f32>,
+}
+
+impl FrameTimer {
+    /// How many frames the average spans.
+    pub const WINDOW: usize = 60;
+
+    /// Records this frame's duration; call once per frame (from `Scene::ui`).
+    pub fn record(&mut self, ui: &egui::Ui) {
+        if self.times.len() == Self::WINDOW {
+            self.times.pop_front();
+        }
+        self.times.push_back(ui.input(|input| input.unstable_dt));
+    }
+
+    /// The average of the recorded frame times, in milliseconds (`None` before the first frame).
+    pub fn average_ms(&self) -> Option<f32> {
+        let count = self.times.len();
+        // `count` is at most WINDOW (60): exact as f32.
+        #[allow(clippy::cast_precision_loss)]
+        let count_f = count as f32;
+        (count > 0).then(|| self.times.iter().sum::<f32>() / count_f * 1000.0)
+    }
+
+    /// The readout as a side-panel label: average milliseconds, frames averaged and fps.
+    pub fn label(&self, ui: &mut egui::Ui) {
+        match self.average_ms() {
+            Some(ms) => ui.label(format!("frame time: {ms:.2} ms (avg of {} frames, {:.0} fps)", self.times.len(), 1000.0 / ms.max(0.001))),
+            None => ui.label("frame time: -"),
+        };
+    }
 }

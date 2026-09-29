@@ -25,14 +25,15 @@ processors. They are also the manual test bench for both backends.
     scalar / vector component, a colour picker for a `vec4` named `*color*` / `*colour*`, a grid
     for `mat4x4`, arrays collapsed.
   - `scenes/`: `mod.rs` (the `Scene` trait, `SceneEntry` registry `SCENES`, `SceneInit`,
-    `SceneFrame`, shared `DragRect` and `record_rect`) and one file per scene: `stack.rs`
+    `SceneFrame`, shared `DragRect`, `record_rect` and `FrameTimer`, the averaged frame-time
+    readout used by bloom and grid) and one file per scene: `stack.rs`
     (scene "stack": the preset stack on a draggable rect); `hot.rs` + `hot.wgsl` (scene "hot": a
     `HotEffect` watching `hot.wgsl`, whose path is fixed at compile time from
     `CARGO_MANIFEST_DIR`; an in-app editor saving the file from a worker thread, compile errors
     as an overlay on the layer and in the panel, named values kept across reloads by `rebind`);
     `bloom.rs` + `bloom_{bright,combine}.wgsl` (scene "bloom": own dark content; a custom bloom
-    with a scaled bright pass, `presets::bloom`, or Gaussian vs Kawase blur alone, with an averaged
-    frame-time readout); `textures.rs` + `tex_{displace,refract,lut}.wgsl` (scene "textures":
+    with a scaled bright pass, `presets::bloom`, or Gaussian vs Kawase blur alone, with the
+    `FrameTimer` readout); `textures.rs` + `tex_{displace,refract,lut}.wgsl` (scene "textures":
     noise, normal map and a 256x16 flattened 16^3 LUT generated at build and attached to slots
     0-2, one custom effect per slot; shows `check_textures` / `failed_textures`); `mask.rs` (scene
     "mask": star from overlapping convex kites, circle and a "GLASS" galley as `Mask::Shape`
@@ -43,7 +44,10 @@ processors. They are also the manual test bench for both backends.
     an `egui::Window` menu whose rect is a `WaveObstacle` every frame, a draggable rock obstacle
     painted after the layer, splashes, pointer wake, rain, `reset_state`); `trails.rs` (scene
     "trails": `presets::trails` on a `DragRect` over the moving circles, an orbiting comet and a
-    pointer brush).
+    pointer brush); `grid.rs` (scene "grid": the many-elements benchmark made visible — N pulsing,
+    individually tinted frosted tiles as N layers or one layer with N regions, tint by `region()`
+    with a per-layer `p.index` fallback so both modes run one chain; `GridMode` is the extension
+    point for the entry modes of phase R2b; `FrameTimer` + layers-per-frame readout).
 - `process_image.rs` (feature `image`): offline processing of an image file on a headless wgpu
   device (`OfflineRenderer::headless` + `process_file`) with a fixed stack incl. a custom effect;
   `--ppp`, `--time`, `--max-tile` map to `OfflineOptions`. JPEG output of translucent input relies
@@ -52,6 +56,13 @@ processors. They are also the manual test bench for both backends.
   programs (`FfmpegTranscode`) on a headless wgpu device with an animated stack (vignette + ripple,
   so `fl.time` follows the video); `--codec`, `--crf`, `--audio copy|drop|opus`, `--background`,
   `--ppp`; prints progress.
+
+## Benchmark (tests, not examples)
+`bench_many_elements` (`#[ignore]`, at the end of `tests/wgpu_headless.rs` and
+`tests/glow_headless.rs`) is the headless counterpart of the grid scene; its scene builder, timing
+loop and table live in `tests/common/mod.rs` (shared by both files). Run with
+`cargo test --release --all-features --test wgpu_headless bench_many_elements -- --ignored --nocapture`
+(same for `glow_headless`).
 
 ## Demo architecture
 - The app owns one `Option<Box<dyn Scene>>` per registry entry, built on first show (from the

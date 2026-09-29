@@ -19,8 +19,10 @@
 //! RGBA16F and RGBA8, reset, one step per frame for an id painted twice, growth keeping the state,
 //! a missing id refused).
 //! Shape masks (F9): circle (also 4x MSAA), monotonic AA edge, star, transformed and text masks;
-//! abutting mask pieces leave no seam. Regions (R1): refused on glow until phase R1b (the layer
-//! draws nothing extra, other layers are unaffected).
+//! abutting mask pieces leave no seam. Regions (R1, also 4x MSAA): a 2x2 grid of abutting
+//! regions tinted per `region()` fills its cells, switches tint within a pixel of every shared
+//! edge with full coverage there and no `REGION_NONE` fringe; overlapping regions: the later one
+//! wins; `region()` is `REGION_NONE` outside the regions and on a layer without regions.
 //!
 //! Linux only (EGL device platform, Mesa or a vendor EGL). Needs a GPU or Mesa's software
 //! device, so it is ignored by default: `cargo test --all-features --test glow_headless -- --ignored`.
@@ -1231,21 +1233,224 @@ fn abutting_mask_pieces_leave_no_seam() {
     }
 }
 
-/// R1 on glow before phase R1b: a region-masked layer is refused (it draws nothing extra, logged
-/// once), a plain layer in the same frame still filters and the backend stays active.
+// ---- R1: regions (the same scenes as `wgpu_headless.rs`) ----
+
+/// Paints `p.tint[region()]` (opaque), white where `region()` is `REGION_NONE`: a white tint in
+/// any covered pixel is a sentinel fringe.
+const REGION_TINT_WGSL: &str = "struct Params { tint: array<vec4<f32>, 4> }
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let r = region();
+    if r == REGION_NONE { return vec4<f32>(1.0); }
+    return p.tint[min(r, 3u)];
+}";
+
+/// The region tints by id: green, blue, cyan, magenta.
+const REGION_TINTS: [[u8; 3]; 4] = [[0, 255, 0], [0, 0, 255], [0, 255, 255], [255, 0, 255]];
+
+/// The tint pass of [`REGION_TINT_WGSL`] with [`REGION_TINTS`].
+fn region_tint_pass() -> Pass {
+    let mut tint = pass("region tint", REGION_TINT_WGSL);
+    let tints: Vec<[f32; 4]> = REGION_TINTS.iter().map(|tint| [f32::from(tint[0]) / 255.0, f32::from(tint[1]) / 255.0, f32::from(tint[2]) / 255.0, 1.0]).collect();
+    if let Err(error) = tint.set_slice("tint", &tints) {
+        panic!("{error}");
+    }
+    tint
+}
+
+/// A convex quad region `[x0, x1] x [y0, y1]` (points; a path, so half-pixel edges stay where
+/// they are instead of being rounded to pixels like a rect).
+fn quad_region(x0: f32, y0: f32, x1: f32, y1: f32) -> Region {
+    Region::shape(egui::Shape::convex_polygon(vec![pos2(x0, y0), pos2(x1, y0), pos2(x1, y1), pos2(x0, y1)], Color32::WHITE, egui::Stroke::NONE))
+}
+
+/// Red | blue halves and a layer over the red half split into a 2x2 grid of abutting regions,
+/// all edges at half pixels (x, y in {20.5, 60.5, 100.5}): ids 0 top-left, 1 top-right,
+/// 2 bottom-left, 3 bottom-right.
+fn region_grid_scene(painter: &egui::Painter, tint: &Pass) {
+    halves(painter);
+    let (a, b, c) = (20.5, 60.5, 100.5);
+    let cells = [quad_region(a, a, b, b), quad_region(b, a, c, b), quad_region(a, b, b, c), quad_region(b, b, c, c)];
+    ShaderLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), tint.clone()).regions(cells).paint(painter);
+}
+
+/// Each cell holds its tint; on a shared edge (mid-pixel: both feathers 0.5, coverage 1 by the
+/// additive union) the tint switches from one cell's to the LATER cell's within one pixel with no
+/// backdrop showing; the four-cell junction pixel belongs to the last cell; the outer
+/// antialiased edge mixes the backdrop with the cell's tint, never with the sentinel white.
+fn check_region_grid(pixels: &[u8], what: &str) {
+    for (x, y, id) in [(40, 40, 0), (80, 40, 1), (40, 80, 2), (80, 80, 3)] {
+        assert_near(pixels, x, y, REGION_TINTS[id], &format!("{what}: centre of region {id}"));
+    }
+    // Vertical shared edge at x = 60.5: column 60 is shared, the later (right) region owns it.
+    for (y, left, right) in [(40, 0, 1), (80, 2, 3)] {
+        for x in 55..=65 {
+            let expected = if x <= 59 { REGION_TINTS[left] } else { REGION_TINTS[right] };
+            assert_near(pixels, x, y, expected, &format!("{what}: vertical edge, row {y}"));
+        }
+    }
+    // Horizontal shared edge at y = 60.5: row 60 belongs to the later (lower) region.
+    for (x, top, bottom) in [(40, 0, 2), (80, 1, 3)] {
+        for y in 55..=65 {
+            let expected = if y <= 59 { REGION_TINTS[top] } else { REGION_TINTS[bottom] };
+            assert_near(pixels, x, y, expected, &format!("{what}: horizontal edge, column {x}"));
+        }
+    }
+    assert_near(pixels, 60, 60, REGION_TINTS[3], &format!("{what}: the junction pixel belongs to the last region"));
+    // Outer edges (partly covered): the backdrop red mixed with the cell's tint by the coverage
+    // `c`, i.e. `(255 (1 - c), 255 c, 0)` for green and `(255 (1 - c), 255 c, 255 c)` for cyan;
+    // the white sentinel would give `(255, 255 c, 255 c)`. Row 60 is where the two left cells'
+    // outer corners meet (the additive union covers it fully, roadmap §18 R1a).
+    for y in 25..=95 {
+        let [red, green, blue] = rgb(pixels, 20, y);
+        let consistent = if y <= 59 { blue <= 3 } else { green.abs_diff(blue) <= 3 };
+        assert!(consistent && (u16::from(red) + u16::from(green)).abs_diff(255) <= 6, "{what}: left outer edge (20, {y}) = {:?}: no sentinel fringe", [red, green, blue]);
+        assert!(green >= 100, "{what}: left outer edge (20, {y}) = {:?}: at least half covered", [red, green, blue]);
+        assert_near(pixels, 19, y, [255, 0, 0], &format!("{what}: left of the regions"));
+    }
+    for y in 25..=55 {
+        assert!(rgb(pixels, 100, y)[1] <= 3, "{what}: right outer edge (100, {y}) = {:?}: no sentinel fringe", rgb(pixels, 100, y));
+    }
+    assert_near(pixels, 105, 60, [255, 0, 0], &format!("{what}: inside the layer rect, outside every region"));
+}
+
+/// R1 on glow: abutting regions tint their own cells and own their edges (no seam, no halo, no
+/// sentinel fringe), also into a 4x multisampled framebuffer (the id passes run offscreen, so
+/// MSAA must not change them); a plain layer in the same frame still filters.
 #[test]
 #[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
-fn region_masks_are_refused_until_glow_runs_them() {
+fn regions_tint_each_cell_and_own_their_edges() {
+    let tint = region_tint_pass();
+    for samples in [0, 4] {
+        let mut harness = Harness::new(samples, [0.0, 0.0, 0.0, 1.0]);
+        let scene = |ui: &mut egui::Ui| {
+            region_grid_scene(ui.painter(), &tint);
+            ShaderLayer::new(Rect::from_min_max(pos2(150.0, 10.0), pos2(240.0, 100.0)), presets::invert(1.0)).paint(ui.painter());
+        };
+        harness.frame(&mut |ui| scene(ui));
+        let pixels = harness.frame(&mut |ui| scene(ui));
+        check_region_grid(&pixels, &format!("glow, {samples} samples"));
+        assert_near(&pixels, 190, 50, [255, 255, 0], &format!("glow, {samples} samples: the plain layer still inverts the blue half"));
+        assert_active(&harness.ctx);
+    }
+}
+
+/// Paints red where `region()` is `REGION_NONE`, green elsewhere.
+const REGION_NONE_WGSL: &str = "fn effect(uv: vec2<f32>) -> vec4<f32> { return select(vec4<f32>(0.0, 1.0, 0.0, 1.0), vec4<f32>(1.0, 0.0, 0.0, 1.0), region() == REGION_NONE); }";
+
+/// R1 on glow: a circle region over the blue half is green inside, the screen (blue) outside it,
+/// and its antialiased edge mixes blue and green only (no pixel inside the mask reads
+/// `REGION_NONE`); the same effect on a layer without regions is red everywhere (the dummy); an
+/// empty region list is a mask covering nothing.
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn region_none_outside_regions() {
+    let none = pass("region none", REGION_NONE_WGSL);
     let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let rect = Rect::from_min_max(pos2(140.0, 20.0), pos2(240.0, 100.0));
     let scene = |ui: &mut egui::Ui| {
         halves(ui.painter());
-        ShaderLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(100.0, 100.0)), presets::invert(1.0)).regions([Region::rounded_rect(Rect::from_min_max(pos2(20.0, 20.0), pos2(90.0, 90.0)), 0)]).paint(ui.painter());
-        ShaderLayer::new(Rect::from_min_max(pos2(150.0, 10.0), pos2(240.0, 100.0)), presets::invert(1.0)).paint(ui.painter());
+        ShaderLayer::new(rect, none.clone()).regions([Region::shape(egui::Shape::circle_filled(pos2(190.3, 60.3), 30.0, Color32::WHITE))]).paint(ui.painter());
     };
-    for _ in 0..2 {
-        let pixels = harness.frame(&mut |ui| scene(ui));
-        assert_near(&pixels, 50, 50, [255, 0, 0], "the region layer is refused: the backdrop stays");
-        assert_near(&pixels, 190, 50, [255, 255, 0], "the plain layer still inverts the blue half");
+    harness.frame(&mut |ui| scene(ui));
+    let pixels = harness.frame(&mut |ui| scene(ui));
+    assert_near(&pixels, 190, 60, [0, 255, 0], "circle centre");
+    assert_near(&pixels, 145, 25, [0, 0, 255], "layer corner outside the circle: masked out");
+    for y in 20..100 {
+        for x in 140..240 {
+            let [red, _, _] = rgb(&pixels, x, y);
+            assert!(red <= 3, "({x}, {y}) = {:?}: a covered pixel read REGION_NONE", rgb(&pixels, x, y));
+        }
     }
+    let row: Vec<[u8; 3]> = (190..=225).map(|x| rgb(&pixels, x, 60)).collect();
+    assert!(row.iter().any(|pixel| (8..248).contains(&pixel[1])), "an antialiased edge pixel: {row:?}");
+
+    let plain = |ui: &mut egui::Ui| {
+        halves(ui.painter());
+        ShaderLayer::new(rect, none.clone()).paint(ui.painter());
+    };
+    harness.frame(&mut |ui| plain(ui));
+    let pixels = harness.frame(&mut |ui| plain(ui));
+    for (x, y) in [(145, 25), (190, 60), (235, 95)] {
+        assert_near(&pixels, x, y, [255, 0, 0], "a layer without regions reads REGION_NONE everywhere");
+    }
+
+    let empty = |ui: &mut egui::Ui| {
+        halves(ui.painter());
+        ShaderLayer::new(rect, none.clone()).regions(Vec::new()).paint(ui.painter());
+    };
+    harness.frame(&mut |ui| empty(ui));
+    let pixels = harness.frame(&mut |ui| empty(ui));
+    for (x, y) in [(145, 25), (190, 60), (235, 95)] {
+        assert_near(&pixels, x, y, [0, 0, 255], "an empty region list covers nothing");
+    }
+    assert_active(&harness.ctx);
+}
+
+/// R1 on glow: where regions overlap, the LATER one owns the pixels: a small region after a big
+/// one keeps its own tint inside the big one; listed before it, it disappears into the big one.
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn overlapping_regions_later_wins() {
+    let tint = region_tint_pass();
+    let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let big = Region::rounded_rect(Rect::from_min_max(pos2(20.0, 20.0), pos2(100.0, 100.0)), 0);
+    let small = Region::rounded_rect(Rect::from_min_max(pos2(40.0, 40.0), pos2(80.0, 80.0)), 0);
+    for (regions, small_on_top) in [([big.clone(), small.clone()], true), ([small, big], false)] {
+        let what = if small_on_top { "small after big" } else { "small before big" };
+        let scene = |ui: &mut egui::Ui| {
+            halves(ui.painter());
+            ShaderLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), tint.clone()).regions(regions.clone()).paint(ui.painter());
+        };
+        harness.frame(&mut |ui| scene(ui));
+        let pixels = harness.frame(&mut |ui| scene(ui));
+        // The centre is id 1 either way: the small region on top, or the big one listed last.
+        assert_near(&pixels, 60, 60, REGION_TINTS[1], &format!("{what}: centre (id 1)"));
+        let corner = if small_on_top { REGION_TINTS[0] } else { REGION_TINTS[1] };
+        assert_near(&pixels, 30, 30, corner, &format!("{what}: the big region's corner"));
+        // Hard boundary at the small region's edge (x = 40) when it is on top.
+        if small_on_top {
+            assert_near(&pixels, 39, 60, REGION_TINTS[0], &format!("{what}: left of the small region"));
+            assert_near(&pixels, 40, 60, REGION_TINTS[1], &format!("{what}: first column of the small region"));
+        }
+    }
+    assert_active(&harness.ctx);
+}
+
+// ---- R2: benchmark (`tests/common/mod.rs` holds the scene builder shared with wgpu) ----
+
+mod common;
+
+/// R2 benchmark on glow: N glass tiles as N layers vs one layer with N regions, mean wall time per
+/// frame (egui + tessellation + GL + `glReadPixels`, which waits for the GPU). Run in release:
+/// `cargo test --release --all-features --test glow_headless bench_many_elements -- --ignored --nocapture`.
+/// Asserts only that every mode applied the glass (a timed frame that draws nothing is no data).
+#[test]
+#[ignore = "benchmark; needs an EGL device (GPU or Mesa); run with --ignored --nocapture"]
+fn bench_many_elements() {
+    use common::{BenchRow, ELEMENT_COUNTS, GridScene, Mode, glass_applied, print_table, time_per_frame};
+    let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let area = Rect::from_min_size(Pos2::ZERO, vec2(256.0, 128.0));
+    let backdrop_scene = GridScene::new(1, area);
+    let baseline = time_per_frame(|| {
+        harness.frame(&mut |ui| backdrop_scene.paint_backdrop(ui.painter()));
+    });
+    let backdrop = harness.frame(&mut |ui| backdrop_scene.paint_backdrop(ui.painter()));
+    let mut rows = vec![BenchRow { mode: None, count: 0, per_frame: baseline }];
+    for count in ELEMENT_COUNTS {
+        let scene = GridScene::new(count, area);
+        for mode in Mode::ALL {
+            let mut paint = |ui: &mut egui::Ui| {
+                scene.paint_backdrop(ui.painter());
+                scene.paint(ui.painter(), mode);
+            };
+            let pixels = harness.frame(&mut paint);
+            assert!(glass_applied(&backdrop, &pixels, WIDTH, scene.first_tile_centre()), "{} x {count}: the glass was not applied", mode.name());
+            let per_frame = time_per_frame(|| {
+                harness.frame(&mut paint);
+            });
+            rows.push(BenchRow { mode: Some(mode), count, per_frame });
+        }
+    }
+    print_table("glow", [WIDTH, HEIGHT], &rows);
     assert_active(&harness.ctx);
 }

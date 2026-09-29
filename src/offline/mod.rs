@@ -118,7 +118,7 @@ pub use texture::OfflineTexture;
 
 use crate::effect::{TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING};
 use crate::geometry::{LayerGeometry, MaskTransform, PxRect, layer_geometry, mask_transform, padding_px};
-use crate::mask::{Mask, PackedCoverage, tessellate};
+use crate::mask::{Mask, PackedRegions, tessellate, tessellate_regions};
 use crate::pass::{FilterChain, InputUniforms};
 use crate::plan::{StatePlan, StatePlanInput, check_textures};
 use crate::state::{StateError, StateFormat};
@@ -395,16 +395,19 @@ impl OfflineRenderer {
         }
         self.ensure_allocations(&plan).await?;
         self.ensure_user_textures(options).await?;
-        // A shape mask (F9), tessellated once per run like the UI does per paint: the frame is the
-        // layer (layer points = frame pixels / ppp, no transform) and the screen.
+        // A shape mask (F9) or a region mask (R1), tessellated once per run like the UI does per
+        // paint: the frame is the layer (layer points = frame pixels / ppp, no transform) and the
+        // screen. Regions keep their draw ranges, so every tile rasterizes the ids of its own window.
         let coverage = match &options.mask {
             Mask::RoundedRect(_) => None,
-            // `OfflineOptions::validate` refused it already; kept explicit so no run ever treats
-            // regions as a plain mask.
-            Mask::Regions(_) => return Err(options::regions_unsupported()),
             Mask::Shape(shape) => {
                 let frame_rect = frame_rect(size, options.pixels_per_point)?;
                 let meshes = tessellate(shape.clone(), frame_rect, options.pixels_per_point, TessellationOptions::default(), [1, 1]);
+                Some((PackedRegions { packed: meshes.pack(), regions: Vec::new() }, mask_transform(frame_rect, frame_rect, options.pixels_per_point, geometry.capture)))
+            }
+            Mask::Regions(regions) => {
+                let frame_rect = frame_rect(size, options.pixels_per_point)?;
+                let meshes = tessellate_regions(regions.clone(), frame_rect, options.pixels_per_point, TessellationOptions::default(), [1, 1]);
                 Some((meshes.pack(), mask_transform(frame_rect, frame_rect, options.pixels_per_point, geometry.capture)))
             }
         };
@@ -612,8 +615,7 @@ impl OfflineRenderer {
                 state: run.state,
                 // Untextured meshes only (`Mask::check_offline`): the white group stands in for
                 // egui's white atlas pixel.
-                // No region ranges: region masks are refused offline before any run.
-                coverage: run.coverage.map(|(packed, transform)| CoverageJob { packed, transform: *transform, textures: vec![resources.coverage().white_group(); packed.draws.len()], regions: &[] }),
+                coverage: run.coverage.map(|(packed, transform)| CoverageJob { packed: &packed.packed, transform: *transform, textures: vec![resources.coverage().white_group(); packed.packed.draws.len()], regions: &packed.regions }),
             };
             let recorded = resources.record(&mut ChainRecording { device, queue, encoder: &mut encoder }, &mut targets.chain, &job, state.as_mut());
             let Some((bind_group, planned_state)) = recorded else {
@@ -637,8 +639,8 @@ impl OfflineRenderer {
     }
 }
 
-/// What one tile's GPU run needs besides the renderer (a shape mask is tessellated and packed
-/// once per `run`, each tile rasterizes its own window of it).
+/// What one tile's GPU run needs besides the renderer (a shape or region mask is tessellated and
+/// packed once per `run`, each tile rasterizes its own window of it).
 struct TileRun<'a> {
     /// The tile.
     tile: Tile,
@@ -652,8 +654,9 @@ struct TileRun<'a> {
     input: InputUniforms,
     /// The renderer's state before this run (stateful chains, never tiled).
     state: Option<StatePlanInput>,
-    /// A shape mask's packed meshes and their layer-points -> frame-pixels transform.
-    coverage: Option<&'a (PackedCoverage, MaskTransform)>,
+    /// A shape or region mask's packed meshes (region draw ranges empty for a shape) and their
+    /// layer-points -> frame-pixels transform.
+    coverage: Option<&'a (PackedRegions, MaskTransform)>,
 }
 
 /// The layer geometry of a whole `size` frame: the layer rect covers the frame (in points at

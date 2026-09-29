@@ -77,9 +77,10 @@ frame stream needs (`video/` builds on exactly that).
   points with egui's default tessellation options, rasterized per tile window by the SAME
   `wgpu_backend/coverage.rs` path as the UI (untextured meshes bind its white group). UI and offline
   agree exactly where coverage is 0 or 1, within one step on the anti-aliased edge (UI blend vs
-  shader mix); tiled equals whole (tested). Region masks (`Mask::Regions`, R1) are refused before
-  any GPU work (`OfflineError::InvalidOption`, option `mask`) until offline runs them (roadmap §19
-  phase R1c).
+  shader mix); tiled equals whole (tested). Region masks (`Mask::Regions`, R1) run the same way:
+  `run` tessellates every region (`tessellate_regions`) and packs them with their draw ranges
+  (`PackedRegions`), and each tile's `CoverageJob` rasterizes the union and the region ids of its
+  own window; ids are identical tiled and whole (tested), `check_offline` visits every region.
 - Tiles overlap by the chain padding + 1 px; effects must read no further than their sample radius
   (the `lens` preset needs an explicit radius when tiled).
 - Every size is checked (`MAX_SIDE` = 2^24 - 1 per side, `usize` / `u32` / `u64` arithmetic);

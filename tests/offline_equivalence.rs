@@ -27,6 +27,9 @@
 //!   energy stays bounded over many frames.
 //! * Shape masks (F9): a star mask matches the UI (exact where coverage is 0 or 1, within one step
 //!   on the AA edge), tiled equals whole; text masks and textured meshes are refused.
+//! * Region masks (R1): a 2x2 grid of abutting regions plus an overlapping circle matches the UI
+//!   the same way; each cell's effect sees its own id, shared edges belong to the later region
+//!   and show no backdrop; tiled equals whole (ids identical, one step on the outer outline).
 //! * The GPU tests of this file share one device (`GPU`, a test-only static; see there) and run
 //!   in parallel on it.
 //!
@@ -1026,4 +1029,138 @@ fn a_path_mask_offline_equals_the_ui_and_text_masks_are_refused() {
     textured.add_rect_with_uv(Rect::from_min_max(pos2(0.0, 0.0), pos2(20.0, 20.0)), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
     let refused = offline.process(&frame, &FilterChain::from(presets::invert(1.0)), &OfflineOptions::default().with_mask(egui_shader_layers::Mask::Shape(egui::Shape::mesh(textured))));
     assert!(matches!(refused, Err(egui_shader_layers::OfflineError::Mask(egui_shader_layers::MaskError::TexturedMesh { .. }))), "{:?}", refused.map(|frame| frame.width()));
+}
+
+// ---- R1: region masks ----
+
+/// Mixes the frame half-and-half with `p.tint[region()]`, and paints opaque white where
+/// `region()` is `REGION_NONE` (a sentinel fringe inside the mask would show as white).
+const REGION_MIX_WGSL: &str = "struct Params { tint: array<vec4<f32>, 4> }
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let r = region();
+    if r == REGION_NONE { return vec4<f32>(1.0); }
+    return mix(src(uv), p.tint[min(r, 3u)], 0.5);
+}";
+
+/// The region tints by id: green, blue, cyan, magenta.
+const REGION_TINTS: [[f32; 4]; 4] = [[0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 1.0, 1.0], [1.0, 0.0, 1.0, 1.0]];
+
+/// [`REGION_MIX_WGSL`] with [`REGION_TINTS`], then an invert (a second pass reading the region
+/// ids too would change nothing: the ids are bound to every pass).
+fn region_chain() -> FilterChain {
+    let mut pass = Pass::new(&Effect::new("region mix", REGION_MIX_WGSL).unwrap_or_else(|error| panic!("{error}")));
+    if let Err(error) = pass.set_slice("tint", &REGION_TINTS) {
+        panic!("{error}");
+    }
+    FilterChain::from(pass).then(presets::invert(1.0))
+}
+
+/// A convex quad `[x0, x1] x [y0, y1]` in PIXELS, as a region in frame points at `ppp` (a path,
+/// so half-pixel edges stay where they are).
+fn pixel_quad(ppp: f32, [x0, y0, x1, y1]: [f32; 4]) -> egui_shader_layers::Region {
+    let at = |x: f32, y: f32| pos2(x / ppp, y / ppp);
+    egui_shader_layers::Region::shape(egui::Shape::convex_polygon(vec![at(x0, y0), at(x1, y0), at(x1, y1), at(x0, y1)], Color32::WHITE, egui::Stroke::NONE))
+}
+
+/// The region mask of the R1 tests at `ppp`: a 2x2 grid of abutting cells with all edges at half
+/// pixels (ids 0..=3), then a circle (id 4, tinted like id 3) overlapping cells 1 and 3, so it
+/// owns that overlap (later wins).
+fn region_mask(ppp: f32) -> egui_shader_layers::Mask {
+    let (x, y) = ([20.5, 96.5, 171.5], [20.5, 64.5, 107.5]);
+    let mut regions = vec![
+        pixel_quad(ppp, [x[0], y[0], x[1], y[1]]),
+        pixel_quad(ppp, [x[1], y[0], x[2], y[1]]),
+        pixel_quad(ppp, [x[0], y[1], x[1], y[2]]),
+        pixel_quad(ppp, [x[1], y[1], x[2], y[2]]),
+    ];
+    regions.push(egui_shader_layers::Region::shape(egui::Shape::circle_filled(pos2(150.3 / ppp, 64.3 / ppp), 24.0 / ppp, Color32::WHITE)));
+    egui_shader_layers::Mask::Regions(regions)
+}
+
+/// The 8-bit RGB of pixel `(x, y)` of an RGBA8 frame `WIDTH` wide.
+fn rgb_at(pixels: &[u8], x: u32, y: u32) -> [u8; 3] {
+    let i = usize::try_from((y * WIDTH + x) * 4).unwrap_or(0);
+    [pixels[i], pixels[i + 1], pixels[i + 2]]
+}
+
+/// R1c: a region mask offline equals the UI — exactly where the coverage is 0 or 1 (the same
+/// tessellation, the same coverage / id rasterizer, the same composite), within one step on the
+/// antialiased outline (the UI blends by coverage, offline mixes in the shader); inside a cell the
+/// effect sees that cell's id, outside the regions the frame is kept, and no covered pixel reads
+/// `REGION_NONE`.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn region_masks_offline_equal_the_ui() {
+    let image = test_image(WIDTH, HEIGHT, |_, _| 255);
+    let chain = region_chain();
+    for ppp in [1.0, 2.0] {
+        let ui = Ui::new(wgpu::TextureFormat::Rgba8Unorm, false, ppp, &image);
+        let mut offline = OfflineRenderer::from_render_state(&ui.state).unwrap_or_else(|error| panic!("{error}"));
+        let mask = region_mask(ppp);
+        let expected = ui.render_masked(&chain, &mask);
+        let options = OfflineOptions::default().with_pixels_per_point(ppp).with_time(TIME).with_mask(mask).with_output_alpha(AlphaMode::Premultiplied);
+        let result = offline.process(&FrameRef::new(&image, WIDTH, HEIGHT, AlphaMode::Straight), &chain, &options).unwrap_or_else(|error| panic!("{error}"));
+        let (count, max, first) = compare(&expected, result.pixels(), WIDTH, true);
+        eprintln!("region mask, ppp {ppp}: {count} differing values, max diff {max}, first at {first:?}");
+        assert!(max <= 1, "ppp {ppp}: max diff {max} ({count} values, first at {first:?})");
+        // Only the antialiased outline (the grid's border and the circle's outer arc) may differ.
+        assert!(count < 1200, "ppp {ppp}: {count} values differ");
+
+        // Inside each cell: 255 - (image + tint) / 2 (the mix, then the invert), within rounding.
+        let inverted_mix = |x: u32, y: u32, id: usize| {
+            let source = rgb_at(&image, x, y);
+            std::array::from_fn::<u8, 3, _>(|c| {
+                // Tints are 0 or 1 per channel; the mix of two 8-bit values halves their sum.
+                let tint: u16 = if REGION_TINTS[id][c] > 0.5 { 255 } else { 0 };
+                u8::try_from(255 - (u16::from(source[c]) + tint) / 2).unwrap_or(0)
+            })
+        };
+        for (x, y, id) in [(50, 40, 0), (120, 40, 1), (50, 90, 2), (110, 90, 3), (150, 64, 4)] {
+            let actual = rgb_at(result.pixels(), x, y);
+            let wanted = inverted_mix(x, y, id.min(3));
+            assert!(actual.iter().zip(wanted).all(|(a, w)| a.abs_diff(w) <= 1), "ppp {ppp}: region {id} at ({x}, {y}) = {actual:?}, expected {wanted:?}");
+        }
+        // Shared edges (mid-pixel, coverage 1 by the additive union): the later cell owns the
+        // shared column / row, and no backdrop shows (the value is a full mix of that cell).
+        for (x, y, id) in [(95, 40, 0), (96, 40, 1), (50, 63, 0), (50, 64, 2)] {
+            let actual = rgb_at(result.pixels(), x, y);
+            let wanted = inverted_mix(x, y, id);
+            assert!(actual.iter().zip(wanted).all(|(a, w)| a.abs_diff(w) <= 1), "ppp {ppp}: shared edge of region {id} at ({x}, {y}) = {actual:?}, expected {wanted:?}");
+        }
+        // Outside every region: the frame itself (a `REGION_NONE` fringe inside the mask would
+        // be black after the invert, which the checks above and the UI comparison exclude).
+        for (x, y) in [(5, 5), (180, 120), (10, 64)] {
+            assert_eq!(rgb_at(result.pixels(), x, y), rgb_at(&image, x, y), "ppp {ppp}: ({x}, {y}) is outside every region");
+        }
+    }
+}
+
+/// R1c: a region mask processed in tiles equals the whole-frame run: each tile rasterizes the
+/// coverage and the ids of its own window from the same meshes. The ids are identical per pixel
+/// (a flipped id would differ by ~127 here: the shared mid-pixel edges go to the later region
+/// whatever the window, `plan::REGION_PASS_B_THRESHOLD`); the only differences are one step on
+/// the outer outline where it runs through pixel centres (coverage 0.5 up to interpolation noise,
+/// which rounds to 127 or 128 in the 8-bit coverage depending on the window; as for F9 shape
+/// masks). An empty region list keeps the frame.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn tiled_region_masks_equal_whole() {
+    let image = test_image(WIDTH, HEIGHT, |_, _| 255);
+    let chain = region_chain();
+    let (_instance, adapter, device, queue) = gpu();
+    let mut offline = OfflineRenderer::new(&adapter, &device, &queue).unwrap_or_else(|error| panic!("{error}"));
+    let frame = FrameRef::new(&image, WIDTH, HEIGHT, AlphaMode::Straight);
+    for ppp in [1.0, 2.0] {
+        let options = OfflineOptions::default().with_pixels_per_point(ppp).with_time(TIME).with_mask(region_mask(ppp));
+        let whole = offline.process(&frame, &chain, &options).unwrap_or_else(|error| panic!("whole: {error}"));
+        for tile in [64, 48] {
+            let tiled = offline.process(&frame, &chain, &options.clone().with_max_tile_size(Some(tile))).unwrap_or_else(|error| panic!("tiled: {error}"));
+            let (count, max, first) = compare(whole.pixels(), tiled.pixels(), WIDTH, false);
+            eprintln!("region mask tiled ({tile}) vs whole, ppp {ppp}: {count} differing values, max diff {max}, first at {first:?}");
+            assert!(max <= 1 && count < 200, "ppp {ppp}, tile {tile}: {count} values, max {max}, first at {first:?}");
+        }
+    }
+    let empty = OfflineOptions::default().with_mask(egui_shader_layers::Mask::Regions(Vec::new()));
+    let kept = offline.process(&frame, &chain, &empty).unwrap_or_else(|error| panic!("empty: {error}"));
+    assert_eq!(kept.pixels(), image.as_slice(), "an empty region list covers nothing");
 }

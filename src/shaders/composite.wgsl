@@ -32,16 +32,26 @@ fn fl_composite_uv(frag_uv: vec2<f32>) -> vec2<f32> {
 // Mask coverage at capture uv `uv`, in [0, 1]: the rounded rect (1-px antialiased edge), or,
 // when params[3].x > 0.5 (a shape mask, F9), the alpha of the coverage texture (binding 6: the
 // rasterized shape, holding the run's window at its origin like the original, mapped by
-// `internal_cover_*`). Values within 1/1024 of 0 or 1 snap to exactly 0 or 1: a pixel-aligned
-// edge puts pixel centres at distance -0.5 only up to float error (`uv * size_px`), and an
-// almost-1 coverage would make the blended composite round differently from the filtered value
-// (1/1024 is under a quarter of an 8-bit step).
+// `internal_cover_*`). Values within 1/1024 of 0 snap to exactly 0, and values near 1 to exactly
+// 1: a pixel-aligned edge puts pixel centres at distance -0.5 only up to float error
+// (`uv * size_px`), and an almost-1 coverage would make the blended composite round differently
+// from the filtered value (1/1024 is under a quarter of an 8-bit step).
+// The coverage TEXTURE snaps to 1 from 1 - 1.5/255: it is the additive union of 8-bit pieces
+// (roadmap §19 D1), and two pieces sharing a mid-pixel edge each store their ~0.5 feather
+// rounded separately, so their sum may fall one 8-bit step short (254/255) where the true
+// coverage is 1. On gamma targets that is one step of backdrop; an `*Srgb` target blends in
+// linear and shows it as ~14 gamma steps over a bright backdrop. Two roundings lose at most
+// 1/255, so 1.5/255 catches exactly the stored 254 and never 253; the cost, a genuinely 99.6 %
+// covered outline pixel drawn fully filtered, is within the 8-bit storage's own error. One shader
+// for every backend (wgpu, glow, WebGL2; UI and offline), so no format capability is involved.
 fn fl_coverage(uv: vec2<f32>) -> f32 {
     let sdf = clamp(0.5 - fl_rounded_rect_distance(uv * fl.size_px, fl.params[0], fl.params[1]), 0.0, 1.0);
     let shape = textureSampleLevel(fl_coverage_texture, fl_sampler, fl_storage_uv(uv, fl.texel, fl.internal_cover_scale, fl.internal_cover_offset), 0.0).a;
-    let coverage = select(sdf, shape, fl.params[3].x > 0.5);
+    let from_texture = fl.params[3].x > 0.5;
+    let coverage = select(sdf, shape, from_texture);
     let snap = 1.0 / 1024.0;
-    return select(select(coverage, 1.0, coverage > 1.0 - snap), 0.0, coverage < snap);
+    let full = select(1.0 - snap, 1.0 - 1.5 / 255.0, from_texture);
+    return select(select(coverage, 1.0, coverage > full), 0.0, coverage < snap);
 }
 
 // Coverage, discarding fragments the mask does not cover at all: the blended (wgpu UI)

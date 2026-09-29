@@ -1329,29 +1329,10 @@ fn region_grid_scene(painter: &egui::Painter, pass: &Pass) {
     ShaderLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), pass.clone()).regions(cells).paint(painter);
 }
 
-/// Each cell holds its tint; on a shared edge (mid-pixel: both feathers 0.5, coverage 1 by the
-/// additive union) the tint switches from one cell's to the LATER cell's within one pixel with no
-/// backdrop showing; the four-cell junction pixel belongs to the last cell; the outer
-/// antialiased edge mixes the backdrop with the cell's tint, never with the sentinel white.
+/// [`check_region_cells`], and the outer antialiased edge mixes the backdrop with the cell's tint,
+/// never with the sentinel white (checked in gamma: only on a non-sRGB target).
 fn check_region_grid(pixels: &[u8], what: &str) {
-    for (x, y, id) in [(40, 40, 0), (80, 40, 1), (40, 80, 2), (80, 80, 3)] {
-        assert_near(pixels, x, y, REGION_TINTS[id], &format!("{what}: centre of region {id}"));
-    }
-    // Vertical shared edge at x = 60.5: column 60 is shared, the later (right) region owns it.
-    for (y, left, right) in [(40, 0, 1), (80, 2, 3)] {
-        for x in 55..=65 {
-            let expected = if x <= 59 { REGION_TINTS[left] } else { REGION_TINTS[right] };
-            assert_near(pixels, x, y, expected, &format!("{what}: vertical edge, row {y}"));
-        }
-    }
-    // Horizontal shared edge at y = 60.5: row 60 belongs to the later (lower) region.
-    for (x, top, bottom) in [(40, 0, 2), (80, 1, 3)] {
-        for y in 55..=65 {
-            let expected = if y <= 59 { REGION_TINTS[top] } else { REGION_TINTS[bottom] };
-            assert_near(pixels, x, y, expected, &format!("{what}: horizontal edge, column {x}"));
-        }
-    }
-    assert_near(pixels, 60, 60, REGION_TINTS[3], &format!("{what}: the junction pixel belongs to the last region"));
+    check_region_cells(pixels, what);
     // Outer edges (partly covered): the backdrop red mixed with the cell's tint by the coverage
     // `c`, i.e. `(255 (1 - c), 255 c, 0)` for green and `(255 (1 - c), 255 c, 255 c)` for cyan;
     // the white sentinel would give `(255, 255 c, 255 c)`. Row 60 is where the two left cells'
@@ -1370,6 +1351,31 @@ fn check_region_grid(pixels: &[u8], what: &str) {
     assert_near(pixels, 105, 60, [255, 0, 0], &format!("{what}: inside the layer rect, outside every region"));
 }
 
+/// Each cell holds its tint; on a shared edge (mid-pixel: both feathers 0.5, coverage 1 by the
+/// additive union and the composite's snap of the 8-bit sum) the tint switches from one cell's to
+/// the LATER cell's within one pixel with no backdrop showing, on gamma and sRGB targets alike;
+/// the four-cell junction pixel belongs to the last cell.
+fn check_region_cells(pixels: &[u8], what: &str) {
+    for (x, y, id) in [(40, 40, 0), (80, 40, 1), (40, 80, 2), (80, 80, 3)] {
+        assert_near(pixels, x, y, REGION_TINTS[id], &format!("{what}: centre of region {id}"));
+    }
+    // Vertical shared edge at x = 60.5: column 60 is shared, the later (right) region owns it.
+    for (y, left, right) in [(40, 0, 1), (80, 2, 3)] {
+        for x in 55..=65 {
+            let expected = if x <= 59 { REGION_TINTS[left] } else { REGION_TINTS[right] };
+            assert_near(pixels, x, y, expected, &format!("{what}: vertical edge, row {y}"));
+        }
+    }
+    // Horizontal shared edge at y = 60.5: row 60 belongs to the later (lower) region.
+    for (x, top, bottom) in [(40, 0, 2), (80, 1, 3)] {
+        for y in 55..=65 {
+            let expected = if y <= 59 { REGION_TINTS[top] } else { REGION_TINTS[bottom] };
+            assert_near(pixels, x, y, expected, &format!("{what}: horizontal edge, column {x}"));
+        }
+    }
+    assert_near(pixels, 60, 60, REGION_TINTS[3], &format!("{what}: the junction pixel belongs to the last region"));
+}
+
 /// R1 on wgpu: abutting regions tint their own cells and own their edges.
 #[test]
 #[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
@@ -1379,14 +1385,11 @@ fn regions_tint_each_cell_and_own_their_edges() {
         let (ctx, state, _texture, target) = setup(format);
         render_frame(&ctx, &state, &target, &mut |ui| region_grid_scene(ui.painter(), &pass));
         let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| region_grid_scene(ui.painter(), &pass));
-        // The sRGB target blends partly covered pixels in linear, which magnifies the 8-bit
-        // coverage quantization of a shared edge (two 0.5 feathers store 127/255 + 127/255 or so,
-        // a 1-step shortfall that shows as ~14 gamma steps of backdrop): only pixels one region
-        // covers fully are compared there.
+        // The sRGB target blends partly covered pixels in linear, so the outer edge is not
+        // checked there in gamma; the shared edges must show no backdrop on both (the composite
+        // snaps the 8-bit coverage sum of two half feathers, 254/255, to full coverage).
         if format.is_srgb() {
-            for (x, y, id) in [(40, 40, 0), (80, 40, 1), (59, 40, 0), (61, 40, 1), (40, 59, 0), (40, 61, 2), (80, 80, 3)] {
-                assert_near(&pixels, x, y, REGION_TINTS[id], &format!("{format:?}: region {id}"));
-            }
+            check_region_cells(&pixels, &format!("{format:?}"));
         } else {
             check_region_grid(&pixels, &format!("{format:?}"));
         }
@@ -1460,4 +1463,43 @@ fn overlapping_regions_later_wins() {
             assert_near(&pixels, 40, 60, REGION_TINTS[1], &format!("{what}: first column of the small region"));
         }
     }
+}
+
+// ---- R2: benchmark (`tests/common/mod.rs` holds the scene builder shared with glow) ----
+
+mod common;
+
+/// R2 benchmark on wgpu: N glass tiles as N layers vs one layer with N regions, mean wall time per
+/// frame (egui + tessellation + GPU + readback; `render_frame` waits for the GPU). Run in release:
+/// `cargo test --release --all-features --test wgpu_headless bench_many_elements -- --ignored --nocapture`.
+/// Asserts only that every mode applied the glass (a timed frame that draws nothing is no data).
+#[test]
+#[ignore = "benchmark; needs a GPU adapter; run with --ignored --nocapture"]
+fn bench_many_elements() {
+    use common::{BenchRow, ELEMENT_COUNTS, GridScene, Mode, glass_applied, print_table, time_per_frame};
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let area = Rect::from_min_size(Pos2::ZERO, vec2(256.0, 128.0));
+    let backdrop_scene = GridScene::new(1, area);
+    let baseline = time_per_frame(|| {
+        render_frame(&ctx, &state, &target, &mut |ui| backdrop_scene.paint_backdrop(ui.painter()));
+    });
+    let (backdrop, _) = render_frame(&ctx, &state, &target, &mut |ui| backdrop_scene.paint_backdrop(ui.painter()));
+    let mut rows = vec![BenchRow { mode: None, count: 0, per_frame: baseline }];
+    for count in ELEMENT_COUNTS {
+        let scene = GridScene::new(count, area);
+        for mode in Mode::ALL {
+            let mut paint = |ui: &mut egui::Ui| {
+                scene.paint_backdrop(ui.painter());
+                scene.paint(ui.painter(), mode);
+            };
+            let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+            assert!(glass_applied(&backdrop, &pixels, WIDTH, scene.first_tile_centre()), "{} x {count}: the glass was not applied", mode.name());
+            let per_frame = time_per_frame(|| {
+                render_frame(&ctx, &state, &target, &mut paint);
+            });
+            rows.push(BenchRow { mode: Some(mode), count, per_frame });
+        }
+    }
+    print_table(&format!("wgpu, {:?}", state.adapter.get_info().backend), [WIDTH, HEIGHT], &rows);
+    assert!(matches!(egui_shader_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_shader_layers::status(&ctx));
 }

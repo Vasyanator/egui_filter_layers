@@ -70,8 +70,10 @@ other draw binds the backend's white dummy. Windows (offline tiles) rasterize th
 Regions (R1): `ChainPlan::with_regions(count)` is `with_coverage` (the union of the regions is the
 coverage) plus two id passes over all regions in list order, run after the coverage draw into
 `Slot::RegionId` (cleared to id 255 = `REGION_NONE`, no blend): pass A (`alpha_threshold` 0)
-gives every pixel a region touches that region's id, pass B (threshold 0.5) every pixel a region
-covers by more than half; the later region wins either way. So no pixel of the mask's antialiased
+gives every pixel a region touches that region's id, pass B (threshold `0.5 - 1/128`) every pixel
+a region covers by about half or more; the later region wins either way (the margin makes a
+mid-pixel shared edge, where the later region's coverage is 0.5 up to float noise, go to the later
+region deterministically, independent of the window origin). So no pixel of the mask's antialiased
 edge keeps the sentinel, and interior boundaries sit at the later region's 50 % contour. Every
 PASS step binds the region texture (mapped like the coverage: the window in its own allocation,
 `internal_region_*`); the composite does not read it (the white dummy = `REGION_NONE`).
@@ -108,7 +110,6 @@ pub(crate) enum Slot {
     /// The region-id texture of a region mask (R1): the run's window at the texture origin,
     /// `.r * 255` = the id of the region owning the pixel (255 = none), written by the coverage
     /// step's id passes; read by every pass step.
-    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Region plans run on wgpu; glow runs them from roadmap §19 phase R1b.
     RegionId,
 }
 
@@ -266,13 +267,15 @@ pub(crate) struct CoverageStep {
 }
 
 /// The coverage threshold of region-id pass A: every pixel a region touches at all.
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Region plans run on wgpu; glow runs them from roadmap §19 phase R1b.
 pub(crate) const REGION_PASS_A_THRESHOLD: f32 = 0.0;
-/// The coverage threshold of region-id pass B: every pixel a region covers by more than half.
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Region plans run on wgpu; glow runs them from roadmap §19 phase R1b.
-pub(crate) const REGION_PASS_B_THRESHOLD: f32 = 0.5;
+/// The coverage threshold of region-id pass B: every pixel a region covers by about half or more.
+/// Just BELOW 0.5: on a shared edge through pixel centres both regions cover those pixels by 0.5
+/// up to interpolation noise, which differs with the window origin (offline tiles, a grown UI
+/// capture); with a threshold of exactly 0.5 the owner of such a pixel was decided by that noise.
+/// The 1/128 margin (a contour shift of < 0.01 px) exceeds the noise, so the later region owns
+/// the whole shared column / row, whatever the window.
+pub(crate) const REGION_PASS_B_THRESHOLD: f32 = 0.5 - 1.0 / 128.0;
 /// The id passes in execution order (their `alpha_threshold`s).
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Region plans run on wgpu; glow runs them from roadmap §19 phase R1b.
 pub(crate) const REGION_PASS_THRESHOLDS: [f32; 2] = [REGION_PASS_A_THRESHOLD, REGION_PASS_B_THRESHOLD];
 
 /// Every draw of one chain run, in execution order.
@@ -316,7 +319,6 @@ impl ChainPlan {
     /// whose coverage step also runs the id passes into [`Slot::RegionId`] (a texture of at least
     /// [`ChainPlan::target_px`], like the coverage), bound by every pass step (not the composite).
     /// `count == 0` is a plain shape mask (no id passes, no region binding).
-    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Region plans run on wgpu; glow runs them from roadmap §19 phase R1b.
     #[must_use]
     pub(crate) fn with_regions(self, count: u32) -> Self {
         let mut plan = self.with_coverage();
@@ -648,7 +650,6 @@ pub(crate) fn coverage_locals(transform: &MaskTransform, step: &CoverageStep) ->
 /// The `MeshLocals` block of region `region`'s draws in the id pass with `threshold`
 /// ([`REGION_PASS_THRESHOLDS`]): the coverage step's placement ([`coverage_locals`]) plus the id
 /// (`region`, exact in `f32`; `fs_region` writes `region / 255`) and the threshold, at bytes 24 / 28.
-#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Region plans run on wgpu; glow runs them from roadmap §19 phase R1b.
 #[must_use]
 pub(crate) fn region_locals(transform: &MaskTransform, step: &CoverageStep, region: u32, threshold: f32) -> [u8; MESH_LOCALS_SIZE] {
     let mut bytes = coverage_locals(transform, step);
@@ -1064,10 +1065,10 @@ mod tests {
         let step = CoverageStep { used_px: [48, 24], window_origin: [16, 8], regions: 3 };
         let bytes = region_locals(&transform, &step, 2, REGION_PASS_B_THRESHOLD);
         assert_eq!(bytes[..24], coverage_locals(&transform, &step)[..24]);
-        assert!((read(&bytes, 24) - 2.0).abs() < f32::EPSILON && (read(&bytes, 28) - 0.5).abs() < f32::EPSILON);
+        assert!((read(&bytes, 24) - 2.0).abs() < f32::EPSILON && (read(&bytes, 28) - REGION_PASS_B_THRESHOLD).abs() < f32::EPSILON);
         assert!(read(&region_locals(&transform, &step, 0, REGION_PASS_A_THRESHOLD), 28).abs() < f32::EPSILON);
         assert!((read(&region_locals(&transform, &step, 900, 0.0), 24) - 255.0).abs() < f32::EPSILON, "out-of-range ids saturate at the sentinel");
-        assert_eq!(REGION_PASS_THRESHOLDS.map(f32::to_bits), [0.0_f32, 0.5].map(f32::to_bits));
+        assert_eq!(REGION_PASS_THRESHOLDS.map(f32::to_bits), [0.0_f32, 0.5 - 1.0 / 128.0].map(f32::to_bits));
     }
 
     #[test]

@@ -497,6 +497,9 @@ Each phase is marked done here in the same commit that lands it.
 - Final review fixes (per-viewport eviction clocks in `StateRegistry`; `reset_state` as a `ResetTicket` claimed where the registry's `begin` runs, so an unrun paint keeps it; malformed user mask meshes refused (`MaskError::InvalidMesh`) and skipped by `CoverageMeshes::pack`; explicit `LayerOutcome` arms in glow; `#[non_exhaustive]` on `Mask`, `HotReloadEvent`, `WaveObstacle` (+ `new`), `PointerState` (+ `new`), `Impulse`, `ImpulsePack`, `Rebound`; demo captures written on a `FrameWriter` thread; hot-reload mtime granularity documented): done.
 - Phase R0 (§19 D1: additive coverage union — wgpu `COVERAGE_BLEND` (`One, One`), `mesh_pipeline` takes the blend (backdrop keeps `EGUI_BLEND`), glow `blend_func(ONE, ONE)`; mask / lib.rs / README / CHANGELOG text: abutting pieces leave no seam; GPU tests `abutting_mask_pieces_leave_no_seam` wgpu + glow (0 / 4x MSAA); no F9 expectation changed): done.
 - Phase R1a (§19.3 regions core + wgpu: `Region`, `Mask::Regions`, `MaskError::TooManyRegions`, `MAX_REGIONS`, `REGION_NONE`, `ShaderLayer::regions`, `Effect::reads_regions`; `mask.rs` `RegionMeshes` / `PackedRegions` / `tessellate_regions` / `JobMask::{pack, textures, regions}`; binding 7 `fl_region_texture` + prelude `region()` / `region_at(uv)` / `REGION_NONE`; `FlUniforms` 464 B (`internal_region_scale` 184, `_offset` 192, `params` 208); `mesh.wgsl` `fs_region`, `MeshLocals.region_id` / `alpha_threshold`; `plan.rs` `Slot::RegionId`, `Bindings::region`, `CoverageStep::regions`, `ChainPlan::with_regions`, `region_locals`, `REGION_PASS_THRESHOLDS`, `Allocations::region`; wgpu `coverage.rs` region pipeline + target + dynamic-offset locals, `chain.rs` 8-entry layout; glow units shifted (group 0 = 0..=4, user = 5..=7) and region masks refused (`Unsupported::RegionMasks`, logged once) until R1b; offline refuses region masks (`OfflineError::InvalidOption`, option `mask`) until R1c; GPU tests wgpu (Vulkan + GL) grid / NONE / overlap, glow refusal): done.
+- Phase R1b (§19.3.6 regions on glow: `glsl::translate_mesh(target, MeshEntry)` (`fs_main` | `fs_region`, pinned per target); `coverage.rs` region program + RGBA8 region-id target (cleared to 255), id passes A / B with blend off and per-region `region_locals` via `glBufferSubData`, `CoverageResources::fits` (mismatch latches); `render.rs` `with_regions(count)` for every mask, `target_of(Slot::RegionId)`, `allocations().region`; `RenderTarget::clear_to`; `Unsupported::RegionMasks` removed (and `JobMask::regions` now test-only, stale R1b `allow(dead_code)` in `plan.rs` dropped); GPU tests glow grid (0 / 4x MSAA) / NONE / empty list / overlap, mutation-checked (pass A dropped fails grid + NONE)): done.
+- Phase R2a (§19.5 bench part 1: `tests/common/mod.rs` (`GridScene` N tinted frosted tiles on a busy backdrop, one chain for both modes: blur + tint by `region()` with a per-layer `p.index` fallback; `time_per_frame` 10 warm-up + 100 timed frames; `print_table`), `#[ignore]` `bench_many_elements` at the end of both headless files, modes Layers / Regions, N in {4, 16, 64} plus a backdrop-only baseline, each mode asserted to apply the glass; demo scene `grid` (`GridMode` = R2b's extension point for entries), `FrameTimer` moved from bloom into `scenes/mod.rs`): done. First numbers (dev machine, Ryzen 5 9600X iGPU, Mesa 26.0.3, release, 256x128, ms/frame incl. GPU completion + readback): wgpu/Vulkan backdrop 0.09, layers 0.56 / 1.34 / 5.54, regions 0.41 / 0.44 / 0.52 (N = 4 / 16 / 64); glow backdrop 0.15, layers 0.48 / 0.76 / 1.57, regions 0.41 / 0.43 / 0.56.
+- Phase R1c (§19.3 regions offline: the `OfflineOptions::validate` / `run` refusal removed, `run` tessellates `Mask::Regions` with `tessellate_regions` and hands each tile's `CoverageJob` the `PackedRegions` draw ranges; `Mask::check_offline` already visited every region (R1a), `offline/options.rs` docs + unit test (textured region, > 255 regions, empty list); §18 sRGB seam fixed by the texture-coverage snap in `composite.wgsl` `fl_coverage`; `plan::REGION_PASS_B_THRESHOLD` = `0.5 - 1/128`; GPU tests `region_masks_offline_equal_the_ui` / `tiled_region_masks_equal_whole` (Vulkan + GL), the wgpu sRGB grid now checks the shared edges): done.
 
 ## 18. Findings during execution
 - Phase 1: naga's GLSL writer rejects one texture read through two samplers in one module
@@ -708,6 +711,26 @@ Each phase is marked done here in the same commit that lands it.
   snippet declaring one of them fails to parse (redefinition), like any prelude name.
 - Phase R1a: the id passes are verified by mutation: with pass A dropped (thresholds `[0.5, 0.5]`)
   the grid test and `region_none_outside_regions` fail on `REGION_NONE` fringe pixels.
+- Phase R1c, the §18 sRGB seam (R1a finding above): fixed by a SNAP, not a wider coverage format.
+  `fl_coverage` treats coverage-TEXTURE values above `1 - 1.5/255` as exactly 1 (the analytic
+  rounded-rect SDF keeps the 1/1024 snap). Two pieces' separately rounded half feathers lose at
+  most 1/255, so the stored sum is 254 or 255 and the snap catches exactly 254, never 253.
+  RGBA16F coverage was rejected: it is not renderable + blendable everywhere (WebGL2 needs
+  `EXT_color_buffer_float`; the glow backend would need its own format probe), so the 8-bit
+  fallback, and with it the seam, would remain on exactly the backends that lack it, and the
+  crate would carry two coverage formats with different edge results. The snap is one shader
+  line for every backend (wgpu, glow, WebGL2; UI and offline share the composite, so UI ==
+  offline is unchanged). Cost: a genuinely >= 99.4 % covered outline pixel is drawn fully
+  filtered, within the 8-bit storage's own rounding. Verified: the extended sRGB grid test
+  (shared columns / rows, junction) failed before (`(40, 60)` = `[14, 254, 254]`) and passes.
+- Phase R1c: pass B's threshold of exactly 0.5 made the owner of a MID-PIXEL shared edge float
+  noise: the later region's coverage there is 0.5 +- interpolation error, which depends on the
+  window origin, so the whole-frame run gave rows 89 / 91 of the shared column to DIFFERENT
+  regions and tiles flipped them (diff 127). `REGION_PASS_B_THRESHOLD` is now `0.5 - 1/128`
+  (contour shift < 0.01 px): the later region owns the whole shared column / row whatever the
+  window (tiled == whole ids, UI == offline ids). The remaining tiled-vs-whole difference is one
+  step on outer outlines through pixel centres (coverage 0.5 rounds to 127 or 128 in 8 bits by
+  window), as for F9 shape masks, so §19.3.8's "bit-identical" holds for ids, not for that outline.
 - Owner decision after R1a (commit d6a6ffc): the crate is renamed `egui_filter_layers` ->
   `egui-shader-layers` (lib `egui_shader_layers`, repo `Vasyanator/egui-shader-layers`) and
   `FilterLayer` -> `ShaderLayer` for 0.2.0, because 0.2 layers are no longer only filters

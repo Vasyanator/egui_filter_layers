@@ -9,7 +9,7 @@ blur, then an own combine reading `original()`), the built-in `presets::bloom`, 
 alone (Gaussian vs Kawase at equal visual radius). The side panel shows an averaged frame time.
 
 Key structures:
-- BloomScene: rect, mode, blur kind, the sliders, the compiled custom effects, frame-time window.
+- BloomScene: rect, mode, blur kind, the sliders, the compiled custom effects, the frame timer.
 - Mode / BlurKind: what the layer runs.
 - ENTRY: the registry entry (`--scene bloom`).
 
@@ -20,23 +20,19 @@ Key functions:
 Notes:
 The custom effects live in `bloom_bright.wgsl` / `bloom_combine.wgsl` (compiled once, in the
 constructor; a compile error is shown in the side panel and the layer is skipped). The frame time
-is egui's `unstable_dt` averaged over the last frames: it is CPU+GPU wall time between frames,
-capped by vsync, so the Gaussian / Kawase difference shows at large radii.
+is the shared `FrameTimer` (CPU+GPU wall time between frames, capped by vsync), so the
+Gaussian / Kawase difference shows at large radii.
 */
 
-use std::collections::VecDeque;
 use std::f32::consts::TAU;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Stroke, pos2, vec2};
 use egui_shader_layers::{Effect, EffectError, FilterChain, ShaderLayer, Pass, presets};
 
-use super::{DragRect, Scene, SceneEntry, SceneFrame, SceneInit};
+use super::{DragRect, FrameTimer, Scene, SceneEntry, SceneFrame, SceneInit};
 
 /// Registry entry.
 pub const ENTRY: SceneEntry = SceneEntry { key: "bloom", title: "Bloom / fast blur", build };
-
-/// How many frames the frame-time readout averages.
-const FRAME_WINDOW: usize = 60;
 
 /// What the layer runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,8 +74,8 @@ struct BloomScene {
     glow_color: Color32,
     /// The custom bright and combine effects, compiled once.
     effects: Result<(Effect, Effect), EffectError>,
-    /// Recent frame durations in seconds (egui `unstable_dt`), newest last.
-    frame_times: VecDeque<f32>,
+    /// The averaged frame-time readout.
+    frame_timer: FrameTimer,
 }
 
 /// Builds the scene (compiles the two custom effects: cheap naga validation).
@@ -98,7 +94,7 @@ fn build(init: &SceneInit<'_>) -> Box<dyn Scene> {
         pass_scale: 0.5,
         glow_color: Color32::WHITE,
         effects,
-        frame_times: VecDeque::with_capacity(FRAME_WINDOW),
+        frame_timer: FrameTimer::default(),
     })
 }
 
@@ -136,15 +132,6 @@ impl BloomScene {
                 Ok(FilterChain::new().then(bright).then(blur).then(combine))
             }
         }
-    }
-
-    /// Average of the recorded frame times, in milliseconds (`None` before the first frame).
-    fn average_frame_ms(&self) -> Option<f32> {
-        let count = self.frame_times.len();
-        // `count` is at most FRAME_WINDOW (60): exact as f32.
-        #[allow(clippy::cast_precision_loss)]
-        let count_f = count as f32;
-        (count > 0).then(|| self.frame_times.iter().sum::<f32>() / count_f * 1000.0)
     }
 }
 
@@ -185,20 +172,13 @@ impl Scene for BloomScene {
                 ui.colored_label(ui.visuals().error_fg_color, format!("chain unavailable: {error}"));
             }
         }
-        match self.average_frame_ms() {
-            Some(ms) => ui.label(format!("frame time: {ms:.2} ms (avg of {} frames, {:.0} fps)", self.frame_times.len(), 1000.0 / ms.max(0.001))),
-            None => ui.label("frame time: -"),
-        };
+        self.frame_timer.label(ui);
         ui.weak("Wall time between frames (vsync caps it). Compare gaussian and kawase at a large radius.");
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &SceneFrame<'_>) {
         let area = ui.max_rect();
-        let dt = ui.input(|input| input.unstable_dt);
-        if self.frame_times.len() == FRAME_WINDOW {
-            self.frame_times.pop_front();
-        }
-        self.frame_times.push_back(dt);
+        self.frame_timer.record(ui);
 
         let painter = ui.painter_at(area);
         paint_dark_backdrop(&painter, area, frame.time, frame.phase);
