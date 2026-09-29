@@ -322,7 +322,7 @@ module names a backend type.
 //!
 //! # Regions and entries
 //!
-//! Three ways to filter many areas, from cheapest to most flexible:
+//! Three ways to filter many areas:
 //!
 //! * **Regions** ([`ShaderLayer::regions`]): ONE chain, one capture (the layer rect, which must
 //!   cover the regions) and one run for every area; effects read `region()` to vary their
@@ -340,23 +340,32 @@ module names a backend type.
 //!   entry present, the accessors return the first entry's; a stateful entry keeps its own state
 //!   under the layer's id, and [`reset_state`] resets them all. A layer is drawn or refused as a
 //!   whole (any failing entry refuses it). Offline: `OfflineLayer` + `OfflineEntry` with
-//!   `OfflineRenderer::process_layer` (never tiled). The glow backend refuses layers of more than
-//!   one entry for now (they draw nothing, logged once); single-entry layers are unchanged.
-//! * **Separate layers**: one [`ShaderLayer`] per area. The most general (each its own paint
-//!   position), and the costliest on wgpu: every layer selects, tessellates and re-renders the
-//!   content beneath it again.
+//!   `OfflineRenderer::process_layer` (never tiled). Entries run on the wgpu and glow backends and
+//!   offline, in both overlap modes.
+//! * **Separate layers**: one [`ShaderLayer`] per area. The most general (each its own position
+//!   in egui's paint order), and the costliest on wgpu: every layer selects, tessellates and
+//!   re-renders the content beneath it again.
 //!
-//! Measured (roadmap R2, `bench_many_elements`: N frosted, tinted tiles over a busy 256x128
-//! backdrop, release build, Ryzen 5 9600X iGPU, Mesa 26.0.3, wall time per frame including GPU
-//! completion and readback; N = 4 / 16 / 64):
+//! Rule of thumb: the same effect with different parameters → regions; different chains, masks or
+//! state per area → entries (or regions with one branching chain when there are many dense
+//! areas); different paint-order positions → separate layers. Prefer [`Overlap::Independent`]
+//! unless a later entry must see an earlier entry's result: on wgpu `Stacked` adds a hand-off draw
+//! into every later entry whose padded capture an earlier one reaches.
 //!
-//! | backend | backdrop only | N layers | one layer, N regions |
-//! |---|---|---|---|
-//! | wgpu (Vulkan) | 0.09 ms | 0.56 / 1.34 / 5.54 ms | 0.41 / 0.44 / 0.52 ms |
-//! | glow | 0.15 ms | 0.48 / 0.76 / 1.57 ms | 0.41 / 0.43 / 0.56 ms |
+//! Measured by `bench_many_elements` (N frosted, tinted tiles filling a busy 256x128 backdrop,
+//! release build, Ryzen 5 9600X iGPU, Mesa 26.0.3, wall time per frame including egui, GPU
+//! completion and readback; ms for N = 4 / 16 / 64; the backdrop alone costs 0.09 ms on wgpu and
+//! 0.16 ms on glow):
 //!
-//! Regions stay flat as N grows; layers grow linearly (on wgpu with the re-render). Entries sit
-//! between: one selection and callback, N small captures and runs (numbers pending, roadmap R2b).
+//! | mode | wgpu (Vulkan) | glow |
+//! |---|---|---|
+//! | N layers | 0.57 / 1.39 / 5.75 | 0.50 / 0.80 / 1.64 |
+//! | 1 layer, N regions | 0.41 / 0.42 / 0.53 | 0.41 / 0.43 / 0.56 |
+//! | 1 layer, N entries | 0.57 / 1.38 / 5.97 | 0.49 / 0.81 / 1.61 |
+//! | 1 layer, N entries, stacked | 0.60 / 2.23 / 9.74 | 0.49 / 0.82 / 1.60 |
+//!
+//! Regions stay nearly flat as N grows; layers and entries grow with N, steeply on wgpu. With a few small areas far apart on a large screen
+//! the regions capture grows with the screen, while layers and entries stay at their areas' size.
 //!
 //! # Backends
 //!

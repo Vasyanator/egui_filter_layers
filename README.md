@@ -30,7 +30,8 @@ blur, colour adjustments, refraction, or your own WGSL shader.
   and offline).
 - Entries: several areas in one layer, each with its own chain, mask, textures and state, each
   capturing only its own rect; overlapping entries either filter the original backdrop or the
-  earlier entries' result (`Overlap::Independent` / `Overlap::Stacked`, wgpu UI and offline).
+  earlier entries' result (`Overlap::Independent` / `Overlap::Stacked`; wgpu and glow UI, and
+  offline). See [Choosing layers, regions or entries](#choosing-layers-regions-or-entries).
 - Offline processing of images and video with the same chains (features `image` / `video`).
 - View-only: never touches egui textures or your data.
 - One shader language on every backend (WGSL, translated to GLSL for OpenGL).
@@ -71,8 +72,9 @@ egui-shader-layers = { version = "0.2", default-features = false, features = ["g
 These crates appear in the public API, so moving to a new egui / wgpu / glow line is a breaking
 release of this crate. 0.2 changes the API in a few places (see the
 [changelog](CHANGELOG.md#020---2026-09-29)): most 0.1 code compiles unchanged, but effects that
-define functions named like the new prelude helpers (`original`, `tex`, `state`, ...) or a
-`struct Params` of their own must rename them.
+define functions named like the new prelude helpers (`original`, `tex`, `state`, `region`, ...)
+or a `struct Params` of their own must rename them, and the crate and its main type are renamed
+(`egui_filter_layers::FilterLayer` is now `egui_shader_layers::ShaderLayer`).
 
 ## Quick start (eframe + glow)
 
@@ -368,10 +370,11 @@ entry present; the accessors (`chain`, `layer_mask`, `texture_at`) return the fi
 stateful entry keeps its own state under the layer's `id`; `reset_state(ctx, id)` resets all of
 them. A layer whose ANY entry fails a check is skipped whole. Offline: `OfflineLayer` of
 `OfflineEntry`s with `OfflineRenderer::process_layer` — bit-identical to the UI, never tiled (a
-frame above the tile limit is `NotTileable`). In this build the glow backend skips layers of more
-than one entry (logged once); single-entry layers are unaffected.
+frame above the tile limit is `NotTileable`). Entries run on the wgpu and glow backends and
+offline, in both overlap modes.
 
-**Regions, entries or layers?** See [Performance: many elements](#performance-many-elements).
+**Regions, entries or layers?** See
+[Choosing layers, regions or entries](#choosing-layers-regions-or-entries).
 
 ### Named parameters
 
@@ -424,9 +427,9 @@ if let Some(error) = hot.error() {
 }
 ```
 
-## Performance: many elements
+## Choosing layers, regions or entries
 
-Three ways to filter N areas, and what each costs:
+Three ways to filter N areas, what each can do, and what each costs:
 
 - **N layers** (`ShaderLayer` per area): N egui paint callbacks, N captures, N chain runs. On wgpu
   every layer also pays its own beneath selection, tessellation and backdrop re-render, so the
@@ -444,10 +447,22 @@ Three ways to filter N areas, and what each costs:
   a hand-off draw from every earlier entry into each later entry whose PADDED capture it reaches
   — neighbours within the blur radius count even when the areas do not overlap.
 
+| | N layers | 1 layer, N regions | 1 layer, N entries |
+|---|---|---|---|
+| chain per area | own | one shared (varies by `region()`) | own |
+| mask per area | own | one shape per region | own |
+| textures and state per area | own | one set for the layer | own |
+| capture | N padded rects | the layer rect (union) | N padded rects |
+| paint-order position per area | own | one | one |
+| sees the areas painted before it | glow only | — (one run) | `Overlap::Stacked`, every backend |
+| edge between two areas | soft (each mask) | pixel-hard | soft (each mask) |
+
 Rule of thumb: the same effect with different parameters → regions; different chains, masks or
 state per area → entries (or regions with a branching chain when N is large and the areas are
 dense); different paint-order positions → layers. Prefer `Independent` unless a later entry must
 see an earlier entry's result.
+
+### Measurements
 
 Measured by `bench_many_elements` (`tests/wgpu_headless.rs`, `tests/glow_headless.rs`, scene in
 `tests/common/mod.rs`): N frosted tiles (Gaussian blur sigma 3 + per-tile tint, rounded corners)
@@ -500,7 +515,8 @@ with the screen while layers and entries stay at their areas' size. Run it yours
 - The installed backend lives in the `egui::Context` itself, so resetting egui `Memory` does not
   uninstall it.
 - **wgpu specifics**: the backdrop is re-rendered (see the warning above), so a filter over another
-  filter sees the lower one's *unfiltered* backdrop, and paint callbacks beneath a filter are left
+  filter sees the lower one's *unfiltered* backdrop (entries of one layer with `Overlap::Stacked`
+  do see each other), and paint callbacks beneath a filter are left
   out of its backdrop. Outside the mask (a rounded rect's corners, or anything outside a shape
   mask) the screen keeps what is already there, so a lower filter does show through the corners. The beneath content is
   collected by an egui plugin at the end of every pass (`Context::run_ui` / `end_pass`, which
@@ -688,6 +704,7 @@ Pick a scene in the side panel, or start on one with `--scene NAME`:
 | `bloom` | a custom bloom with a scaled bright pass vs `presets::bloom`; Gaussian vs Kawase blur with frame times |
 | `textures` | noise displacement, normal-map refraction and a 3D colour LUT from user textures |
 | `mask` | shape masks: a star from overlapping convex pieces, a circle, a text galley |
+| `grid` | many elements: N tinted glass tiles as N layers, one layer of N regions, or one layer of N entries (independent / stacked), optionally mixed with pixelate tiles, with frame times |
 
 The "hot" scene edits `examples/demo/scenes/hot.wgsl` through `HotEffect` (hence the
 `hot-reload` feature the demo requires): save from the in-app editor (Ctrl+S) or from any

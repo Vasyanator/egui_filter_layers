@@ -101,7 +101,7 @@ impl HotOptions {
         self
     }
 
-    /// Compiles the file as a STATE pass ([`Effect::new_state`], F7) instead of a display pass.
+    /// Compiles the file as a STATE pass ([`Effect::new_state`]) instead of a display pass.
     #[must_use]
     pub fn with_state(mut self, state: bool) -> Self {
         self.state = state;

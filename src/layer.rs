@@ -337,7 +337,7 @@ impl ShaderLayer {
         self
     }
 
-    /// Splits the layer into REGIONS (R1): shorthand for `mask(Mask::Regions(..))`, replacing any
+    /// Splits the layer into REGIONS: shorthand for `mask(Mask::Regions(..))`, replacing any
     /// earlier mask (of every entry). The union of the regions is the mask; every pass reads the id
     /// of the region that owns a pixel with the prelude's `region()` (see [`Mask::Regions`]). More
     /// than [`crate::MAX_REGIONS`] regions are refused ([`MaskError::TooManyRegions`]).

@@ -60,13 +60,18 @@ adheres to [Semantic Versioning](https://semver.org/).
   `ShaderLayer::mask` / `layer_mask` / `check_mask`,
   `OfflineOptions::with_mask`, `OfflineError::Mask`. The shape's alpha is the coverage; the
   coverage of several pieces is the sum of their alphas, capped at 1 (pieces meeting edge to edge
-  leave no seam).
+  leave no seam), and a shape or region coverage from 254/255 up counts as full (two pieces
+  sharing an edge through pixel centres round their half feathers separately in the 8-bit
+  coverage; on `*Srgb` targets that one-step shortfall would show as a seam). The rounded-rect
+  mask keeps 0.1's snap within 1/1024 of 0 or 1.
 - Regions: `Mask::Regions` / `ShaderLayer::regions` with `Region` (`rounded_rect`, `shape`,
-  `shape_ref`), up to `MAX_REGIONS` (255, `MaskError::TooManyRegions`): the union of the regions
-  is the mask and every pass reads the owning region's id with the prelude's `region()` /
-  `region_at(uv)` (`REGION_NONE` = 255 outside the regions; also `REGION_NONE` in Rust); later
-  regions win where they overlap; `Effect::reads_regions`. Runs on the wgpu and glow
-  backends and offline (`OfflineOptions::with_mask`, tiled runs included).
+  `shape_ref`), up to `MAX_REGIONS` (255, `MaskError::TooManyRegions`): ONE capture and one
+  chain run serve many areas. The union of the regions is the mask and every pass reads the
+  owning region's id with the prelude's `region()` / `region_at(uv)` (`REGION_NONE` = 255
+  outside the regions; also `REGION_NONE` in Rust), so per-region values are named-parameter
+  arrays indexed by it; later regions win where they overlap, and the boundary between two
+  regions is pixel-hard; `Effect::reads_regions`. Runs on the wgpu and glow backends and
+  offline (`OfflineOptions::with_mask`, tiled runs included).
 - Entries: several independent areas in one layer — `Entry` (`new`, `mask`, `corner_radius`,
   `texture`, `state`, accessors) with `ShaderLayer::from_entries` / `with_entry` / `entries`,
   and `Overlap` (`Independent`: every entry filters the original backdrop; `Stacked`: a later
@@ -77,10 +82,12 @@ adheres to [Semantic Versioning](https://semver.org/).
   first entry's, `ShaderLayer::rect` is the union; a stateful entry keeps its own state under the
   layer id (`reset_state` resets all). Offline: `OfflineEntry`, `OfflineLayer`,
   `OfflineRenderer::process_layer` / `process_layer_into` / `process_layer_async` (bit-identical
-  to the UI in both modes, never tiled: `NotTileable` above the tile limit). The glow backend
-  skips layers of more than one entry for now (logged once); single-entry layers are unchanged.
-  `TextureError::InvalidSlot` / `NotAttached` and `StateError::MissingId` name the failing
-  `entry`; `FilterChain::new` is `const`.
+  to the UI in both modes, never tiled: `NotTileable` above the tile limit). Runs on the wgpu and
+  glow backends and offline. `TextureError::InvalidSlot` / `NotAttached` and
+  `StateError::MissingId` name the failing `entry`; `FilterChain::new` is `const`.
+- README "Choosing layers, regions or entries" guide and the `bench_many_elements` benchmark
+  (`#[ignore]`d, in the wgpu and glow headless suites): N layers vs one layer of N regions vs one
+  layer of N entries, per backend, with the measured numbers.
 - Feature `hot-reload` (native only, no extra dependencies): `HotEffect` (`watch`,
   `watch_with` + `HotOptions`, `poll` -> `HotReloadEvent`, `current`, `error`, `status_text`)
   recompiles a WGSL file off the GUI thread and keeps the last good effect while the file is
@@ -91,16 +98,18 @@ adheres to [Semantic Versioning](https://semver.org/).
 - `WaveObstacle` is also re-exported at the crate root.
 - Headless GPU tests for the glow backend (EGL, Linux) next to the wgpu and offline suites.
 - Demo: a scene-based directory example with `--scene NAME` (`stack`, `hot`, `ripples`,
-  `water`, `trails`, `bloom`, `textures`, `mask`) and a generic named-parameter editor.
+  `water`, `trails`, `bloom`, `textures`, `mask`, `grid`: the many-elements modes live) and a
+  generic named-parameter editor.
 
 ### Changed
 - **Breaking:** `EffectError::Interface` gained a `location: Option<SnippetLocation>` field
   (the `struct Params` declaration for named-parameter errors); patterns that list its fields
   need `location` or `..`, and `EffectError::location()` now returns it.
-- **Breaking (WGSL):** new prelude functions are reserved names — `original`, `src_texel`,
+- **Breaking (WGSL):** new prelude names are reserved — the functions `original`, `src_texel`,
   `out_texel`, `tex`, `tex_size`, `tex_load`, `state`, `state_load`, `state_px`, `state_size`,
-  `state_texel`. A snippet that defines a function or global with one of these names no longer
-  compiles (`EffectError`); rename it.
+  `state_texel`, `region`, `region_at` and the constant `REGION_NONE`. A snippet that defines a
+  function, constant or global with one of these names no longer compiles (`EffectError`);
+  rename it.
 - **Breaking (WGSL):** a snippet's `struct Params` is now the named-parameter block, bound as the
   module-scope `p`. A snippet that used its own `struct Params` for something else must rename it
   (unsupported member types are an `EffectError::Interface`, and a module-scope `p` of its own
@@ -115,10 +124,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   `TextureTooLarge`); it is `#[non_exhaustive]`, so exhaustive matches were already impossible.
 - `ShaderLayer::corner_radius` and `OfflineOptions::with_corner_radius` are shorthands for
   `Mask::RoundedRect`; a later `mask(...)` replaces them (and vice versa).
-- A shape or region mask's coverage from 254/255 up is treated as full (was: within 1/1024):
-  two pieces sharing an edge through pixel centres store their half feathers rounded separately
-  in the 8-bit coverage, and on `*Srgb` targets that one-step shortfall showed as a visible seam.
-- The crate-private `fl` uniform block grew from 352 to 448 bytes; its documented members keep
+- `ShaderLayer::rect` is the union of the layer's entries and `ShaderLayer::chain` the first
+  entry's chain; for a layer built with `ShaderLayer::new` (one entry) both return what 0.1 did.
+- The crate-private `fl` uniform block grew from 352 to 464 bytes; its documented members keep
   their meaning (undocumented `internal_*` members changed). `presets::gaussian_blur` and
   `presets::ripple` step by `fl.texel` (bit-identical output at full resolution).
 - Dependency ranges are unchanged (egui / eframe 0.36, wgpu / naga 30, glow 0.17); MSRV stays

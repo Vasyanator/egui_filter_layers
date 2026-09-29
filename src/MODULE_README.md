@@ -38,9 +38,9 @@ user code ──► ShaderLayer::paint (layer.rs; one or more `Entry`s, entry.rs
 - **Entries (R3)**: a layer of several entries runs one capture + chain per entry, each over its
   OWN padded rect (never the union); `plan::schedule` is the single owner of the order of
   captures, runs, `Stacked` hand-offs and composites for every backend (`CaptureSource::Pristine`:
-  wgpu UI and offline; `Framebuffer`: glow from phase R3b — until then glow refuses multi-entry
-  layers). A `Stacked` hand-off on a pristine source is the replace composite of an earlier entry
-  drawn into a later entry's capture (`wgpu_backend/chain.rs::record_handoff`, UI and offline).
+  wgpu UI and offline; `Framebuffer`: glow, where a later capture already sees the earlier
+  composites, so it needs no hand-off). A `Stacked` hand-off on a pristine source is the replace
+  composite of an earlier entry drawn into a later entry's capture (`wgpu_backend/chain.rs::record_handoff`, UI and offline).
 - **Coordinates**: effect `uv` is top-left origin, y down on every backend. A backend whose
   texture storage is bottom-up sets `FrameUniforms::flip_y`; the prelude's `src()` applies it.
   Intermediates are grow-only; `src_scale` / `aux_scale` map the used region to storage.
@@ -232,7 +232,8 @@ user code ──► ShaderLayer::paint (layer.rs; one or more `Entry`s, entry.rs
 - Capture/padding/mask math: `geometry.rs`.
 - Entries: the public types `entry.rs` / `layer.rs`; the order of captures, runs, hand-offs and
   composites `plan::schedule` (never in a backend); the hand-off draw `wgpu_backend/chain.rs`;
-  execution wgpu `render.rs`, offline `offline/layer.rs`, glow `render.rs` (R3b).
+  execution wgpu `render.rs`, offline `offline/layer.rs`, glow `render.rs` (+ the blended
+  composite in `resources.rs`).
 - Shape masks: what is accepted / tessellation / packing `mask.rs`; the coverage step and its
   uniform bytes `plan.rs`; rasterization wgpu `wgpu_backend/coverage.rs` (UI and offline), glow
   `glow_backend/coverage.rs`; the composite's read `shaders/composite.wgsl` (`fl_coverage`).
