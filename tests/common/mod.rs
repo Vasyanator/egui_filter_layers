@@ -109,11 +109,15 @@ impl Mode {
     }
 }
 
+/// `value` as `f32`, exactly: the scene's counts and grid indices are at most [`TINT_SLOTS`], far
+/// below `u16::MAX` (saturates there, never reached).
+fn small_f32(value: usize) -> f32 {
+    f32::from(u16::try_from(value).unwrap_or(u16::MAX))
+}
+
 /// The tint of tile `index` of `count`: hues spread around the colour wheel, alpha = strength.
 pub fn tile_tint(index: usize, count: usize) -> [f32; 4] {
-    // Both are at most TINT_SLOTS (64): exact in f32.
-    #[allow(clippy::cast_precision_loss)]
-    let hue = index as f32 / count.max(1) as f32;
+    let hue = small_f32(index) / small_f32(count.max(1));
     let channel = |offset: f32| {
         let phase = (hue + offset).rem_euclid(1.0);
         (1.0 - (phase * 6.0 - 3.0).abs().min(3.0) / 1.5).clamp(0.0, 1.0) * 0.8 + 0.2
@@ -183,16 +187,14 @@ impl GridScene {
     /// filling `area` with a 2-point inset per cell.
     pub fn new(count: usize, area: Rect) -> Self {
         let count = count.clamp(1, TINT_SLOTS);
-        // Rows ~ sqrt(N / 2) for a 2:1 area; small integers, exact in f32 / usize.
-        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let rows = ((count as f32 / 2.0).sqrt().round() as usize).max(1);
+        // Rows = round(sqrt(N / 2)) for a 2:1 area, in integers: the largest r >= 1 with
+        // r - 1/2 <= sqrt(N / 2), i.e. (2r - 1)^2 <= 2N.
+        let rows = (1..=count).take_while(|rows| (2 * rows - 1) * (2 * rows - 1) <= 2 * count).last().unwrap_or(1);
         let cols = count.div_ceil(rows);
-        #[allow(clippy::cast_precision_loss)]
-        let cell = vec2(area.width() / cols as f32, area.height() / rows as f32);
+        let cell = vec2(area.width() / small_f32(cols), area.height() / small_f32(rows));
         let tiles: Vec<Rect> = (0..count)
             .map(|tile| {
-                #[allow(clippy::cast_precision_loss)]
-                let min = area.min + vec2((tile % cols) as f32 * cell.x, (tile / cols) as f32 * cell.y);
+                let min = area.min + vec2(small_f32(tile % cols) * cell.x, small_f32(tile / cols) * cell.y);
                 Rect::from_min_size(min, cell).shrink(2.0)
             })
             .collect();
@@ -265,9 +267,16 @@ impl GridScene {
 /// Whether pixel `probe` of the `width`-pixel-wide RGBA8 frame `filtered` differs from the same
 /// pixel of `backdrop` by more than 3 steps in any channel (the glass was applied there).
 pub fn glass_applied(backdrop: &[u8], filtered: &[u8], width: u32, probe: Pos2) -> bool {
-    // The probe is a tile centre inside the frame: non-negative, small.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let (x, y) = (probe.x as usize, probe.y as usize);
+    // The probe is a tile centre inside the frame; anything else is "not applied". Checked to be
+    // in 0..65536 first, so the float -> integer truncation (the intended floor) cannot saturate.
+    let pixel = |coordinate: f32| (0.0..65536.0).contains(&coordinate).then(|| {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // In range, checked above.
+        let floored = coordinate as usize;
+        floored
+    });
+    let (Some(x), Some(y)) = (pixel(probe.x), pixel(probe.y)) else {
+        return false;
+    };
     let index = (y * usize::try_from(width).unwrap_or(0) + x) * 4;
     match (backdrop.get(index..index + 3), filtered.get(index..index + 3)) {
         (Some(a), Some(b)) => a.iter().zip(b).any(|(a, b)| a.abs_diff(*b) > 3),

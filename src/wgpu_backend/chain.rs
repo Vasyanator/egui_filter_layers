@@ -33,7 +33,8 @@ Key functions:
 - `draw_composite()` / `draw_composite_over()`: the composite draw(s) into a caller-owned render
   pass (replace: offline; blended over the pass's pixels: the UI).
 - `ChainResources::record_handoff()`: a `Stacked` hand-off (R3) — the replace composite of an
-  earlier entry's run drawn into a later entry's capture (UI and offline share it).
+  earlier entry's run drawn into a later entry's capture (UI and offline share it), mixing in the
+  `HandoffSpace` of the screen composite (linear for `*Srgb` UI targets).
 
 Notes:
 One uniform buffer per run holds, for draw `i` (plan step `i`; draw `n` = the composite), its
@@ -56,7 +57,9 @@ the state format, so the pipeline cache is keyed by module AND output format.
 Entries (R3): a multi-entry layer is one run per entry; `plan::schedule` orders them. A run whose
 composite is handed off (`Stacked`) gets one extra composite block per target entry
 (`ChainJob::handoff_origins`, `plan::composite_for_origin`) and returns their bind groups;
-`record_handoff` draws one with the cached replace pipeline into the later capture (`LoadOp::Load`).
+`record_handoff` draws one with a cached replace pipeline into the later capture (`LoadOp::Load`):
+the gamma one, or for a `*Srgb` UI target the linear one (decode, mix, re-encode in the shader, so
+it needs no sRGB view and works on GL too), matching the space the screen composite blends in.
 Textures are stored top-down on wgpu, so `flip_y` is false.
 A run computes a WINDOW of the capture (`ChainWindow`): the UI always uses the whole capture; the
 offline tiler runs one window per tile. Fragments derive their capture uv from their pixel
@@ -71,7 +74,7 @@ use super::coverage::{CoverageJob, CoverageRasterizer, CoverageTargets};
 use super::gpu::{GrowBuffer, Target, begin_pass, begin_pass_load, egui_texture_entries, pass_pipeline, renderable_and_filterable, sampler_entry, texture_entry, uniform_entry, with_error_scope};
 use crate::effect::{
     BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_REGION_TEXTURE, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, CompiledModule, TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING, USER_TEXTURE_GROUP_BASE,
-    composite_add_linear_module, composite_add_module, composite_erase_module, composite_linear_module, composite_module,
+    composite_add_linear_module, composite_add_module, composite_erase_module, composite_handoff_linear_module, composite_linear_module, composite_module,
 };
 use crate::geometry::{LayerGeometry, PxRect, px_f32};
 use crate::pass::{FrameUniforms, InputUniforms, Pass, UNIFORM_BLOCK_SIZE};
@@ -147,6 +150,8 @@ pub(crate) struct ChainResources {
     /// The REPLACE composite into `HANDOFF_FORMAT` (single-sampled, no depth): the `Stacked`
     /// hand-off of an earlier entry into a later entry's capture (R3), UI and offline.
     handoff: wgpu::RenderPipeline,
+    /// The same hand-off mixing in linear (`HandoffSpace::Linear`: `*Srgb` UI targets).
+    handoff_linear: wgpu::RenderPipeline,
 }
 
 /// Format of every texture a hand-off writes: an entry's capture (`Rgba8Unorm`, the UI's
@@ -165,6 +170,7 @@ impl ChainResources {
         let intermediate_format = if float_intermediates { wgpu::TextureFormat::Rgba16Float } else { wgpu::TextureFormat::Rgba8Unorm };
         let uniform_alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment.max(1));
         let handoff_module = composite_module().map_err(|error| format!("the composite pass does not compile (crate bug): {error}"))?;
+        let handoff_linear_module = composite_handoff_linear_module().map_err(|error| format!("the linear hand-off composite does not compile (crate bug): {error}"))?;
 
         with_error_scope(device, || {
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -213,6 +219,7 @@ impl ChainResources {
             let white = white_texture.create_view(&wgpu::TextureViewDescriptor::default());
             let coverage = CoverageRasterizer::create(device, &user_layout, &white, &sampler);
             let handoff = pass_pipeline(device, &pipeline_layout, &handoff_module, HANDOFF_FORMAT, None, wgpu::MultisampleState::default(), None);
+            let handoff_linear = pass_pipeline(device, &pipeline_layout, &handoff_linear_module, HANDOFF_FORMAT, None, wgpu::MultisampleState::default(), None);
             Self {
                 float_intermediates,
                 intermediate_format,
@@ -228,6 +235,7 @@ impl ChainResources {
                 pipelines: HashMap::new(),
                 coverage,
                 handoff,
+                handoff_linear,
             }
         })
     }
@@ -469,11 +477,28 @@ impl ChainResources {
     /// Records a `Stacked` hand-off (R3, `plan::Op::HandOff`): the REPLACE composite of an earlier
     /// entry's run (`bind_group`, one of its [`RecordedRun::handoffs`]) drawn into a later
     /// entry's capture `target` (a `HANDOFF_FORMAT` view, loaded, not cleared) over `viewport`
-    /// (that capture's pixels, from the plan). The later run must be recorded after this.
-    pub(crate) fn record_handoff(&self, encoder: &mut wgpu::CommandEncoder, bind_group: &wgpu::BindGroup, target: &wgpu::TextureView, viewport: PxRect) {
+    /// (that capture's pixels, from the plan), mixing in `space` (the space the screen composite
+    /// of the same entry mixes in). The later run must be recorded after this.
+    pub(crate) fn record_handoff(&self, encoder: &mut wgpu::CommandEncoder, bind_group: &wgpu::BindGroup, target: &wgpu::TextureView, viewport: PxRect, space: HandoffSpace) {
+        let pipeline = match space {
+            HandoffSpace::Gamma => &self.handoff,
+            HandoffSpace::Linear => &self.handoff_linear,
+        };
         let mut pass = begin_pass_load(encoder, target, "egui_shader_layers stacked hand-off");
-        draw_composite(&mut pass, &self.handoff, bind_group, viewport);
+        draw_composite(&mut pass, pipeline, bind_group, viewport);
     }
+}
+
+/// The colour space a [`ChainResources::record_handoff`] mixes in: the one the entry's screen
+/// composite mixes in, so an earlier entry's antialiased edge reads the same inside a later entry
+/// (from the hand-off) as outside it (from the screen composite).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandoffSpace {
+    /// Mix the stored (gamma) values: gamma UI targets and offline.
+    Gamma,
+    /// Decode, mix in linear, re-encode: `*Srgb` UI targets, whose screen composite blends in
+    /// linear (egui-wgpu's own draws do too).
+    Linear,
 }
 
 /// What [`ChainResources::record`] leaves for the caller.

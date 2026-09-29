@@ -75,7 +75,8 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   `chain.rs`, so offline runs rasterize masks unchanged.
 - `chain.rs`: the chain executor (`ChainResources`, `ChainTargets`, `ChainWindow`, `record` ->
   `RecordedRun` (composite + hand-off bind groups + state plan), `record_handoff` (R3: the replace
-  composite into another entry's capture, `HANDOFF_FORMAT`, `LoadOp::Load`),
+  composite into another entry's capture, `HANDOFF_FORMAT`, `LoadOp::Load`; mixing in
+  gamma or linear, `HandoffSpace`),
   `frame_uniforms`, `chain_uniforms` = every draw's plan blocks (`fl`, then the named-parameter
   block) at the device's offset alignment (`ChainUniforms` / `DrawUniforms`); composites: replace `composite_pipeline` / `draw_composite` for offline,
   blended `CompositeOver` / `draw_composite_over` for the UI); egui-free; shared with `src/offline/`.
@@ -140,9 +141,13 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   viewport (earlier region ∩ later capture) and origin come from `plan::schedule`, never from this
   module; its composite block is `plan::composite_for_origin` (extra blocks of the earlier run's
   uniform buffer). Outside the earlier mask it writes the earlier capture, which holds the same
-  re-rendered backdrop there. State per entry (`LayerJob::state_key(index)`), the reset ticket
-  claimed once per paint. A failing entry (state format, pipeline) skips the whole layer before
-  anything is recorded.
+  re-rendered backdrop there. On an `*Srgb` target the hand-off mixes in linear
+  (`WgpuResources::linear_handoff`, `chain::HandoffSpace::Linear`: decode, mix, re-encode in the
+  shader, no sRGB view needed) like `paint`'s screen composite, so an earlier entry's antialiased
+  edge reads the same inside and outside a later entry. State per
+  entry (`LayerJob::state_key(position)`, keyed by the user index `EntryJob::index`), the reset
+  ticket claimed once per paint. A failing entry (state format, pipeline) skips the whole layer
+  before anything is recorded.
 - The UI composite never writes pixels its mask does not cover (discard), and inside the mask it
   equals the filtered value exactly; only the 1-px antialiased edge is a blend with what the pass
   holds (on `*Srgb` targets in linear, so it differs from the offline / glow gamma mix there).

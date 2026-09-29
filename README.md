@@ -367,8 +367,8 @@ ShaderLayer::from_entries([
 
 The layer-level builders (`mask`, `corner_radius`, `regions`, `texture`, `state`) apply to every
 entry present; the accessors (`chain`, `layer_mask`, `texture_at`) return the first entry's. A
-stateful entry keeps its own state under the layer's `id`; `reset_state(ctx, id)` resets all of
-them. A layer whose ANY entry fails a check is skipped whole. Offline: `OfflineLayer` of
+stateful entry keeps its own state under the layer's `id` and its index in the list (also while
+an earlier entry collapses to nothing and back); `reset_state(ctx, id)` resets all of them. A layer whose ANY entry fails a check is skipped whole. Offline: `OfflineLayer` of
 `OfflineEntry`s with `OfflineRenderer::process_layer` — bit-identical to the UI, never tiled (a
 frame above the tile limit is `NotTileable`). Entries run on the wgpu and glow backends and
 offline, in both overlap modes.

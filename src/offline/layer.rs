@@ -40,7 +40,7 @@ use crate::mask::{Mask, PackedRegions, tessellate, tessellate_regions};
 use crate::pass::FilterChain;
 use crate::plan::{CaptureSource, Op, StatePlan, StatePlanInput, check_textures, schedule};
 use crate::state::{StateError, StateOptions};
-use crate::wgpu_backend::chain::{ChainJob, ChainRecording, ChainSource, ChainState, ChainTargets, ChainWindow, draw_composite_over};
+use crate::wgpu_backend::chain::{ChainJob, ChainRecording, ChainSource, ChainState, ChainTargets, ChainWindow, HandoffSpace, draw_composite_over};
 use crate::wgpu_backend::coverage::CoverageJob;
 use crate::wgpu_backend::gpu::{ErrorScopes, begin_pass_load};
 
@@ -583,7 +583,8 @@ impl OfflineRenderer {
                         let Some((_, _, view)) = entries.get(into).and_then(|resources| resources.capture.as_ref()) else {
                             return Err(crate_bug("an entry capture is missing"));
                         };
-                        chain.record_handoff(&mut encoder, &group, view, viewport);
+                        // The frame is `Rgba8Unorm`: the gamma mix of the offline composite.
+                        chain.record_handoff(&mut encoder, &group, view, viewport, HandoffSpace::Gamma);
                     }
                     Op::Composite(index) => {
                         let (Some(Some(prepared)), Some(group)) = (prepared.get(index), entries.get(index).and_then(|resources| resources.composite.as_ref())) else {

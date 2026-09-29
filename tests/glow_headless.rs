@@ -1647,6 +1647,39 @@ fn stateful_entries_keep_separate_states() {
     assert_active(&harness.ctx);
 }
 
+/// R3: a stateful entry keeps its state (keyed by its USER index) across frames where an
+/// EARLIER stateful entry collapses to zero size and draws nothing, and the earlier one resumes
+/// its own count when it returns (keyed by the job position, the two would swap states).
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn stateful_entry_keeps_its_state_while_an_earlier_entry_collapses() {
+    let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let slow = match Effect::new_state("accumulate slowly", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state_px(vec2<i32>(0)) + vec4<f32>(0.125); }") {
+        Ok(effect) => FilterChain::new().then(Pass::new(&effect)).then(pass("show", "fn effect(uv: vec2<f32>) -> vec4<f32> { return min(state(uv), vec4<f32>(1.0)); }")),
+        Err(error) => panic!("{error}"),
+    };
+    let id = egui::Id::new("collapsing entry");
+    let left = Rect::from_min_max(pos2(8.0, 8.0), pos2(120.0, 120.0));
+    let collapsed = Rect::from_min_max(pos2(8.0, 8.0), pos2(120.0, 8.0));
+    let right = Rect::from_min_max(pos2(136.0, 8.0), pos2(248.0, 120.0));
+    let slow_value = |frames: u32| [0, 32, 64, 96, 128].get(usize::try_from(frames).unwrap_or(0)).copied().unwrap_or(0);
+    // Frames 1, 2 and 4 draw the slow entry A; frame 3 collapses it. B (fast) steps every frame.
+    for (frame, a_steps) in [(1, Some(1)), (2, Some(2)), (3, None), (4, Some(3))] {
+        let a_rect = if a_steps.is_some() { left } else { collapsed };
+        let paint = |ui: &mut egui::Ui| {
+            halves(ui.painter());
+            ShaderLayer::from_entries([Entry::new(a_rect, slow.clone()), Entry::new(right, accumulator())]).id(id).paint(ui.painter());
+        };
+        let pixels = harness.frame(&mut |ui| paint(ui));
+        assert_grey(&pixels, 190, 60, accumulated(frame), &format!("frame {frame}, the later entry"));
+        if let Some(steps) = a_steps {
+            assert_grey(&pixels, 60, 60, slow_value(steps), &format!("frame {frame}, the earlier entry"));
+        }
+    }
+    assert!(egui_shader_layers::failed_states(&harness.ctx).is_empty());
+    assert_active(&harness.ctx);
+}
+
 /// R3: textures are per entry — the same effect reads the checker in one entry and a yellow
 /// texture in the other; the layer-level `texture` attaches one to every entry.
 #[test]

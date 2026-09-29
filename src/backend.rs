@@ -9,8 +9,9 @@ Key structures:
   (`glow_backend`, and the `wgpu` backend) implements it; core code never names a backend type.
 - `LayerJob` / `EntryJob` (crate-internal): one `ShaderLayer::paint` call, resolved for the
   backend: layer-wide values (union rect, overlap mode, time, input, id, reset ticket) and one
-  `EntryJob` per entry (rect, passes, padding, textures, state options; its mask a
-  `mask::JobMask`: rounded-rect radii or the shape tessellated on the GUI thread).
+  `EntryJob` per DRAWABLE entry (its user index, rect, passes, padding, textures, state options;
+  its mask a `mask::JobMask`: rounded-rect radii or the shape tessellated on the GUI thread).
+  A job position is not an identity: states and attributions use `EntryJob::index`.
 - `FrameInput` / `PointerInput` (crate-internal): the per-frame input a layer reads on the GUI
   thread (`fl.delta_time`, `fl.frame`, `fl.pointer`), resolved per capture by `FrameInput::resolve`.
 - `BackendKind`, `BackendStatus`, `EffectFailure`, `InstallError` (public).
@@ -19,8 +20,8 @@ Key structures:
 
 Key functions:
 - `register()` / `installed()` / `uninstall()` (crate-internal): the per-context registry.
-- `LayerJob::state_key(index)` / `EntryJob::is_stateful()`: an entry's state key (a state pass
-  and a layer id, F7) and whether it has a state pass.
+- `LayerJob::state_key(position)` / `EntryJob::is_stateful()`: an entry's state key (a state pass
+  and a layer id, F7; keyed by the entry's USER index) and whether it has a state pass.
 - `status()`, `failed_effects()`, `failed_textures()` (public, re-exported at the crate root).
 
 Notes:
@@ -187,7 +188,10 @@ pub(crate) struct LayerJob {
     /// The layer's rect in points (painter space, before layer transforms): the union of the
     /// entries' rects (the paint callback's rect).
     pub rect: Rect,
-    /// The entries, in list order (never empty; every one with passes and a positive rect).
+    /// The DRAWABLE entries, in list order (never empty; every one with passes and a positive
+    /// rect). Entries the user listed but that draw nothing are left out, so a position here is
+    /// NOT the user's entry index: every identity (state keys, attributions) uses
+    /// [`EntryJob::index`]; positions only index per-job arrays (geometries, ops, captures).
     pub entries: Vec<EntryJob>,
     /// How overlapping entries see each other (`plan::schedule` decides the order from it).
     pub overlap: Overlap,
@@ -209,6 +213,9 @@ pub(crate) struct LayerJob {
 /// One entry of a [`LayerJob`], resolved for the backend.
 #[derive(Clone, Debug)]
 pub(crate) struct EntryJob {
+    /// The entry's index in the user's `ShaderLayer::entries` (stable while earlier entries stop
+    /// or start drawing; the same index `OfflineLayer` keys by).
+    pub index: usize,
     /// The entry's rect in points (painter space, before layer transforms).
     pub rect: Rect,
     /// The mask: rounded-rect radii (layer points), or the tessellated shape / regions (F9, R1).
@@ -241,13 +248,15 @@ impl LayerJob {
         self.reset_state.as_ref().is_some_and(crate::state::ResetTicket::claim)
     }
 
-    /// The state key of entry `index` when it is stateful (a state pass and a layer id), else
-    /// `None`: `plan::entry_state_key` of the layer's key (one state per entry, D5).
+    /// The state key of the entry at job `position` when it is stateful (a state pass and a
+    /// layer id), else `None`: `plan::entry_state_key` of the layer's key and the entry's USER
+    /// index ([`EntryJob::index`]), so an earlier entry that stops drawing does not hand its
+    /// state to a later one (one state per entry, D5).
     #[must_use]
-    pub(crate) fn state_key(&self, index: usize) -> Option<crate::state::StateKey> {
+    pub(crate) fn state_key(&self, position: usize) -> Option<crate::state::StateKey> {
         let id = self.id?;
-        let entry = self.entries.get(index)?;
-        entry.is_stateful().then(|| crate::plan::entry_state_key(crate::state::StateKey { viewport: self.viewport, id }, index))
+        let entry = self.entries.get(position)?;
+        entry.is_stateful().then(|| crate::plan::entry_state_key(crate::state::StateKey { viewport: self.viewport, id }, entry.index))
     }
 }
 

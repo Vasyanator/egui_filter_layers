@@ -93,13 +93,14 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   composite per entry, so later captures see earlier composites; `Independent`: every capture
   first). Entry k captures into `Resources::captures[k]` (a grow-only pool); ping-pong, coverage
   and region-id targets are shared (each run is composited before the next; a schedule that
-  breaks this, or a hand-off op, latches as a crate bug). A layer of several entries composites
-  each with the BLENDED composite (`BlendedComposite`: erase `ZERO, ONE_MINUS_SRC_ALPHA` then add
-  `ONE, ONE`, D4), so a later entry lands over an earlier one; a single entry keeps the replace
-  composite, bit for bit as before. Programs, the blended programs, the rasterizer, state formats
+  breaks this, or a hand-off op, latches as a crate bug). A layer of several VISIBLE entries
+  composites each with the BLENDED composite (`BlendedComposite`: erase `ZERO, ONE_MINUS_SRC_ALPHA`
+  then add `ONE, ONE`, D4), so a later entry lands over an earlier one; a single visible entry
+  keeps the replace composite. Programs, the blended programs, the rasterizer, state formats
   and every entry's textures are settled before the first capture (one failure skips the whole
   layer); a failing op later stops the layer, earlier composites stay. States per entry
-  (`LayerJob::state_key(k)`, reset ticket claimed once per paint), started at `Run(k)` and
+  (`LayerJob::state_key(k)`: keyed by the entry's user index `EntryJob::index`, not the job
+  position k; reset ticket claimed once per paint), started at `Run(k)` and
   finished after `Composite(k)` (`StateRegistry::get_mut`). The blended composite rounds twice,
   so AA edges of overlapping entries may differ from wgpu by one 8-bit step.
 - Backend-wide failures (resource creation, unexplained capture / composite GL error) latch

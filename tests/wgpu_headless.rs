@@ -1573,6 +1573,32 @@ fn overlapping_entries_stacked_compose() {
     assert_near(&pixels, 230, 120, [100, 150, 200], "outside");
 }
 
+/// R3 `Stacked` on a gamma AND an `*Srgb` target: an earlier entry's antialiased edge looks the
+/// same inside a later (identity) entry, where the hand-off put it into the later capture, as
+/// outside it, where the screen composite drew it (both mix in linear on `*Srgb`). A bright
+/// backdrop widens the gamma / linear gap of the edge pixel (76 vs 125 before the linear hand-off).
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn stacked_hand_off_edges_match_the_screen_composite() {
+    for format in [wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Rgba8UnormSrgb] {
+        let (ctx, state, _texture, target) = setup(format);
+        // Entry 0's left edge is a quarter pixel into column 20 (coverage 0.75; a half-pixel edge
+        // rounds the region away from the column); entry 1 covers rows 20..60 of it.
+        let earlier = Rect::from_min_max(pos2(20.25, 20.0), pos2(120.0, 100.0));
+        let later = Rect::from_min_max(pos2(10.0, 20.0), pos2(60.0, 60.0));
+        let mut paint = |ui: &mut egui::Ui| {
+            ui.painter().rect_filled(Rect::from_min_max(pos2(0.0, 0.0), pos2(256.0, 128.0)), 0.0, Color32::from_gray(230));
+            ShaderLayer::from_entries([Entry::new(earlier, presets::invert(1.0)), Entry::new(later, identity())]).overlap(Overlap::Stacked).paint(ui.painter());
+        };
+        render_frame(&ctx, &state, &target, &mut paint);
+        let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+        let (inside, outside) = (rgb(&pixels, 20, 40), rgb(&pixels, 20, 80));
+        assert!(inside.iter().zip(outside).all(|(a, b)| a.abs_diff(b) <= 1), "{format:?}: the edge inside the later entry {inside:?} differs from outside {outside:?}");
+        assert!(outside.iter().all(|value| (30..220).contains(value)), "{format:?}: column 20 is an AA edge: {outside:?}");
+        assert!(egui_shader_layers::failed_effects(&ctx).is_empty(), "{:?}", egui_shader_layers::failed_effects(&ctx));
+    }
+}
+
 /// R3 risk 1 (roadmap §19.10): three `Stacked` entries where entry 0 overlaps entry 2 but not
 /// entry 1, and entry 1 overlaps entry 2; entries 0 and 2 are padded (sample radii), so the
 /// hand-off viewports are clipped to the later padded capture. Entry 2 sees both inverts; in
@@ -1674,6 +1700,38 @@ fn stateful_entries_keep_separate_states() {
         ShaderLayer::from_entries([Entry::new(left, presets::invert(1.0)), Entry::new(right, slow.clone())]).paint(ui.painter());
     });
     assert_near(&pixels, 60, 60, [255, 0, 0], "an entry of a refused layer draws nothing");
+    assert!(egui_shader_layers::failed_states(&ctx).is_empty());
+}
+
+/// R3: a stateful entry keeps its state (keyed by its USER index) across frames where an
+/// EARLIER stateful entry collapses to zero size and draws nothing, and the earlier one resumes
+/// its own count when it returns (keyed by the job position, the two would swap states).
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn stateful_entry_keeps_its_state_while_an_earlier_entry_collapses() {
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let slow = match Effect::new_state("accumulate slowly", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state_px(vec2<i32>(0)) + vec4<f32>(0.125); }") {
+        Ok(effect) => FilterChain::new().then(Pass::new(&effect)).then(pass_of("show", "fn effect(uv: vec2<f32>) -> vec4<f32> { return min(state(uv), vec4<f32>(1.0)); }")),
+        Err(error) => panic!("{error}"),
+    };
+    let id = egui::Id::new("collapsing entry");
+    let left = Rect::from_min_max(pos2(8.0, 8.0), pos2(120.0, 120.0));
+    let collapsed = Rect::from_min_max(pos2(8.0, 8.0), pos2(120.0, 8.0));
+    let right = Rect::from_min_max(pos2(136.0, 8.0), pos2(248.0, 120.0));
+    let slow_value = |frames: u32| [0, 32, 64, 96, 128].get(usize::try_from(frames).unwrap_or(0)).copied().unwrap_or(0);
+    // Frames 1, 2 and 4 draw the slow entry A; frame 3 collapses it. B (fast) steps every frame.
+    for (frame, a_steps) in [(1, Some(1)), (2, Some(2)), (3, None), (4, Some(3))] {
+        let a_rect = if a_steps.is_some() { left } else { collapsed };
+        let mut paint = |ui: &mut egui::Ui| {
+            halves(ui.painter());
+            ShaderLayer::from_entries([Entry::new(a_rect, slow.clone()), Entry::new(right, accumulator())]).id(id).paint(ui.painter());
+        };
+        let (pixels, _) = render_frame(&ctx, &state, &target, &mut paint);
+        assert_grey(&pixels, 190, 60, accumulated(frame), &format!("frame {frame}, the later entry"));
+        if let Some(steps) = a_steps {
+            assert_grey(&pixels, 60, 60, slow_value(steps), &format!("frame {frame}, the earlier entry"));
+        }
+    }
     assert!(egui_shader_layers::failed_states(&ctx).is_empty());
 }
 

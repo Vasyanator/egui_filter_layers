@@ -210,6 +210,12 @@ impl ShaderLayer {
     }
 
     /// Appends `entry` (painted after the existing ones); the layer's rect grows to include it.
+    ///
+    /// The entry is taken as it is: layer-level builders called BEFORE this one
+    /// ([`ShaderLayer::mask`], [`ShaderLayer::corner_radius`], [`ShaderLayer::regions`],
+    /// [`ShaderLayer::texture`], [`ShaderLayer::state`]) do not reach it — e.g.
+    /// `.corner_radius(8).with_entry(e)` leaves `e` with its own mask. Call them after, or set
+    /// them on the [`Entry`].
     #[must_use]
     pub fn with_entry(mut self, entry: Entry) -> Self {
         self.entries.push(entry);
@@ -238,7 +244,8 @@ impl ShaderLayer {
     /// Gives the layer a stable identity (e.g. `ui.id().with("water")`), REQUIRED when a chain
     /// has a state pass ([`crate::Effect::new_state`]): the layer's persistent state is found
     /// again by this id (and the painting viewport) every frame; every stateful entry keeps its
-    /// own state under it. Paint one id once per frame: a second paint in the same frame shows the
+    /// own state under it, keyed by its index in the entry list (an earlier entry that draws
+    /// nothing for a while does not shift it). Paint one id once per frame: a second paint in the same frame shows the
     /// state without stepping it. A state not painted for 120 frames of its viewport and 2
     /// seconds is freed; [`crate::reset_state`] zeroes it (every entry's) at the next paint the
     /// backend runs.
@@ -383,8 +390,9 @@ impl ShaderLayer {
 
     /// Adds the layer to `painter` at the current position in its paint list.
     ///
-    /// Entries with an empty chain or a non-positive rect are left out; a layer with none left
-    /// does nothing. Requests a repaint when a chain is animated. With no backend installed on
+    /// Entries with an empty chain or a non-positive rect are left out (the others keep their
+    /// index: a stateful entry keeps its state while an earlier entry collapses to nothing and
+    /// back); a layer with none left does nothing. Requests a repaint when a chain is animated. With no backend installed on
     /// the painter's context, logs a warning once per context and paints nothing; with a failed
     /// backend, paints nothing (the failure was logged when it happened). Neither case requests
     /// repaints — see [`crate::status`]. A layer ANY of whose entries fails
@@ -418,9 +426,11 @@ impl ShaderLayer {
             log_mask_error_once(ctx, entry, &error);
             return;
         }
-        let entries: Vec<Entry> = self.entries.into_iter().filter(Entry::is_drawable).collect();
+        // Non-drawable entries are left out of the job, but each kept entry carries its USER
+        // index: its state key and attributions must not shift when an earlier entry collapses.
+        let entries: Vec<(usize, Entry)> = self.entries.into_iter().enumerate().filter(|(_, entry)| entry.is_drawable()).collect();
         // An effect reading `fl.time` must keep moving in an otherwise idle app.
-        if entries.iter().any(|entry| entry.chain().is_animated()) {
+        if entries.iter().any(|(_, entry)| entry.chain().is_animated()) {
             ctx.request_repaint();
         }
         // f64 seconds -> f32: effects only need a smooth phase, and f32 keeps millisecond
@@ -428,13 +438,13 @@ impl ShaderLayer {
         #[allow(clippy::cast_possible_truncation)] // Intentional precision reduction, see above.
         let time = ctx.input(|input| input.time) as f32;
         let frame_input = frame_input(ctx);
-        let stateful = entries.iter().any(Entry::is_stateful);
+        let stateful = entries.iter().any(|(_, entry)| entry.is_stateful());
         // Handed only to a stateful layer's paint, so a request waits for the layer it targets;
         // the backend claims it where the state registry actually runs.
         let reset_state = if stateful { self.id.and_then(|id| pending_reset(ctx, id)) } else { None };
         let viewport = ctx.viewport_id();
-        let rect = entries.iter().fold(Rect::NOTHING, |union, entry| union.union(entry.rect()));
-        let entries = entries.into_iter().map(|entry| entry.resolve(|mask, rect| resolve_mask(ctx, mask, rect))).collect();
+        let rect = entries.iter().fold(Rect::NOTHING, |union, (_, entry)| union.union(entry.rect()));
+        let entries = entries.into_iter().map(|(index, entry)| entry.resolve(index, |mask, rect| resolve_mask(ctx, mask, rect))).collect();
         let job = LayerJob { rect, entries, overlap: self.overlap, time, frame_input, id: self.id, viewport, reset_state };
         backend.paint_layer(painter, job);
     }
@@ -827,6 +837,74 @@ mod tests {
         output.textures_delta.clear();
         let jobs = std::mem::take(&mut *backend.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
         assert_eq!(jobs, [(a.union(b), vec![a, b], Overlap::Stacked)], "one job, the empty-chain entry left out; failing layers and a layer of empty chains send none");
+    }
+
+    /// `(user index, state key)` of every entry of one job.
+    type JobKeys = Vec<(usize, Option<crate::state::StateKey>)>;
+
+    /// A backend that keeps the [`JobKeys`] of every job.
+    struct EntryKeys {
+        jobs: std::sync::Mutex<Vec<JobKeys>>,
+    }
+
+    impl Backend for EntryKeys {
+        fn kind(&self) -> BackendKind {
+            BackendKind::Glow
+        }
+        fn status(&self) -> BackendStatus {
+            BackendStatus::Installed { backend: BackendKind::Glow }
+        }
+        fn failed_effects(&self) -> Vec<EffectFailure> {
+            Vec::new()
+        }
+        fn failed_textures(&self) -> Vec<TextureFailure> {
+            Vec::new()
+        }
+        fn failed_states(&self) -> Vec<crate::state::StateFailure> {
+            Vec::new()
+        }
+        fn state_count(&self) -> usize {
+            0
+        }
+        fn paint_layer(&self, _painter: &Painter, job: LayerJob) {
+            let keys = job.entries.iter().enumerate().map(|(position, entry)| (entry.index, job.state_key(position))).collect();
+            self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(keys);
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// R3: an entry left out of the job (empty chain, zero-size rect) does not shift the later
+    /// entries: the kept entry carries its USER index, its state key is the layer key `.with(user
+    /// index)` whether or not the earlier entry draws, and check errors name the user index.
+    #[test]
+    fn a_non_drawable_entry_keeps_the_user_indices() {
+        let Ok(state) = crate::Effect::new_state("sim", "fn effect(uv: vec2<f32>) -> vec4<f32> { return state(uv); }") else { panic!("must compile") };
+        let Ok(textured) = crate::Effect::new("textured", "fn effect(uv: vec2<f32>) -> vec4<f32> { return tex(2u, uv); }") else { panic!("must compile") };
+        let a = Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0));
+        let collapsed = Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 0.0));
+        let b = Rect::from_min_size(pos2(50.0, 20.0), vec2(10.0, 30.0));
+        let id = Id::new("entries keep indices");
+        let stateful = Entry::new(b, crate::Pass::new(&state));
+        let before = |a_rect: Rect, a_chain: FilterChain| ShaderLayer::from_entries([Entry::new(a_rect, a_chain), stateful.clone()]);
+        assert_eq!(before(collapsed, presets::invert(1.0).into()).check_state(), Err(StateError::MissingId { effect: "sim".to_owned(), pass: 0, entry: 1 }));
+        let missing = ShaderLayer::from_entries([Entry::new(a, FilterChain::new()), Entry::new(b, crate::Pass::new(&textured))]);
+        assert_eq!(missing.check_textures(), Err(TextureError::NotAttached { entry: 1, effect: "textured".to_owned(), pass: 0, slot: 2 }));
+
+        let ctx = Context::default();
+        let backend = Arc::new(EntryKeys { jobs: std::sync::Mutex::new(Vec::new()) });
+        register(&ctx, Arc::clone(&backend) as Arc<dyn Backend>);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let painter = Painter::new(ui.ctx().clone(), LayerId::background(), Rect::EVERYTHING);
+            before(a, presets::invert(1.0).into()).id(id).paint(&painter);
+            before(collapsed, presets::invert(1.0).into()).id(id).paint(&painter);
+            before(a, FilterChain::new()).id(id).paint(&painter);
+        });
+        output.textures_delta.clear();
+        let jobs = std::mem::take(&mut *backend.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        let key = crate::plan::entry_state_key(crate::state::StateKey { viewport: ctx.viewport_id(), id }, 1);
+        assert_eq!(jobs, [vec![(0, None), (1, Some(key))], vec![(1, Some(key))], vec![(1, Some(key))]], "the stateful entry keeps index 1 and its key");
     }
 
     /// The "no backend installed" latch is per `Context`: set once per context, independent between contexts.

@@ -504,6 +504,7 @@ Each phase is marked done here in the same commit that lands it.
 - Phase R3b (§19.4.7 entries on glow: `render.rs` executes `plan::schedule(.., CaptureSource::Framebuffer)` op by op (`execute`: `capture_entry` / `run_entry` / `composite_entry`; a hand-off op, a run before its capture or two runs without a composite latch as crate bugs), `Resources::captures` pool (`ensure_captures`, one RGBA8 capture per entry index; ping-pong / coverage / region targets shared), `BlendedComposite` (erase `ZERO, ONE_MINUS_SRC_ALPHA` + add `ONE, ONE`, `composite_erase_module` / `composite_add_module` un-gated) for layers of several entries, replace composite unchanged for one; `prepare` settles programs, blended programs, rasterizer and state formats of every visible entry before the first capture, `mod.rs` resolves every entry's textures first; per-entry states (`StateRegistry::get_mut`, begin at `Run`, finish after `Composite`, reset claimed once); `LayerOutcome::PassFailed` / `PassesFailed` name the entry; `Unsupported::MultiEntryLayers` and every R3a TEMPORARY `allow(dead_code)` removed (`composite_for_origin` keeps a non-temporary glow-only allow: only pristine backends hand off); glow headless tests mirroring wgpu: far-apart windows (`fl.size_px`), Independent / Stacked overlap incl. AA edge at 0 and 4x MSAA (1 step from the wgpu expectation, asserted <= 1), three stacked padded entries, Stacked == Independent outside the earlier mask (0 pixels differ), per-entry states / textures, single- and multi-entry layers plus an invisible entry in one frame; mutation-checked: the replace composite for multi-entry layers fails the Independent AA edge): done.
 - Phase R2b (§19.5 bench part 2: `tests/common/mod.rs` `Mode` gains `Entries` / `EntriesStacked` (one layer, one entry per tile, the glass chain with its own `p.index`) and the mixed variants `LayersMixed` / `RegionsMixed` / `EntriesMixed` (odd tiles pixelate; Regions = blur + `MIXED_TINT_WGSL` branching on the region id, pixelating `original()`); both `bench_many_elements` run every mode; demo `grid`: `GridMode::{Entries, EntriesStacked}` + a "mixed" toggle; README "Performance: many elements" section): done. Numbers (dev machine, Ryzen 5 9600X iGPU, Mesa 26.0.3, release, 256x128, ms/frame, N = 4 / 16 / 64) — wgpu/Vulkan: backdrop 0.09, layers 0.57 / 1.39 / 5.75, regions 0.41 / 0.42 / 0.53, entries 0.57 / 1.38 / 5.97, entries-stacked 0.60 / 2.23 / 9.74, layers-mixed 0.40 / 1.10 / 3.78, regions-mixed 0.41 / 0.44 / 0.55, entries-mixed 0.43 / 1.09 / 4.03; glow: backdrop 0.16, layers 0.50 / 0.80 / 1.64, regions 0.41 / 0.43 / 0.56, entries 0.49 / 0.81 / 1.61, entries-stacked 0.49 / 0.82 / 1.60, layers-mixed 0.37 / 0.60 / 1.22, regions-mixed 0.42 / 0.43 / 0.57, entries-mixed 0.36 / 0.60 / 1.19.
 - Phase R4 docs (every document made coherent for the final 0.2.0: stale glow multi-entry refusal text removed from CHANGELOG / `lib.rs` / `src/MODULE_README.md`; CHANGELOG `[0.2.0]` Added regions (one capture, pixel-hard boundaries), entries (glow too), the coverage snap under shape masks, the bench + guide, demo `grid`; Changed lists `region` / `region_at` / `REGION_NONE` as reserved prelude names, `rect()` / `chain()` over entries, `fl` block 352 -> 464 bytes; README "Choosing layers, regions or entries" section (capability table + rule of thumb, the measurements under it), feature list and compatibility note updated, `grid` in the demo scene table; `lib.rs` "Regions and entries" section with the rule of thumb and the full bench table, no phase / roadmap references in public docs): done.
+- Review fixes (regions/entries) (review-r: M1 `EntryJob::index` carries the USER entry index, `LayerJob::state_key(position)` keys by it, so a non-drawable earlier entry (empty chain / zero rect) no longer shifts later entries' states — UI now keys like offline; L1 on `*Srgb` wgpu UI targets a `Stacked` hand-off mixes in linear like the screen composite (`chain::HandoffSpace`, `composite_handoff_linear_module`: decode, mix, re-encode in the shader; `WgpuResources::linear_handoff`), also without view formats (GL); glow's blended composite only for >1 VISIBLE entry (`blended_layer`); `with_entry` doc; lossy `as` removed from `tests/common/mod.rs`; tests: unit `a_non_drawable_entry_keeps_the_user_indices`, GPU `stateful_entry_keeps_its_state_while_an_earlier_entry_collapses` (wgpu + glow), `stacked_hand_off_edges_match_the_screen_composite` (wgpu, gamma + sRGB), all three mutation-checked): done.
 
 ## 18. Findings during execution
 - Phase 1: naga's GLSL writer rejects one texture read through two samplers in one module
@@ -773,6 +774,21 @@ Each phase is marked done here in the same commit that lands it.
   with non-overlapping tiles, because `plan::schedule` hands off into every later entry whose
   PADDED capture meets the earlier region (neighbours within the blur radius) — correct per the
   stacked contract; glow (framebuffer capture order) pays nothing for it.
+- Review fixes (regions/entries): the UI job left non-drawable entries out and keyed states by
+  the JOB position, so `[A stateful, B stateful]` with A collapsed to height 0 for a frame ran B on
+  A's state (and swapped them back afterwards); offline kept the user index. Fixed by carrying the
+  user index in `EntryJob` rather than keeping non-drawable entries in the job: a zero rect plus
+  padding still yields a capture, so keeping them would need guards in the plugin's selection,
+  texture resolution and geometry. Rule: a job position indexes per-job arrays only; identities
+  (state keys, attributions) use `EntryJob::index`.
+- The gamma hand-off on an `*Srgb` UI target was measured, not just derived: an earlier entry's
+  0.75-coverage edge read 76 inside an identity `Stacked` entry vs 125 outside it (230 grey
+  backdrop, invert). A first fix drew the screen's blended composite through the capture's sRGB
+  view, which failed on GL (no `VIEW_FORMATS`, so no sRGB view); the kept fix is a replace
+  composite variant that decodes, mixes in linear and re-encodes in the shader (exact at coverage
+  0 / 1 like the gamma one), passing on Vulkan and GL. A
+  half-pixel entry edge (x = 20.5) rounds the region away from that column; tests use quarter
+  pixels for AA edges.
 
 # 19. Multi-region layers (R1 regions, R2 benchmark, R3 entries) — design and phases
 
@@ -1026,8 +1042,9 @@ its coverage. Composite in list order: `screen ← mix(screen, f_k, c_k)`.
 * `Independent`: entry k's capture is `backdrop` (no entry's result). Where entries overlap,
   the later entry's filtered backdrop wins, blended by `c_k` at its AA edge.
 * `Stacked`: entry k's capture is `backdrop` with every earlier entry j < k composited:
-  `mix(capture_k, f_j, c_j)` over `region_j ∩ capture_k`, in gamma space with the replace
-  composite's exact-at-0/1 mix. Like separate layers on glow today; UNLIKE separate layers on
+  `mix(capture_k, f_j, c_j)` over `region_j ∩ capture_k`, in the space the screen composite
+  mixes in (gamma with the replace composite's exact-at-0/1 mix; linear on an `*Srgb` wgpu UI
+  target with an sRGB capture view, §18 review fixes). Like separate layers on glow today; UNLIKE separate layers on
   wgpu today (§13 gap: a lower layer is a skipped callback) — within one layer both backends
   give this contract.
 How each backend meets it (D4, D8):

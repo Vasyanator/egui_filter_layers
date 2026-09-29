@@ -80,7 +80,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   share one paint callback (on wgpu one selection and tessellation of the content beneath) and
   are composited in list order. Layer-level builders apply to every entry, accessors return the
   first entry's, `ShaderLayer::rect` is the union; a stateful entry keeps its own state under the
-  layer id (`reset_state` resets all). Offline: `OfflineEntry`, `OfflineLayer`,
+  layer id and its index in the list, also while an earlier entry draws nothing (`reset_state`
+  resets all). On an `*Srgb` wgpu target a `Stacked` hand-off mixes in linear like the screen
+  composite, so an earlier entry's antialiased edge looks the same inside a later entry. Offline: `OfflineEntry`, `OfflineLayer`,
   `OfflineRenderer::process_layer` / `process_layer_into` / `process_layer_async` (bit-identical
   to the UI in both modes, never tiled: `NotTileable` above the tile limit). Runs on the wgpu and
   glow backends and offline. `TextureError::InvalidSlot` / `NotAttached` and

@@ -21,7 +21,8 @@ anything is recorded, so a failing effect skips the layer without leaving half-r
 Then the ops of `plan::schedule` (pristine source) run in order (R3): the beneath meshes are
 packed and uploaded once (into the first visible entry's pool slot); `Capture` re-renders them
 into that entry's own capture (scissored per mesh), `Run` records its chain (one pool slot per
-entry), `HandOff` draws an earlier entry's replace composite into a later capture (`Stacked`),
+entry), `HandOff` draws an earlier entry's replace composite into a later capture (`Stacked`; mixing in
+linear on `*Srgb` targets, `WgpuResources::linear_handoff`, like the screen composite),
 `Composite` is kept for `paint`, which draws them in that order. Nothing here panics; a missing plan
 (the end-of-pass plugin never saw the layer) or a mismatched generation simply draws nothing
 (the missing plan is debug-logged once per install, `Shared::logged`).
@@ -46,7 +47,7 @@ use egui::epaint::{ClippedPrimitive, Primitive};
 use egui_wgpu::{CallbackResources, ScreenDescriptor};
 
 use super::coverage::CoverageJob;
-use super::chain::{ChainJob, ChainRecording, ChainSource, ChainState, ChainWindow, RecordedRun, draw_composite_over};
+use super::chain::{ChainJob, ChainRecording, ChainSource, ChainState, ChainWindow, HandoffSpace, RecordedRun, draw_composite_over};
 use super::gpu::{Target, begin_pass};
 use super::resources::{CAPTURE_FORMAT, CAPTURE_SRGB_VIEW_FORMAT, WgpuResources};
 use super::{BeneathPlan, Drawn, DrawnEntry, LayerSlot, LoggedOnce, Shared};
@@ -356,7 +357,9 @@ impl FilterCallback {
                 Op::HandOff { from, into, viewport, .. } => {
                     let group = handoffs.get_mut(from)?.next()?;
                     let target = resources.pool.get((*pool.get(into)?)?)?.capture.as_ref()?;
-                    resources.chain.record_handoff(rec.encoder, &group, &target.view, viewport);
+                    // In the space `paint`'s screen composite blends in (linear on `*Srgb`).
+                    let space = if resources.linear_handoff { HandoffSpace::Linear } else { HandoffSpace::Gamma };
+                    resources.chain.record_handoff(rec.encoder, &group, &target.view, viewport, space);
                 }
                 Op::Composite(index) => drawn.push(DrawnEntry { entry: index, pool_index: (*pool.get(index)?)?, region: geometries.get(index).copied().flatten()?.region }),
             }

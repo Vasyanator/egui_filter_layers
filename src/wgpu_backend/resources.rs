@@ -94,6 +94,10 @@ pub(super) struct WgpuResources {
     /// supports `DownlevelFlags::VIEW_FORMATS`): semi-transparent meshes then blend in linear like
     /// egui's own draws. `false` on a `*Srgb` target is the documented GL / WebGL2 gap.
     pub srgb_capture: bool,
+    /// Whether `Stacked` hand-offs mix in linear (`chain::HandoffSpace::Linear`): the target is
+    /// `*Srgb`, so the screen composite (`composite`) blends in linear. Independent of
+    /// `srgb_capture` (the hand-off decodes and re-encodes in its shader).
+    pub linear_handoff: bool,
     /// Per-layer targets of the frame being prepared.
     pub pool: Vec<LayerTargets>,
     /// Next free `pool` entry in the frame being prepared.
@@ -156,7 +160,7 @@ impl WgpuResources {
             (mesh_locals_layout, mesh_pipeline)
         })?;
 
-        Ok(Self { generation, chain, composite, mesh_locals_layout, mesh_pipeline, srgb_capture, pool: Vec::new(), cursor: 0, states: StateRegistry::default() })
+        Ok(Self { generation, chain, composite, mesh_locals_layout, mesh_pipeline, srgb_capture, linear_handoff: target_format.is_srgb(), pool: Vec::new(), cursor: 0, states: StateRegistry::default() })
     }
 
     /// The next free per-layer targets of this frame.

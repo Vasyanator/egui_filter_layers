@@ -151,8 +151,8 @@ struct LayerRun<'a> {
     caller: CallerState,
     /// Whether the context is GLES / WebGL (affects how the default read buffer is named).
     embedded: bool,
-    /// A layer of several entries: every entry composites with the BLENDED composite (D4), so a
-    /// later entry lands over an earlier one; a single entry keeps the replace composite.
+    /// A layer of several VISIBLE entries: every entry composites with the BLENDED composite (D4),
+    /// so a later entry lands over an earlier one; a single visible entry keeps the replace composite.
     blended: bool,
     /// The layer's `reset_state` request, claimed once for this paint (every stateful entry).
     reset: bool,
@@ -160,7 +160,8 @@ struct LayerRun<'a> {
 
 /// The inputs of one VISIBLE entry (`plan::schedule` gives invisible entries no op).
 struct EntryRun<'a> {
-    /// The entry's index in the layer (its capture target, its state key, its ops).
+    /// The entry's position in the job (its capture target and its ops; its state key goes
+    /// through `LayerJob::state_key`, which keys by the user index `EntryJob::index`).
     index: usize,
     /// The entry.
     entry: &'a EntryJob,
@@ -214,7 +215,7 @@ enum LayerOutcome {
     },
     /// Pass `index` of entry `entry` raised `error`: disable its effect.
     PassFailed {
-        /// Index into the layer's entries.
+        /// Position in the job's entries (`LayerJob::entries`).
         entry: usize,
         /// Index into that entry's passes.
         index: usize,
@@ -223,11 +224,17 @@ enum LayerOutcome {
     },
     /// The passes of entry `entry` raised `error` but several effects could have caused it.
     PassesFailed {
-        /// Index into the layer's entries.
+        /// Position in the job's entries (`LayerJob::entries`).
         entry: usize,
         /// The GL error.
         error: u32,
     },
+}
+
+/// Whether a layer composites with the BLENDED composite: more than one VISIBLE entry (a lone
+/// visible entry of a multi-entry layer draws exactly like a single-entry layer, replace composite).
+fn blended_layer(geometries: &[Option<LayerGeometry>]) -> bool {
+    geometries.iter().flatten().nth(1).is_some()
 }
 
 /// A latch for a schedule / bookkeeping inconsistency (a crate bug, never a driver's).
@@ -322,7 +329,7 @@ unsafe fn paint_saved(gl: &glow::Context, state: &mut GlowState, target: GlslTar
         let Some(programs) = prepare(gl, state, target, job, &geometries, textures) else {
             return;
         };
-        let blended = job.entries.len() > 1;
+        let blended = blended_layer(&geometries);
         let Some(mut resources) = state.resources.take() else {
             return;
         };
@@ -391,7 +398,7 @@ unsafe fn prepare(gl: &glow::Context, state: &mut GlowState, target: GlslTarget,
         }
         // The blended composite is created with the first multi-entry layer (a failure is a
         // crate bug in the composite shader or a driver refusal: latched like the composite's).
-        if job.entries.len() > 1
+        if blended_layer(geometries)
             && let Some(resources) = state.resources.as_mut()
             && resources.blended.is_none()
         {

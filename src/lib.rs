@@ -338,7 +338,8 @@ module names a backend type.
 //!   while separate layers on wgpu cannot see each other). Composites are in list order. The
 //!   layer-level builders (`mask`, `corner_radius`, `regions`, `texture`, `state`) apply to every
 //!   entry present, the accessors return the first entry's; a stateful entry keeps its own state
-//!   under the layer's id, and [`reset_state`] resets them all. A layer is drawn or refused as a
+//!   under the layer's id and its index in the list (also while an earlier entry draws nothing),
+//!   and [`reset_state`] resets them all. A layer is drawn or refused as a
 //!   whole (any failing entry refuses it). Offline: `OfflineLayer` + `OfflineEntry` with
 //!   `OfflineRenderer::process_layer` (never tiled). Entries run on the wgpu and glow backends and
 //!   offline, in both overlap modes.

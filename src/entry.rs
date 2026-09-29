@@ -217,11 +217,12 @@ impl Entry {
         self.state = options;
     }
 
-    /// The entry as the backend sees it; `resolve_mask` turns the mask into its job form (a shape
+    /// The entry as the backend sees it, as the layer's entry `index` (the user's index, kept for
+    /// state keys and attributions); `resolve_mask` turns the mask into its job form (a shape
     /// tessellated on the GUI thread, in the entry's rect).
-    pub(crate) fn resolve(self, resolve_mask: impl FnOnce(Mask, Rect) -> JobMask) -> EntryJob {
+    pub(crate) fn resolve(self, index: usize, resolve_mask: impl FnOnce(Mask, Rect) -> JobMask) -> EntryJob {
         let padding_points = self.chain.padding_points();
-        EntryJob { rect: self.rect, mask: resolve_mask(self.mask, self.rect), passes: self.chain.into_passes(), padding_points, textures: self.textures, state: self.state }
+        EntryJob { index, rect: self.rect, mask: resolve_mask(self.mask, self.rect), passes: self.chain.into_passes(), padding_points, textures: self.textures, state: self.state }
     }
 }
 

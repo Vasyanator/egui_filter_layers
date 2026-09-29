@@ -10,8 +10,8 @@ user code ──► ShaderLayer::paint (layer.rs; one or more `Entry`s, entry.rs
                  │  checks every entry's user textures (plan::check_textures), the state id
                  │  (check_state) and the mask (check_mask); tessellates shape masks (mask.rs,
                  │  GUI thread); resolves the entries -> LayerJob (union rect, overlap, time,
-                 │  frame_input, id / viewport / reset ticket) + one EntryJob per entry (rect,
-                 │  mask, passes, padding, textures, state options)
+                 │  frame_input, id / viewport / reset ticket) + one EntryJob per DRAWABLE
+                 │  entry (user index, rect, mask, passes, padding, textures, state options)
                  ▼
           backend registry plugin (backend.rs)       ──►  Arc<dyn Backend>
                  │                                         ├─ glow_backend/  (feature "glow")
@@ -39,8 +39,9 @@ user code ──► ShaderLayer::paint (layer.rs; one or more `Entry`s, entry.rs
   OWN padded rect (never the union); `plan::schedule` is the single owner of the order of
   captures, runs, `Stacked` hand-offs and composites for every backend (`CaptureSource::Pristine`:
   wgpu UI and offline; `Framebuffer`: glow, where a later capture already sees the earlier
-  composites, so it needs no hand-off). A `Stacked` hand-off on a pristine source is the replace
-  composite of an earlier entry drawn into a later entry's capture (`wgpu_backend/chain.rs::record_handoff`, UI and offline).
+  composites, so it needs no hand-off). A `Stacked` hand-off on a pristine source is the composite
+  of an earlier entry drawn into a later entry's capture (`wgpu_backend/chain.rs::record_handoff`,
+  UI and offline), mixing in the same space as the screen composite (linear on an `*Srgb` UI target).
 - **Coordinates**: effect `uv` is top-left origin, y down on every backend. A backend whose
   texture storage is bottom-up sets `FrameUniforms::flip_y`; the prelude's `src()` applies it.
   Intermediates are grow-only; `src_scale` / `aux_scale` map the used region to storage.
@@ -90,7 +91,8 @@ user code ──► ShaderLayer::paint (layer.rs; one or more `Entry`s, entry.rs
   `ShaderLayer::texture` attaches user textures (F8); `ShaderLayer::id` / `state` /
   `check_state` (F7: a stateful chain without an id is skipped, logged once per message).
 - `backend.rs`: crate-internal `Backend` trait, `LayerJob` (backend-neutral: union rect, overlap,
-  time, `FrameInput`, id, reset ticket) with one `EntryJob` per entry (rect, mask, passes, padding,
+  time, `FrameInput`, id, reset ticket) with one `EntryJob` per drawable entry (user index — the
+  identity for state keys and attributions, never the job position —, rect, mask, passes, padding,
   attached texture ids, state options), registry (`register`, `installed`, `uninstall`; a hook-less egui plugin, so it
   lives in the `Context` and survives `Memory` resets), public `status`, `failed_effects`,
   `failed_textures`, `BackendStatus`, `EffectFailure`, `TextureError`, `TextureFailure`, `InstallError`.

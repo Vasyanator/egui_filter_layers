@@ -461,6 +461,11 @@ const COMPOSITE_ADD_GAMMA_TAIL: &str =
 const COMPOSITE_ADD_LINEAR_TAIL: &str =
     "fn effect(frag_uv: vec2<f32>) -> vec4<f32> {\n    let uv = fl_composite_uv(frag_uv);\n    let coverage = fl_coverage_or_discard(uv);\n    return coverage * to_linear(src(uv));\n}\n";
 
+/// `effect` wrapper of the `Stacked` hand-off into a later entry's (gamma-stored) capture when the
+/// UI target is `*Srgb`: the same exact-at-0/1 replace composite, but mixing in LINEAR and storing
+/// gamma again, so the hand-off matches the screen composite, which blends in linear there.
+const COMPOSITE_HANDOFF_LINEAR_TAIL: &str = "fn effect(frag_uv: vec2<f32>) -> vec4<f32> {\n    let uv = fl_composite_uv(frag_uv);\n    let filtered = src(uv);\n    let unfiltered = original(uv);\n    let coverage = fl_coverage(uv);\n    let mixed = to_gamma(mix(to_linear(unfiltered), to_linear(filtered), coverage));\n    return select(select(mixed, filtered, coverage >= 1.0), unfiltered, coverage <= 0.0);\n}\n";
+
 /// Compiles the composite body with one of the `effect` wrappers.
 fn compile_composite(label: &str, tail: &str) -> Result<Arc<CompiledModule>, EffectError> {
     let mut snippet = String::with_capacity(COMPOSITE_WGSL.len() + tail.len() + 1);
@@ -520,6 +525,17 @@ pub(crate) fn composite_add_module() -> Result<Arc<CompiledModule>, EffectError>
 pub(crate) fn composite_add_linear_module() -> Result<Arc<CompiledModule>, EffectError> {
     static COMPOSITE: OnceLock<Result<Arc<CompiledModule>, EffectError>> = OnceLock::new();
     COMPOSITE.get_or_init(|| compile_composite("egui_shader_layers::composite_add_linear", COMPOSITE_ADD_LINEAR_TAIL)).clone()
+}
+
+/// The `Stacked` hand-off composite mixing in linear (see [`COMPOSITE_HANDOFF_LINEAR_TAIL`]),
+/// compiled once per process.
+///
+/// # Errors
+/// As [`composite_module`].
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))] // Only wgpu hands off (a pristine capture source).
+pub(crate) fn composite_handoff_linear_module() -> Result<Arc<CompiledModule>, EffectError> {
+    static COMPOSITE: OnceLock<Result<Arc<CompiledModule>, EffectError>> = OnceLock::new();
+    COMPOSITE.get_or_init(|| compile_composite("egui_shader_layers::composite_handoff_linear", COMPOSITE_HANDOFF_LINEAR_TAIL)).clone()
 }
 
 #[cfg(test)]
