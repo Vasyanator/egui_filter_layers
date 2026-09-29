@@ -399,6 +399,9 @@ impl OfflineRenderer {
         // layer (layer points = frame pixels / ppp, no transform) and the screen.
         let coverage = match &options.mask {
             Mask::RoundedRect(_) => None,
+            // `OfflineOptions::validate` refused it already; kept explicit so no run ever treats
+            // regions as a plain mask.
+            Mask::Regions(_) => return Err(options::regions_unsupported()),
             Mask::Shape(shape) => {
                 let frame_rect = frame_rect(size, options.pixels_per_point)?;
                 let meshes = tessellate(shape.clone(), frame_rect, options.pixels_per_point, TessellationOptions::default(), [1, 1]);
@@ -609,7 +612,8 @@ impl OfflineRenderer {
                 state: run.state,
                 // Untextured meshes only (`Mask::check_offline`): the white group stands in for
                 // egui's white atlas pixel.
-                coverage: run.coverage.map(|(packed, transform)| CoverageJob { packed, transform: *transform, textures: vec![resources.coverage().white_group(); packed.draws.len()] }),
+                // No region ranges: region masks are refused offline before any run.
+                coverage: run.coverage.map(|(packed, transform)| CoverageJob { packed, transform: *transform, textures: vec![resources.coverage().white_group(); packed.draws.len()], regions: &[] }),
             };
             let recorded = resources.record(&mut ChainRecording { device, queue, encoder: &mut encoder }, &mut targets.chain, &job, state.as_mut());
             let Some((bind_group, planned_state)) = recorded else {
@@ -667,7 +671,7 @@ fn frame_geometry(size: [u32; 2], padding_points: f32, options: &OfflineOptions)
     let rect = frame_rect(size, ppp)?;
     let corner_radius = match &options.mask {
         Mask::RoundedRect(radius) => *radius,
-        Mask::Shape(_) => CornerRadius::ZERO,
+        Mask::Shape(_) | Mask::Regions(_) => CornerRadius::ZERO,
     };
     let geometry = layer_geometry(rect, Rect::EVERYTHING, ppp, size, padding_points, corner_radius, 1.0)
         .ok_or_else(|| OfflineError::InvalidOption { option: "pixels_per_point", reason: format!("{ppp} leaves no visible pixel of a {}x{} frame", size[0], size[1]) })?;

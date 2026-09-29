@@ -15,8 +15,9 @@ Key functions:
 - `CoverageResources::create()` / `draw()` / `destroy()`.
 
 Notes:
-The draw clears the target, enables egui_glow's premultiplied blend (`ONE, ONE_MINUS_SRC_ALPHA` /
-`ONE_MINUS_DST_ALPHA, ONE`) over `(0, 0, used)` and draws one `glDrawElements` per packed draw
+The draw clears the target, enables the ADDITIVE coverage union (`ONE, ONE` for colour and alpha,
+saturating in RGBA8: abutting pieces' complementary feathers sum to 1, so they leave no seam;
+the same rule as wgpu's `COVERAGE_BLEND`) over `(0, 0, used)` and draws one `glDrawElements` per packed draw
 with its texture on unit 0 (egui_glow's texture object, sampled through its own parameters).
 Indices are absolute (`mask::PackedCoverage`), so no base vertex is needed (GLES 3.0 has none).
 The locals block goes to `UNIFORM_BINDING_POINT` (re-bound by every later draw of the run). The
@@ -160,7 +161,8 @@ impl CoverageResources {
             gl.viewport(0, 0, used_px[0], used_px[1]);
             gl.enable(glow::BLEND);
             gl.blend_equation(glow::FUNC_ADD);
-            gl.blend_func_separate(glow::ONE, glow::ONE_MINUS_SRC_ALPHA, glow::ONE_MINUS_DST_ALPHA, glow::ONE);
+            // Additive union (roadmap §19 D1), identical to wgpu's `COVERAGE_BLEND`.
+            gl.blend_func(glow::ONE, glow::ONE);
             gl.use_program(Some(self.program));
             gl.bind_buffer(glow::UNIFORM_BUFFER, Some(self.locals));
             gl.buffer_sub_data_u8_slice(glow::UNIFORM_BUFFER, 0, locals);

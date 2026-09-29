@@ -21,7 +21,11 @@
 //! frame when the id is painted twice, stretched (not reset) when the layer grows past its
 //! allocation, dropped by a re-install; a stateful layer without an id is refused.
 //! Shape masks (F9): a circle filters inside and leaves everything outside untouched, incl. a lower
-//! filter layer; the AA edge is monotonic; star, transformed-layer and text-galley masks.
+//! filter layer; the AA edge is monotonic; star, transformed-layer and text-galley masks; abutting
+//! mask pieces leave no seam (additive coverage). Regions (R1): a 2x2 grid of abutting regions
+//! tinted per `region()` fills its cells, switches tint within a pixel of every shared edge with
+//! full coverage there and no `REGION_NONE` fringe; overlapping regions: the later one wins;
+//! `region()` is `REGION_NONE` outside the regions and on a layer without regions.
 //!
 //! All tests share one wgpu device (`GPU`, a test-only static; see there) and run in parallel on it.
 //!
@@ -34,7 +38,7 @@ use std::sync::Arc;
 
 use egui::{Align2, Color32, ColorImage, FontId, Pos2, Rect, TextureOptions, pos2, vec2};
 use egui::emath::TSTransform;
-use egui_filter_layers::{BackendStatus, Effect, FilterChain, FilterLayer, Pass, StateFormat, StateOptions, WgpuOptions, install_wgpu, presets};
+use egui_filter_layers::{BackendStatus, Effect, FilterChain, FilterLayer, Pass, Region, StateFormat, StateOptions, WgpuOptions, install_wgpu, presets};
 
 const WIDTH: u32 = 256;
 const HEIGHT: u32 = 128;
@@ -1215,6 +1219,27 @@ fn check_text_mask(pixels: &[u8], text_rect: Rect, what: &str) {
     assert!(green_inside > 300, "{what}: only {green_inside} glyph pixels filtered");
 }
 
+/// Two convex pieces meeting edge to edge at x = 60.5 (mid-pixel, so both feathers are 0.5
+/// there): the coverage union is additive (roadmap §19 D1), so the shared column is fully covered.
+fn abutting_pieces_scene(painter: &egui::Painter, green: &Pass) {
+    halves(painter);
+    let piece = |x0: f32, x1: f32| egui::Shape::convex_polygon(vec![pos2(x0, 20.0), pos2(x1, 20.0), pos2(x1, 100.0), pos2(x0, 100.0)], Color32::WHITE, egui::Stroke::NONE);
+    let pieces = egui::Shape::Vec(vec![piece(20.0, 60.5), piece(60.5, 100.0)]);
+    FilterLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), green.clone()).mask(egui_filter_layers::Mask::Shape(pieces)).paint(painter);
+}
+
+/// No seam on the shared edge (egui's "over" union would leave 0.75 coverage: about
+/// `[64, 191, 0]` over the red half); the outer edges stay anti-aliased / untouched.
+fn check_abutting_pieces(pixels: &[u8], what: &str) {
+    for y in [30, 60, 90] {
+        for x in 58..=62 {
+            assert_near(pixels, x, y, [0, 255, 0], &format!("{what}: shared edge column {x}, row {y}"));
+        }
+    }
+    assert_near(pixels, 15, 60, [255, 0, 0], &format!("{what}: left of the pieces"));
+    assert_near(pixels, 105, 60, [255, 0, 0], &format!("{what}: right of the pieces"));
+}
+
 /// F9 on wgpu: a circle mask filters inside only; outside it the BLENDED composite discards, so
 /// the screen keeps what egui drew there — including a lower filter layer's output in the upper
 /// layer's corner, which the re-rendered backdrop lacks; the anti-aliased edge is monotonic.
@@ -1251,4 +1276,188 @@ fn star_transformed_and_text_masks() {
     }
     assert!(egui_filter_layers::failed_textures(&ctx).is_empty(), "{:?}", egui_filter_layers::failed_textures(&ctx));
     assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+}
+
+/// D1 on wgpu: abutting mask pieces leave no seam (additive coverage union).
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn abutting_mask_pieces_leave_no_seam() {
+    let green = pass_of("green", GREEN_WGSL);
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    render_frame(&ctx, &state, &target, &mut |ui| abutting_pieces_scene(ui.painter(), &green));
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| abutting_pieces_scene(ui.painter(), &green));
+    check_abutting_pieces(&pixels, "wgpu");
+}
+
+// ---- R1: regions ----
+
+/// Paints `p.tint[region()]` (opaque), white where `region()` is `REGION_NONE`: a white tint in
+/// any covered pixel is a sentinel fringe.
+const REGION_TINT_WGSL: &str = "struct Params { tint: array<vec4<f32>, 4> }
+fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let r = region();
+    if r == REGION_NONE { return vec4<f32>(1.0); }
+    return p.tint[min(r, 3u)];
+}";
+
+/// The region tints by id: green, blue, cyan, magenta.
+const REGION_TINTS: [[u8; 3]; 4] = [[0, 255, 0], [0, 0, 255], [0, 255, 255], [255, 0, 255]];
+
+/// The tint pass of [`REGION_TINT_WGSL`] with [`REGION_TINTS`].
+fn region_tint_pass() -> Pass {
+    let mut pass = pass_of("region tint", REGION_TINT_WGSL);
+    let tints: Vec<[f32; 4]> = REGION_TINTS.iter().map(|tint| [f32::from(tint[0]) / 255.0, f32::from(tint[1]) / 255.0, f32::from(tint[2]) / 255.0, 1.0]).collect();
+    if let Err(error) = pass.set_slice("tint", &tints) {
+        panic!("{error}");
+    }
+    pass
+}
+
+/// A convex quad region `[x0, x1] x [y0, y1]` (points; a path, so half-pixel edges stay where
+/// they are instead of being rounded to pixels like a rect).
+fn quad_region(x0: f32, y0: f32, x1: f32, y1: f32) -> Region {
+    Region::shape(egui::Shape::convex_polygon(vec![pos2(x0, y0), pos2(x1, y0), pos2(x1, y1), pos2(x0, y1)], Color32::WHITE, egui::Stroke::NONE))
+}
+
+/// Red | blue halves and a layer over the red half split into a 2x2 grid of abutting regions,
+/// all edges at half pixels (x, y in {20.5, 60.5, 100.5}): ids 0 top-left, 1 top-right,
+/// 2 bottom-left, 3 bottom-right.
+fn region_grid_scene(painter: &egui::Painter, pass: &Pass) {
+    halves(painter);
+    let (a, b, c) = (20.5, 60.5, 100.5);
+    let cells = [quad_region(a, a, b, b), quad_region(b, a, c, b), quad_region(a, b, b, c), quad_region(b, b, c, c)];
+    FilterLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), pass.clone()).regions(cells).paint(painter);
+}
+
+/// Each cell holds its tint; on a shared edge (mid-pixel: both feathers 0.5, coverage 1 by the
+/// additive union) the tint switches from one cell's to the LATER cell's within one pixel with no
+/// backdrop showing; the four-cell junction pixel belongs to the last cell; the outer
+/// antialiased edge mixes the backdrop with the cell's tint, never with the sentinel white.
+fn check_region_grid(pixels: &[u8], what: &str) {
+    for (x, y, id) in [(40, 40, 0), (80, 40, 1), (40, 80, 2), (80, 80, 3)] {
+        assert_near(pixels, x, y, REGION_TINTS[id], &format!("{what}: centre of region {id}"));
+    }
+    // Vertical shared edge at x = 60.5: column 60 is shared, the later (right) region owns it.
+    for (y, left, right) in [(40, 0, 1), (80, 2, 3)] {
+        for x in 55..=65 {
+            let expected = if x <= 59 { REGION_TINTS[left] } else { REGION_TINTS[right] };
+            assert_near(pixels, x, y, expected, &format!("{what}: vertical edge, row {y}"));
+        }
+    }
+    // Horizontal shared edge at y = 60.5: row 60 belongs to the later (lower) region.
+    for (x, top, bottom) in [(40, 0, 2), (80, 1, 3)] {
+        for y in 55..=65 {
+            let expected = if y <= 59 { REGION_TINTS[top] } else { REGION_TINTS[bottom] };
+            assert_near(pixels, x, y, expected, &format!("{what}: horizontal edge, column {x}"));
+        }
+    }
+    assert_near(pixels, 60, 60, REGION_TINTS[3], &format!("{what}: the junction pixel belongs to the last region"));
+    // Outer edges (partly covered): the backdrop red mixed with the cell's tint by the coverage
+    // `c`, i.e. `(255 (1 - c), 255 c, 0)` for green and `(255 (1 - c), 255 c, 255 c)` for cyan;
+    // the white sentinel would give `(255, 255 c, 255 c)`. Row 60 is where the two left cells'
+    // outer corners meet: each corner feather is 0.5 there, so the additive union covers it
+    // fully (egui's own corner over-estimate, doubled).
+    for y in 25..=95 {
+        let [red, green, blue] = rgb(pixels, 20, y);
+        let consistent = if y <= 59 { blue <= 3 } else { green.abs_diff(blue) <= 3 };
+        assert!(consistent && (u16::from(red) + u16::from(green)).abs_diff(255) <= 6, "{what}: left outer edge (20, {y}) = {:?}: no sentinel fringe", [red, green, blue]);
+        assert!(green >= 100, "{what}: left outer edge (20, {y}) = {:?}: at least half covered", [red, green, blue]);
+        assert_near(pixels, 19, y, [255, 0, 0], &format!("{what}: left of the regions"));
+    }
+    for y in 25..=55 {
+        assert!(rgb(pixels, 100, y)[1] <= 3, "{what}: right outer edge (100, {y}) = {:?}: no sentinel fringe", rgb(pixels, 100, y));
+    }
+    assert_near(pixels, 105, 60, [255, 0, 0], &format!("{what}: inside the layer rect, outside every region"));
+}
+
+/// R1 on wgpu: abutting regions tint their own cells and own their edges.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn regions_tint_each_cell_and_own_their_edges() {
+    let pass = region_tint_pass();
+    for format in [wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Rgba8UnormSrgb] {
+        let (ctx, state, _texture, target) = setup(format);
+        render_frame(&ctx, &state, &target, &mut |ui| region_grid_scene(ui.painter(), &pass));
+        let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| region_grid_scene(ui.painter(), &pass));
+        // The sRGB target blends partly covered pixels in linear, which magnifies the 8-bit
+        // coverage quantization of a shared edge (two 0.5 feathers store 127/255 + 127/255 or so,
+        // a 1-step shortfall that shows as ~14 gamma steps of backdrop): only pixels one region
+        // covers fully are compared there.
+        if format.is_srgb() {
+            for (x, y, id) in [(40, 40, 0), (80, 40, 1), (59, 40, 0), (61, 40, 1), (40, 59, 0), (40, 61, 2), (80, 80, 3)] {
+                assert_near(&pixels, x, y, REGION_TINTS[id], &format!("{format:?}: region {id}"));
+            }
+        } else {
+            check_region_grid(&pixels, &format!("{format:?}"));
+        }
+        assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+    }
+}
+
+/// Paints red where `region()` is `REGION_NONE`, green elsewhere.
+const REGION_NONE_WGSL: &str = "fn effect(uv: vec2<f32>) -> vec4<f32> { return select(vec4<f32>(0.0, 1.0, 0.0, 1.0), vec4<f32>(1.0, 0.0, 0.0, 1.0), region() == REGION_NONE); }";
+
+/// R1 on wgpu: a circle region over the blue half is green inside, the screen (blue) outside it,
+/// and its antialiased edge mixes blue and green only (no pixel inside the mask reads
+/// `REGION_NONE`); the same effect on a layer without regions is red everywhere (the dummy).
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn region_none_outside_regions() {
+    let pass = pass_of("region none", REGION_NONE_WGSL);
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let rect = Rect::from_min_max(pos2(140.0, 20.0), pos2(240.0, 100.0));
+    let scene = |painter: &egui::Painter| {
+        halves(painter);
+        FilterLayer::new(rect, pass.clone()).regions([Region::shape(egui::Shape::circle_filled(pos2(190.3, 60.3), 30.0, Color32::WHITE))]).paint(painter);
+    };
+    render_frame(&ctx, &state, &target, &mut |ui| scene(ui.painter()));
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| scene(ui.painter()));
+    assert_near(&pixels, 190, 60, [0, 255, 0], "circle centre");
+    assert_near(&pixels, 145, 25, [0, 0, 255], "layer corner outside the circle: masked out");
+    for y in 20..100 {
+        for x in 140..240 {
+            let [red, _, _] = rgb(&pixels, x, y);
+            assert!(red <= 3, "({x}, {y}) = {:?}: a covered pixel read REGION_NONE", rgb(&pixels, x, y));
+        }
+    }
+    let row: Vec<[u8; 3]> = (190..=225).map(|x| rgb(&pixels, x, 60)).collect();
+    assert!(row.iter().any(|pixel| (8..248).contains(&pixel[1])), "an antialiased edge pixel: {row:?}");
+
+    let plain = |painter: &egui::Painter| {
+        halves(painter);
+        FilterLayer::new(rect, pass.clone()).paint(painter);
+    };
+    render_frame(&ctx, &state, &target, &mut |ui| plain(ui.painter()));
+    let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| plain(ui.painter()));
+    for (x, y) in [(145, 25), (190, 60), (235, 95)] {
+        assert_near(&pixels, x, y, [255, 0, 0], "a layer without regions reads REGION_NONE everywhere");
+    }
+    assert!(matches!(egui_filter_layers::status(&ctx), BackendStatus::Active { .. }), "{}", egui_filter_layers::status(&ctx));
+}
+
+/// R1 on wgpu: where regions overlap, the LATER one owns the pixels: a small region after a big
+/// one keeps its own tint inside the big one; listed before it, it disappears into the big one.
+#[test]
+#[ignore = "needs a GPU adapter (Vulkan / Metal / DX12 / GL); run with --ignored"]
+fn overlapping_regions_later_wins() {
+    let pass = region_tint_pass();
+    let (ctx, state, _texture, target) = setup(wgpu::TextureFormat::Rgba8Unorm);
+    let big = Region::rounded_rect(Rect::from_min_max(pos2(20.0, 20.0), pos2(100.0, 100.0)), 0);
+    let small = Region::rounded_rect(Rect::from_min_max(pos2(40.0, 40.0), pos2(80.0, 80.0)), 0);
+    for (regions, centre, what) in [([big.clone(), small.clone()], REGION_TINTS[1], "small after big"), ([small, big], REGION_TINTS[1], "small before big")] {
+        let scene = |painter: &egui::Painter| {
+            halves(painter);
+            FilterLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), pass.clone()).regions(regions.clone()).paint(painter);
+        };
+        render_frame(&ctx, &state, &target, &mut |ui| scene(ui.painter()));
+        let (pixels, _) = render_frame(&ctx, &state, &target, &mut |ui| scene(ui.painter()));
+        assert_near(&pixels, 60, 60, centre, &format!("{what}: centre (id 1)"));
+        let corner = if what == "small after big" { REGION_TINTS[0] } else { REGION_TINTS[1] };
+        assert_near(&pixels, 30, 30, corner, &format!("{what}: the big region's corner"));
+        // Hard boundary at the small region's edge (x = 40) when it is on top.
+        if what == "small after big" {
+            assert_near(&pixels, 39, 60, REGION_TINTS[0], &format!("{what}: left of the small region"));
+            assert_near(&pixels, 40, 60, REGION_TINTS[1], &format!("{what}: first column of the small region"));
+        }
+    }
 }

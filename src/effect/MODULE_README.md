@@ -16,13 +16,14 @@ Effect::new(label, snippet)
        naga Validator                           -> EffectError::Validation (located)
        interface::check_interface               bindings / entry points / `override`
        interface::texture_slots                 user texture slots the module may read
-  -> CompiledModule { id, label, source, module, info, params: ParamLayout, texture_slots }
+       interface::reads_regions                 whether the module reads region ids (R1)
+  -> CompiledModule { id, label, source, module, info, params: ParamLayout, texture_slots, reads_regions }
 ```
 Detection runs BEFORE the parse because a snippet reading `p.x` does not parse without the
 appended `var<uniform> p: Params;`; naga's IR then confirms it (the struct is found by name).
 
 ## Files and submodules
-- `mod.rs`: `Effect` (incl. `reads_texture`; `new_state` / `is_state`: a state pass, F7 — the
+- `mod.rs`: `Effect` (incl. `reads_texture`, `reads_regions`; `new_state` / `is_state`: a state pass, F7 — the
   same module, flagged on the `Effect`), `EffectError`, `CompiledModule`, binding constants
   (`@group(0)` bindings, user texture groups, public `TEXTURE_SLOTS`), `compile()`, the internal
   composite modules.
@@ -31,7 +32,8 @@ appended `var<uniform> p: Params;`; naga's IR then confirms it (the struct is fo
 - `interface.rs`: `PRELUDE_RESOURCES` (`(name, group, binding)`: `@group(0)` and the user
   texture groups 1..=3), `check_interface` (only prelude bindings, plus the crate's `p` at binding
   4 when `struct Params` was detected), `reads_time` (animated detection), `texture_slots` (which
-  user texture slots a module reads).
+  user texture slots a module reads), `reads_regions` (a snippet function calls `region()` /
+  `region_at()` or names `fl_region_texture`; the prelude helpers alone do not count).
 - `params.rs`: public `ParamType` / `ParamInfo` / `ParamValue` / `ParamError`; crate-internal
   `ParamLayout` (members + padded block size), the scan, element ranges, value (de)serialization.
 
@@ -54,6 +56,8 @@ appended `var<uniform> p: Params;`; naga's IR then confirms it (the struct is fo
   `tex_load`) with a constant slot counts that slot, any other slot expression counts every slot,
   a direct `fl_user*` reference counts its slot. A false "reads" only makes a layer demand a
   texture; a false "does not read" would let an effect sample a dummy.
+- `reads_regions` is informational (`Effect::reads_regions`): a layer without regions is a valid
+  input (every pixel reads `REGION_NONE`), so nothing is refused on it.
 - Public API never panics on user input.
 
 ## Editing map

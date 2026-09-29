@@ -65,7 +65,9 @@ user code ──► FilterLayer::paint (layer.rs)
 - `geometry.rs`: `layer_geometry` — region / capture / UV / mask math (pure, unit-tested);
   `LayerGeometry::composite_params` (the composite pass's parameter block, every backend);
   `pointer_uniform` (the one screen-points -> capture-uv conversion of `fl.pointer`).
-- `mask.rs`: `Mask` (public: rounded rect / any egui `Shape` in layer points), `MaskError`,
+- `mask.rs`: `Mask` (public: rounded rect / any egui `Shape` in layer points / `Regions`),
+  `Region`, `MAX_REGIONS`, `REGION_NONE`, `MaskError`, `RegionMeshes` / `PackedRegions` (every
+  region packed in id order with its draw range),
   `JobMask`, `tessellate` (the one tessellation, UI and offline: no pre-rasterized discs),
   `CoverageMeshes::pack` -> `PackedCoverage` (egui vertex bytes, absolute `u32` indices, one draw
   per texture run; every backend uploads exactly this), `MESH_WGSL`.
@@ -117,7 +119,8 @@ user code ──► FilterLayer::paint (layer.rs)
   capture, 4 = the named-parameter block `p: Params` (appended by the crate after a snippet that
   declares `struct Params`; every draw binds `plan::params_block`, 16 zero bytes without one),
   5 = state (the layer's latest state for every pass step of a stateful run; a 1x1 zero dummy
-  otherwise and for the composite), 6 = mask coverage. There is no nearest sampler: every texture is read through ONE
+  otherwise and for the composite), 6 = mask coverage, 7 = region ids (R1; every pass step of a
+  region run, a 1x1 white dummy = `REGION_NONE` otherwise and for the composite). There is no nearest sampler: every texture is read through ONE
   sampler (naga's GLSL writer rejects two per texture); exact reads use `textureLoad`.
   A binding a draw does not use gets a neutral dummy (transparent / white texture, zero buffer);
   every pass and the composite bind the capture as the original (`original()`, mapped by the
@@ -171,8 +174,9 @@ user code ──► FilterLayer::paint (layer.rs)
 - Shape masks (F9): a `Mask::Shape` is in LAYER points, tessellated where the job is built
   (`FilterLayer::paint` on the GUI thread with the context's ppp / tessellation options / font
   atlas size; offline per run with default options), without egui's pre-rasterized discs (only
-  text samples the font atlas). Coverage = the meshes' alpha (egui's premultiplied blend into a
-  cleared RGBA8 texture at capture resolution, the run's window at its origin), drawn by
+  text samples the font atlas). Coverage = the meshes' alpha (an ADDITIVE, saturating union into a
+  cleared RGBA8 texture at capture resolution, the run's window at its origin; abutting pieces'
+  feathers sum to 1, so they leave no seam), drawn by
   `shaders/mesh.wgsl` on every backend (glow: naga-translated); the layer transform maps it at
   paint time (`geometry::mask_transform`), so the feather scales with a zoom. The composite alone
   binds it (`plan::ChainPlan::with_coverage`, `params[3].x = 1`); uncovered pixels keep the screen
@@ -181,6 +185,13 @@ user code ──► FilterLayer::paint (layer.rs)
   packer skips such meshes too, so no out-of-range index reaches a draw); offline also text and textured meshes (`OfflineError::Mask`). A mask texture
   the renderer cannot resolve skips the layer (`failed_textures`; wgpu: a stale font atlas skips
   only the frame).
+- Regions (R1, `Mask::Regions` / `FilterLayer::regions`, at most `MAX_REGIONS` = 255): the union
+  of the regions is the coverage (F9 path); `plan::ChainPlan::with_regions` adds two id passes
+  after the coverage draw into `Slot::RegionId` (window at the texture origin, cleared to 255,
+  no blend: pass A threshold 0 = every touched pixel, pass B threshold 0.5; later regions win),
+  bound at binding 7 of every PASS step and read by the prelude's `region()` / `region_at(uv)`.
+  Per-region values are F4 arrays indexed by the id. Runs on wgpu (UI); glow refuses region masks
+  (logged once) until phase R1b, offline refuses them (`OfflineError::InvalidOption`) until R1c.
 - Chain padding is the SUM of pass sample radii; a preset whose passes reach along different axes
   (separable blur) declares its reach on one pass only.
 - Backend-specific public API lives in its module behind its feature; core never names backend types.
@@ -204,3 +215,6 @@ user code ──► FilterLayer::paint (layer.rs)
 - Shape masks: what is accepted / tessellation / packing `mask.rs`; the coverage step and its
   uniform bytes `plan.rs`; rasterization wgpu `wgpu_backend/coverage.rs` (UI and offline), glow
   `glow_backend/coverage.rs`; the composite's read `shaders/composite.wgsl` (`fl_coverage`).
+- Regions: `Region` / packing `mask.rs`; the id passes and the region binding `plan.rs`
+  (`with_regions`, `region_locals`); rasterization `wgpu_backend/coverage.rs` (`fs_region` in
+  `shaders/mesh.wgsl`); the reads `shaders/prelude.wgsl` (`region_at`).

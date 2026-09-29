@@ -18,7 +18,9 @@
 //! unknown / freed / missing textures), and persistent state (F7: accumulation over frames in
 //! RGBA16F and RGBA8, reset, one step per frame for an id painted twice, growth keeping the state,
 //! a missing id refused).
-//! Shape masks (F9): circle (also 4x MSAA), monotonic AA edge, star, transformed and text masks.
+//! Shape masks (F9): circle (also 4x MSAA), monotonic AA edge, star, transformed and text masks;
+//! abutting mask pieces leave no seam. Regions (R1): refused on glow until phase R1b (the layer
+//! draws nothing extra, other layers are unaffected).
 //!
 //! Linux only (EGL device platform, Mesa or a vendor EGL). Needs a GPU or Mesa's software
 //! device, so it is ignored by default: `cargo test --all-features --test glow_headless -- --ignored`.
@@ -30,7 +32,7 @@ use std::sync::Arc;
 
 use egui::emath::TSTransform;
 use egui::{Color32, ColorImage, Pos2, Rect, TextureOptions, pos2, vec2};
-use egui_filter_layers::{BackendKind, BackendStatus, Effect, FilterChain, FilterLayer, Pass, StateFormat, StateOptions, destroy_glow, install_glow, presets};
+use egui_filter_layers::{BackendKind, BackendStatus, Effect, FilterChain, FilterLayer, Pass, Region, StateFormat, StateOptions, destroy_glow, install_glow, presets};
 use glow::HasContext as _;
 use glutin::api::egl::context::PossiblyCurrentContext;
 use glutin::api::egl::device::Device;
@@ -1152,6 +1154,27 @@ fn check_text_mask(pixels: &[u8], text_rect: Rect, what: &str) {
     assert!(green_inside > 300, "{what}: only {green_inside} glyph pixels filtered");
 }
 
+/// Two convex pieces meeting edge to edge at x = 60.5 (mid-pixel, so both feathers are 0.5
+/// there): the coverage union is additive (roadmap §19 D1), so the shared column is fully covered.
+fn abutting_pieces_scene(painter: &egui::Painter, green: &Pass) {
+    halves(painter);
+    let piece = |x0: f32, x1: f32| egui::Shape::convex_polygon(vec![pos2(x0, 20.0), pos2(x1, 20.0), pos2(x1, 100.0), pos2(x0, 100.0)], Color32::WHITE, egui::Stroke::NONE);
+    let pieces = egui::Shape::Vec(vec![piece(20.0, 60.5), piece(60.5, 100.0)]);
+    FilterLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(110.0, 110.0)), green.clone()).mask(egui_filter_layers::Mask::Shape(pieces)).paint(painter);
+}
+
+/// No seam on the shared edge (egui's "over" union would leave 0.75 coverage: about
+/// `[64, 191, 0]` over the red half); the outer edges stay anti-aliased / untouched.
+fn check_abutting_pieces(pixels: &[u8], what: &str) {
+    for y in [30, 60, 90] {
+        for x in 58..=62 {
+            assert_near(pixels, x, y, [0, 255, 0], &format!("{what}: shared edge column {x}, row {y}"));
+        }
+    }
+    assert_near(pixels, 15, 60, [255, 0, 0], &format!("{what}: left of the pieces"));
+    assert_near(pixels, 105, 60, [255, 0, 0], &format!("{what}: right of the pieces"));
+}
+
 /// F9 on glow: a circle mask filters inside only; outside it the replace composite writes the
 /// exact capture back (the lower filter's output included); the anti-aliased edge is monotonic.
 /// The first shape-masked layer creates the mesh program translated by naga (roadmap risk 3).
@@ -1191,5 +1214,38 @@ fn star_transformed_and_text_masks() {
         check_text_mask(&pixels, text_rect, "text");
     }
     assert!(egui_filter_layers::failed_textures(&harness.ctx).is_empty(), "{:?}", egui_filter_layers::failed_textures(&harness.ctx));
+    assert_active(&harness.ctx);
+}
+
+/// D1 on glow: abutting mask pieces leave no seam (additive coverage union), also on MSAA.
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn abutting_mask_pieces_leave_no_seam() {
+    let green = pass("green", GREEN_WGSL);
+    for samples in [0, 4] {
+        let mut harness = Harness::new(samples, [0.0, 0.0, 0.0, 1.0]);
+        harness.frame(&mut |ui| abutting_pieces_scene(ui.painter(), &green));
+        let pixels = harness.frame(&mut |ui| abutting_pieces_scene(ui.painter(), &green));
+        check_abutting_pieces(&pixels, &format!("glow, {samples} samples"));
+        assert_active(&harness.ctx);
+    }
+}
+
+/// R1 on glow before phase R1b: a region-masked layer is refused (it draws nothing extra, logged
+/// once), a plain layer in the same frame still filters and the backend stays active.
+#[test]
+#[ignore = "needs an EGL device (GPU or Mesa); run with --ignored"]
+fn region_masks_are_refused_until_glow_runs_them() {
+    let mut harness = Harness::new(0, [0.0, 0.0, 0.0, 1.0]);
+    let scene = |ui: &mut egui::Ui| {
+        halves(ui.painter());
+        FilterLayer::new(Rect::from_min_max(pos2(10.0, 10.0), pos2(100.0, 100.0)), presets::invert(1.0)).regions([Region::rounded_rect(Rect::from_min_max(pos2(20.0, 20.0), pos2(90.0, 90.0)), 0)]).paint(ui.painter());
+        FilterLayer::new(Rect::from_min_max(pos2(150.0, 10.0), pos2(240.0, 100.0)), presets::invert(1.0)).paint(ui.painter());
+    };
+    for _ in 0..2 {
+        let pixels = harness.frame(&mut |ui| scene(ui));
+        assert_near(&pixels, 50, 50, [255, 0, 0], "the region layer is refused: the backdrop stays");
+        assert_near(&pixels, 190, 50, [255, 255, 0], "the plain layer still inverts the blue half");
+    }
     assert_active(&harness.ctx);
 }

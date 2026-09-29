@@ -345,7 +345,7 @@ impl Extend<Pass> for FilterChain {
 }
 
 /// Size in bytes of the `FlUniforms` block (see `shaders/prelude.wgsl`).
-pub(crate) const UNIFORM_BLOCK_SIZE: usize = 448;
+pub(crate) const UNIFORM_BLOCK_SIZE: usize = 464;
 
 /// Byte offsets of the `FlUniforms` members; pinned against naga's computed layout by a test.
 pub(crate) mod offsets {
@@ -399,8 +399,12 @@ pub(crate) mod offsets {
     pub const STATE_TEXEL: usize = 168;
     /// `internal_state_size: vec2<f32>`.
     pub const STATE_SIZE: usize = 176;
+    /// `internal_region_scale: vec2<f32>`.
+    pub const REGION_SCALE: usize = 184;
+    /// `internal_region_offset: vec2<f32>`.
+    pub const REGION_OFFSET: usize = 192;
     /// `params: array<vec4<f32>, 16>`.
-    pub const PARAMS: usize = 192;
+    pub const PARAMS: usize = 208;
 }
 
 /// The non-parameter uniforms of one pass.
@@ -450,6 +454,9 @@ pub(crate) struct FrameUniforms {
     pub state_size: [f32; 2],
     /// Same for the coverage texture (`internal_cover_*`); identity while no mask needs one.
     pub cover: [[f32; 2]; 2],
+    /// Same for the region-id texture (`internal_region_*`, R1); identity for a draw that binds
+    /// none (the 1x1 dummy).
+    pub region: [[f32; 2]; 2],
     /// Output resolution of the draw relative to the capture (`fl.pass_scale`); `1` = full.
     pub pass_scale: f32,
     /// Index of the draw among the chain's passes of its kind, display or state (`fl.pass_index`;
@@ -498,6 +505,7 @@ impl FrameUniforms {
             state_texel: [1.0, 1.0],
             state_size: [1.0, 1.0],
             cover: [[1.0, 1.0], [0.0, 0.0]],
+            region: [[1.0, 1.0], [0.0, 0.0]],
             pass_scale: 1.0,
             pass_index: 0,
             frag_texel: [1.0 / w, 1.0 / h],
@@ -577,6 +585,8 @@ pub(crate) fn pack_uniforms(frame: &FrameUniforms, params: &Params) -> [u8; UNIF
     put_f32s(&mut bytes, offsets::SRC_TEXEL, &frame.src_texel);
     put_f32s(&mut bytes, offsets::STATE_TEXEL, &frame.state_texel);
     put_f32s(&mut bytes, offsets::STATE_SIZE, &frame.state_size);
+    put_f32s(&mut bytes, offsets::REGION_SCALE, &frame.region[0]);
+    put_f32s(&mut bytes, offsets::REGION_OFFSET, &frame.region[1]);
     for (i, slot) in params.iter().enumerate() {
         put_f32s(&mut bytes, offsets::PARAMS + i * 16, slot);
     }
@@ -632,8 +642,10 @@ mod tests {
         assert_eq!(offset_of("internal_src_texel"), offsets::SRC_TEXEL);
         assert_eq!(offset_of("internal_state_texel"), offsets::STATE_TEXEL);
         assert_eq!(offset_of("internal_state_size"), offsets::STATE_SIZE);
+        assert_eq!(offset_of("internal_region_scale"), offsets::REGION_SCALE);
+        assert_eq!(offset_of("internal_region_offset"), offsets::REGION_OFFSET);
         assert_eq!(offset_of("params"), offsets::PARAMS);
-        assert_eq!(members.len(), 26, "every member is pinned above");
+        assert_eq!(members.len(), 28, "every member is pinned above");
         assert_eq!(usize::try_from(*span).unwrap_or(0), UNIFORM_BLOCK_SIZE);
     }
 
@@ -659,6 +671,7 @@ mod tests {
             state_texel: [0.25, 0.375],
             state_size: [4.0, 8.0],
             cover: [[0.375, 1.0], [0.0, 0.5]],
+            region: [[0.625, 0.25], [0.75, 0.875]],
             pass_scale: 0.5,
             pass_index: 3,
             frag_texel: [1.0, 0.5],
@@ -695,6 +708,7 @@ mod tests {
         assert!((read_f32(&bytes, offsets::FRAG_TEXEL) - 1.0).abs() < f32::EPSILON && (read_f32(&bytes, offsets::FRAG_TEXEL + 4) - 0.5).abs() < f32::EPSILON);
         assert!((read_f32(&bytes, offsets::SRC_TEXEL) - 0.0625).abs() < f32::EPSILON && (read_f32(&bytes, offsets::SRC_TEXEL + 4) - 0.125).abs() < f32::EPSILON);
         assert!((read_f32(&bytes, offsets::STATE_TEXEL + 4) - 0.375).abs() < f32::EPSILON && (read_f32(&bytes, offsets::STATE_SIZE) - 4.0).abs() < f32::EPSILON);
+        assert!((read_f32(&bytes, offsets::REGION_SCALE) - 0.625).abs() < f32::EPSILON && (read_f32(&bytes, offsets::REGION_OFFSET + 4) - 0.875).abs() < f32::EPSILON);
     }
 
     #[test]

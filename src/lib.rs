@@ -118,6 +118,8 @@ module names a backend type.
 //! | `state_load(px)`, `state_px(offset)` | the exact state texel `px` (`vec2<i32>`, (0, 0) top-left, clamped) / the one under the current pixel offset by `offset` texels, no filtering |
 //! | `state_size()`, `state_texel()` | the state's size in texels / one state texel in `uv` units |
 //! | `fl.pass_index` | index of this pass among the chain's passes of its kind (state or display), `u32`: the substep number of consecutive state passes |
+//! | `region()`, `region_at(uv)` | the id (`u32`) of the [`Region`] that owns the current pixel / capture `uv` (its index in [`Mask::Regions`]); `REGION_NONE` outside every region and on layers without regions (see [Masks](#masks)) |
+//! | `REGION_NONE` | `255u`, the "no region" id ([`REGION_NONE`] in Rust) |
 //!
 //! An effect whose code reads `fl.time` is **animated**: painting a layer that uses it requests
 //! an egui repaint every frame, so it keeps moving in an otherwise idle app. The detection walks
@@ -270,9 +272,10 @@ module names a backend type.
 //! meshes, text galleys (UI only), in the layer's points (so it follows layer transforms). The
 //! shape's alpha is the coverage (paint it opaque for a full-strength filter; egui's feathered edge
 //! anti-aliases it); outside it the backdrop stays untouched. It is tessellated when the layer is
-//! painted and rasterized into a coverage texture at capture resolution. egui fills convex paths
-//! only: build a concave outline from convex pieces that **overlap** (pieces meeting edge to edge
-//! leave a visible seam, where both feathered edges fade out) or from a mesh.
+//! painted and rasterized into a coverage texture at capture resolution; the coverage of several
+//! pieces is the sum of their alphas, capped at 1, so pieces meeting edge to edge leave no seam
+//! (their feathered edges add up to full coverage). egui fills convex paths only: build a concave
+//! outline from convex pieces (abutting or overlapping) or from a mesh.
 //!
 //! ```no_run
 //! # fn frame(ui: &mut egui::Ui, rect: egui::Rect) {
@@ -280,6 +283,30 @@ module names a backend type.
 //! let lens = egui::Shape::circle_filled(rect.center(), 60.0, egui::Color32::WHITE);
 //! FilterLayer::new(rect, presets::gaussian_blur(8.0)).mask(Mask::Shape(lens)).paint(ui.painter());
 //! # }
+//! ```
+//!
+//! **Regions.** One layer can run its chain differently per area: [`FilterLayer::regions`] (a
+//! [`Mask::Regions`] of up to [`MAX_REGIONS`] [`Region`]s) masks by the union of the regions (no
+//! seam where they abut) and tells every pass which region a pixel belongs to: `region()` is the
+//! region's index, `region_at(uv)` the one at another point (a kernel that must not cross into a
+//! neighbour compares `region_at(uv + d) == region()`). Per-region values are named-parameter
+//! arrays indexed by it; scalars go four to a `vec4` (`array<f32, N>` is not accepted). Where
+//! regions overlap the LATER one wins, and the boundary between two regions is pixel-hard (a soft
+//! transition between two parameter sets needs two layers). One capture and one chain run serve
+//! every region, which is what makes many small areas cheaper than many layers. Regions run on the
+//! wgpu backend; the glow backend skips region-masked layers (logged once) and offline runs refuse
+//! them (`OfflineError::InvalidOption`) for now.
+//!
+//! ```no_run
+//! # fn frame(ui: &mut egui::Ui, rect: egui::Rect) -> Result<(), Box<dyn std::error::Error>> {
+//! use egui_filter_layers::{Effect, FilterLayer, Pass, Region};
+//! let tint = Effect::new("tint", "struct Params { tint: array<vec4<f32>, 2> }
+//! fn effect(uv: vec2<f32>) -> vec4<f32> { return mix(src(uv), p.tint[min(region(), 1u)], 0.5); }")?;
+//! let mut pass = Pass::new(&tint);
+//! pass.set_slice("tint", &[[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]])?;
+//! let (left, right) = rect.split_left_right_at_fraction(0.5);
+//! FilterLayer::new(rect, pass).regions([Region::rounded_rect(left, 8), Region::rounded_rect(right, 8)]).paint(ui.painter());
+//! # Ok(()) }
 //! ```
 //!
 //! **Distances are in layer points.** Sample radii, corner radii and every effect distance
@@ -368,7 +395,7 @@ pub use backend::{BackendKind, BackendStatus, EffectFailure, InstallError, Textu
 pub use effect::{Effect, EffectError, ParamError, ParamInfo, ParamType, ParamValue, SnippetLocation, TEXTURE_SLOTS};
 pub use impulses::{IMPULSE_COUNT_PARAM, IMPULSE_SLOTS, IMPULSES_PARAM, Impulse, ImpulsePack, Impulses};
 pub use layer::FilterLayer;
-pub use mask::{Mask, MaskError};
+pub use mask::{MAX_REGIONS, Mask, MaskError, REGION_NONE, Region};
 pub use pass::{FilterChain, MIN_PASS_SCALE, PARAM_SLOTS, ParamIndexError, Params, Pass};
 pub use presets::WaveObstacle;
 pub use state::{StateError, StateFailure, StateFormat, StateOptions, failed_states, reset_state, state_count};

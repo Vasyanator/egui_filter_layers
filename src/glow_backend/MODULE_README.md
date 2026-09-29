@@ -50,11 +50,12 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
 ## Contracts and invariants
 - All GL calls happen with the context current (inside the callback or in `on_exit`).
 - egui_glow re-runs `prepare_painting` after each callback; this module restores only what that
-  does not: framebuffer bindings, textures on units 0-6, uniform-buffer bindings (points 0 and
+  does not: framebuffer bindings, textures on units 0-7, uniform-buffer bindings (points 0 and
   1), own VAO/program. No sampler object is ever bound.
-- Texture units: `GROUP0_TEXTURE_BINDINGS[i]` is unit `i` (the texture's own `LINEAR`
-  parameters); user texture slot `i` is unit `USER_UNIT_BASE + i` (4-6), egui_glow's own texture
-  object with the parameters egui_glow set from its `TextureOptions`. Max unit 6 < the 16 GLES 3 /
+- Texture units: `GROUP0_TEXTURE_BINDINGS[i]` is unit `i` (0 src, 1 original, 2 state,
+  3 coverage, 4 region ids; the texture's own `LINEAR` parameters); user texture slot `i` is unit
+  `USER_UNIT_BASE + i` (5-7), egui_glow's own texture
+  object with the parameters egui_glow set from its `TextureOptions`. Max unit 7 < the 16 GLES 3 /
   WebGL2 guarantee. naga cannot translate a texture read through two samplers in one module, so
   the prelude has one sampler per texture and exact reads via `textureLoad` (`texelFetch`).
 - Mask textures (the font atlas for text, a mask mesh's texture) are egui_glow's own, resolved by
@@ -71,6 +72,9 @@ The `egui_glow` backend (feature `glow`): OpenGL 3.3+, OpenGL ES 3.0+, WebGL2.
   `texelFetch` for `state_load`); an entry is updated only by a clean run (`LayerOutcome::Done`),
   any other outcome forgets its content. Evicted / replaced targets are freed in the paint
   callback; `destroy_glow` frees all.
+- Region masks (R1) are refused in `paint_layer` on the GUI thread (`Unsupported::RegionMasks`,
+  logged once; the layer draws nothing extra) until glow rasterizes region ids (roadmap §19
+  phase R1b); unit 4 always gets the white dummy (`REGION_NONE`) meanwhile.
 - Backend-wide failures (resource creation, unexplained capture / composite GL error) latch
   `GlowState::failure`; per-effect failures (translation, compile/link, a GL error of that
   effect's draw — attributed directly for single-effect chains, else by per-pass checks on later

@@ -5,11 +5,12 @@ WGSL sources compiled into the crate with `include_str!` (by `effect.rs`).
 
 ## Files
 - `prelude.wgsl`: prepended to every effect. Declares `FlUniforms` / `fl`, the WHOLE `@group(0)`
-  resource layout (bindings 0-3 and 5-6; 4 is the named-parameter block `p: Params`, which
+  resource layout (bindings 0-3 and 5-7; 4 is the named-parameter block `p: Params`, which
   `effect/` appends AFTER a snippet declaring `struct Params`), the user texture groups 1..=3
   (`fl_userN` at 0, `fl_userN_sampler` at 1: egui-wgpu's texture layout), the public helpers
   (`src`, `src_px`, `src_texel`, `out_texel`, `original`, `params`, `tex`, `tex_size`,
-  `tex_load`, `state`, `state_load`, `state_px`, `state_size`, `state_texel`, colour helpers),
+  `tex_load`, `state`, `state_load`, `state_px`, `state_size`, `state_texel`, `region`,
+  `region_at`, `REGION_NONE`, colour helpers),
   and both entry points
   (`fl_vertex`: attribute-less full-viewport triangle; `fl_fragment`: computes the fragment's
   capture uv with `fl_capture_uv` and calls the user's `effect`).
@@ -17,7 +18,10 @@ WGSL sources compiled into the crate with `include_str!` (by `effect.rs`).
 - `mesh.wgsl`: draws egui meshes (egui's vertex, colour unpacked from a `u32`): the wgpu backdrop
   re-render (`fs_main` / `fs_main_linear`, dithering like egui-wgpu) and the shape-mask coverage
   rasterizer on every backend (`vs_main` + `fs_main`, no dithering; glow runs its naga GLSL
-  translation, pinned by `the_mesh_shader_translates_for_every_target`).
+  translation, pinned by `the_mesh_shader_translates_for_every_target`), and the region-id passes
+  (R1: `vs_main` + `fs_region`, which discards coverage `<= MeshLocals.alpha_threshold` and writes
+  `MeshLocals.region_id / 255` into `.r`; no blend). `MeshLocals` is 32 bytes (`plan::mesh_locals`:
+  scale, dithering, origin, size, region id, threshold).
 - `composite.wgsl`: body of the internal write-back pass, `fl_composite(frag_uv)` (reads the
   original capture through the prelude's `original()`, binding 3; params 0..2 = mask rect px, corner radii px, processed region in capture UV; params[3].x = 1:
   a shape mask, whose coverage is the alpha of binding 6 mapped by `internal_cover_*`).
@@ -48,6 +52,10 @@ WGSL sources compiled into the crate with `include_str!` (by `effect.rs`).
   `state()`: `fl_storage_uv` with `internal_state_*` and the state content's texel) and exactly
   with `textureLoad` (`state_load`: clamped to `internal_state_size`, row flipped by
   `internal_flip_y`, since state contents sit at the texture origin with no window offset).
+- Region ids (binding 7, R1): `region_at(uv)` reads the exact texel (`textureLoad`, no sampler)
+  of the region-id texture mapped by `internal_region_*` with the capture texel (the texture holds
+  the window at full resolution); `u8 -> unorm -> * 255 -> round` is exact. Without regions the
+  binding is a 1x1 white dummy = `REGION_NONE` (255).
 - Only `textureSampleLevel` (valid in non-uniform control flow, translates to `textureLod`) and
   `textureLoad` (`texelFetch`) read textures. The slot helpers `tex` / `tex_size` / `tex_load` take
   the slot as their FIRST argument and `switch` on it (a slot `>= 3` yields zero); `effect/`'s

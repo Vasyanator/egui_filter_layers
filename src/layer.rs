@@ -13,8 +13,9 @@ Key functions:
 - `FilterLayer::paint()`.
 - `FilterLayer::texture()` / `check_textures()`: user textures (F8) and the check `paint` runs.
 - `FilterLayer::id()` / `state()` / `check_state()`: persistent state (F7) and its check.
-- `FilterLayer::mask()` / `corner_radius()` / `check_mask()`: the mask (F9); a shape mask is
-  tessellated in `paint` (`resolve_mask`, GUI thread).
+- `FilterLayer::mask()` / `corner_radius()` / `regions()` / `check_mask()`: the mask (F9) and
+  regions (R1); a shape mask and every region are tessellated in `paint` (`resolve_mask`, GUI
+  thread).
 - `frame_input()`: the per-frame input (`fl.delta_time`, `fl.frame`, `fl.pointer`) read from the
   context on the GUI thread.
 
@@ -26,7 +27,8 @@ neither case requests repaints for animated chains. A layer whose user textures 
 effects (`TextureError`: an invalid slot, or a slot an effect reads with nothing attached) is
 skipped too, its error logged once per context and message (`log_texture_error_once`), and so
 is a layer with a state pass but no id (`StateError::MissingId`, same latch), and one whose mask
-shape contains a paint callback or a malformed mesh (`MaskError`, same latch). A pending
+shape contains a paint callback or a malformed mesh, or which has too many regions (`MaskError`,
+same latch). A pending
 `reset_state` request for the layer's id travels in its job as a ticket (`state::pending_reset`);
 the backend claims it where the state registry runs, so a paint that draws nothing keeps it.
 */
@@ -37,7 +39,7 @@ use egui::{Context, CornerRadius, Id, Painter, Rect, TextureId};
 
 use crate::backend::{FrameInput, LayerJob, PointerInput, TextureError, installed};
 use crate::effect::TEXTURE_SLOTS;
-use crate::mask::{JobMask, Mask, MaskError, tessellate};
+use crate::mask::{JobMask, Mask, MaskError, Region, tessellate, tessellate_regions};
 use crate::pass::FilterChain;
 use crate::plan::check_textures;
 use crate::state::{StateError, StateOptions, pending_reset};
@@ -114,14 +116,22 @@ fn log_mask_error_once(ctx: &Context, error: &MaskError) {
 /// context's pixels per point with its tessellation options (feathering) and font atlas size (text
 /// uvs), without pre-rasterized discs (`mask::tessellate`).
 fn resolve_mask(ctx: &Context, mask: Mask, rect: Rect) -> JobMask {
+    let tessellation = || {
+        let options = ctx.options(|options| options.tessellation_options);
+        // The method path does not satisfy `ctx.fonts`'s higher-ranked `FontsView<'_>` bound.
+        #[allow(clippy::redundant_closure_for_method_calls)]
+        let font_size = ctx.fonts(|fonts| fonts.font_image_size());
+        (options, font_size)
+    };
     match mask {
         Mask::RoundedRect(radius) => JobMask::RoundedRect(radius),
         Mask::Shape(shape) => {
-            let options = ctx.options(|options| options.tessellation_options);
-            // The method path does not satisfy `ctx.fonts`'s higher-ranked `FontsView<'_>` bound.
-            #[allow(clippy::redundant_closure_for_method_calls)]
-            let font_size = ctx.fonts(|fonts| fonts.font_image_size());
+            let (options, font_size) = tessellation();
             JobMask::Coverage(Arc::new(tessellate(shape, rect, ctx.pixels_per_point(), options, font_size)))
+        }
+        Mask::Regions(regions) => {
+            let (options, font_size) = tessellation();
+            JobMask::Regions(Arc::new(tessellate_regions(regions, rect, ctx.pixels_per_point(), options, font_size)))
         }
     }
 }
@@ -287,17 +297,27 @@ impl FilterLayer {
         self
     }
 
+    /// Splits the layer into REGIONS (R1): shorthand for `mask(Mask::Regions(..))`, replacing any
+    /// earlier mask. The union of the regions is the mask; every pass reads the id of the region
+    /// that owns a pixel with the prelude's `region()` (see [`Mask::Regions`]). More than
+    /// [`crate::MAX_REGIONS`] regions are refused ([`MaskError::TooManyRegions`]).
+    #[must_use]
+    pub fn regions(self, regions: impl IntoIterator<Item = Region>) -> Self {
+        self.mask(Mask::Regions(regions.into_iter().collect()))
+    }
+
     /// The layer's mask.
     #[must_use]
     pub fn layer_mask(&self) -> &Mask {
         &self.mask
     }
 
-    /// Whether the mask can be rasterized ([`Mask::check`]: no paint callbacks, no malformed meshes).
-    /// [`FilterLayer::paint`] runs this and skips the layer on an error (logged once per context).
+    /// Whether the mask can be rasterized ([`Mask::check`]: no paint callbacks, no malformed
+    /// meshes, at most [`crate::MAX_REGIONS`] regions). [`FilterLayer::paint`] runs this and skips
+    /// the layer on an error (logged once per context).
     ///
     /// # Errors
-    /// [`MaskError::Callback`] or [`MaskError::InvalidMesh`].
+    /// [`MaskError::Callback`], [`MaskError::InvalidMesh`] or [`MaskError::TooManyRegions`].
     pub fn check_mask(&self) -> Result<(), MaskError> {
         self.mask.check()
     }
@@ -669,10 +689,16 @@ mod tests {
             layer.clone().corner_radius(6).paint(&painter);
             layer.clone().mask(Mask::Shape(circle.clone())).paint(&painter);
             layer.clone().mask(Mask::Shape(callback.clone())).paint(&painter);
+            layer.clone().regions([Region::rounded_rect(rect, 0), Region::shape(circle.clone())]).paint(&painter);
+            layer.clone().regions(vec![Region::rounded_rect(rect, 0); crate::MAX_REGIONS + 1]).paint(&painter);
         });
         output.textures_delta.clear();
         let masks = std::mem::take(&mut *backend.masks.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
-        assert_eq!(masks.len(), 2, "the callback mask is refused: {masks:?}");
+        assert_eq!(masks.len(), 3, "the callback mask and 256 regions are refused: {masks:?}");
+        let Some(regions) = masks[2].regions() else { panic!("regions are tessellated per region: {:?}", masks[2]) };
+        assert_eq!(regions.regions.len(), 2);
+        assert!(regions.regions.iter().all(|region| !region.meshes.is_empty()));
+        assert_eq!(layer.clone().regions(vec![Region::rounded_rect(rect, 0); 256]).check_mask(), Err(MaskError::TooManyRegions { count: 256, max: 255 }));
         assert_eq!(masks[0], JobMask::RoundedRect(CornerRadius::same(6)));
         let Some(meshes) = masks[1].coverage() else { panic!("a shape mask is tessellated: {:?}", masks[1]) };
         let bounds = meshes.meshes.iter().fold(Rect::NOTHING, |bounds, mesh| bounds.union(mesh.calc_bounds()));

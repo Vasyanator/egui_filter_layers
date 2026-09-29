@@ -514,7 +514,7 @@ impl Backend for WgpuBackend {
         }
         let slot = Arc::new(LayerSlot::default());
         let (rect, padding_points, textures) = (job.rect, job.padding_points, job.textures);
-        let mut mask_textures: Vec<TextureId> = job.mask.coverage().map(|meshes| meshes.textures().collect()).unwrap_or_default();
+        let mut mask_textures: Vec<TextureId> = job.mask.textures();
         mask_textures.sort_unstable();
         mask_textures.dedup();
         // Read during the pass: after `end_pass` the context reports the parent viewport.

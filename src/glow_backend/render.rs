@@ -28,7 +28,7 @@ Notes (GL state contract, checked against egui_glow 0.36.2 `painter.rs`):
   every texture samples through its own parameters (user textures through the ones egui_glow
   set from their `TextureOptions`).
 - Shape masks (F9): the plan's coverage step runs right after the capture (`coverage.rs`: the
-  mask's meshes into the coverage target with egui's blend); only the composite binds it (unit 3).
+  mask's meshes into the coverage target, an additive union); only the composite binds it (unit 3).
   Its GL errors are the crate's own work (latch).
 - User textures (F8) are egui_glow's own texture objects (resolved by `mod.rs` through
   `Painter::texture`), bound on units `USER_UNIT_BASE + i` for the draws the plan says; they are
@@ -64,7 +64,7 @@ use super::{GlowState, StateTargets};
 use super::glsl::{GROUP0_TEXTURE_BINDINGS, GlslTarget, USER_UNIT_BASE};
 use super::resources::{GlError, PARAMS_BINDING_POINT, ParamsBuffer, ReadFormat, ReadFormatError, RenderTarget, ResolveTarget, Resources, TargetFormat, UNIFORM_BINDING_POINT};
 use crate::backend::LayerJob;
-use crate::effect::{BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, TEXTURE_SLOTS};
+use crate::effect::{BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_REGION_TEXTURE, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, TEXTURE_SLOTS};
 use crate::geometry::{LayerGeometry, MaskTransform, PxRect, layer_geometry, mask_transform, transform_scale};
 use crate::mask::PackedCoverage;
 use crate::pass::{FrameUniforms, InputUniforms, UNIFORM_BLOCK_SIZE};
@@ -622,7 +622,8 @@ fn frame_uniforms(geometry: &LayerGeometry, time: f32) -> FrameUniforms {
 }
 
 /// The GL target a plan slot names, or `None` for a state slot without state targets (no plan
-/// binds one: a state slot exists only with `plan.state`, whose targets `run_layer` created).
+/// binds one: a state slot exists only with `plan.state`, whose targets `run_layer` created) and
+/// for the region-id slot (glow runs no region plan yet).
 fn target_of<'a>(resources: &'a Resources, states: Option<&'a StateTargets>, slot: Slot) -> Option<&'a RenderTarget> {
     match slot {
         Slot::Source => Some(&resources.capture),
@@ -631,6 +632,9 @@ fn target_of<'a>(resources: &'a Resources, states: Option<&'a StateTargets>, slo
         Slot::StateA => states.and_then(|states| states[0].as_ref()),
         Slot::StateB => states.and_then(|states| states[1].as_ref()),
         Slot::Coverage => resources.coverage.as_ref().map(|coverage| &coverage.target),
+        // No region-id target on glow yet: region masks are refused before any run
+        // (`GlowState::refuse_regions`), so no plan here binds this slot.
+        Slot::RegionId => None,
     }
 }
 
@@ -639,11 +643,11 @@ fn target_of<'a>(resources: &'a Resources, states: Option<&'a StateTargets>, slo
 fn allocations(resources: &Resources, states: Option<&StateTargets>) -> Allocations {
     let state = |index: usize| states.and_then(|states| states[index].as_ref()).map_or([0, 0], RenderTarget::allocated_px);
     let coverage = resources.coverage.as_ref().map_or([0, 0], |coverage| coverage.target.allocated_px());
-    Allocations { source: resources.capture.allocated_px(), ping_pong: [resources.ping_pong[0].allocated_px(), resources.ping_pong[1].allocated_px()], state: [state(0), state(1)], coverage }
+    Allocations { source: resources.capture.allocated_px(), ping_pong: [resources.ping_pong[0].allocated_px(), resources.ping_pong[1].allocated_px()], state: [state(0), state(1)], coverage, region: [0, 0] }
 }
 
 /// Binds every texture of one draw on its texture units (`glsl.rs`): the `@group(0)` textures on
-/// units `0..4` (the plan's slots where it names one, the dummies elsewhere), and user texture
+/// units `0..5` (the plan's slots where it names one, the dummies elsewhere), and user texture
 /// slot `i` on unit `USER_UNIT_BASE + i` (the attached texture where the plan binds it, the
 /// transparent dummy elsewhere). Leaves `TEXTURE0` active.
 ///
@@ -669,6 +673,8 @@ unsafe fn bind_textures(gl: &glow::Context, resources: &Resources, states: Optio
                 BINDING_STATE_TEXTURE => texture_of(bindings.state),
                 // Full coverage (white) unless the plan binds a shape mask's coverage.
                 BINDING_COVERAGE_TEXTURE => bindings.coverage.and_then(|slot| target_of(resources, states, slot)).map_or(resources.white, |target| target.texture),
+                // White = id 255 = `REGION_NONE` unless the plan binds a region-id texture.
+                BINDING_REGION_TEXTURE => bindings.region.and_then(|slot| target_of(resources, states, slot)).map_or(resources.white, |target| target.texture),
                 // `GROUP0_TEXTURE_BINDINGS` holds nothing else.
                 _ => resources.transparent,
             };
@@ -749,7 +755,7 @@ unsafe fn composite(gl: &glow::Context, resources: &mut Resources, states: Optio
 unsafe fn cleanup(gl: &glow::Context) {
     // SAFETY: `gl` is current on this thread (this `unsafe fn`'s contract); only unbinding (binding name 0) happens here.
     unsafe {
-        // Units 0..4 (`@group(0)`) and the user texture units after them, highest first.
+        // Units 0..5 (`@group(0)`) and the user texture units after them, highest first.
         let units = USER_UNIT_BASE + u32::try_from(TEXTURE_SLOTS).unwrap_or(0);
         for unit in (0..units).rev() {
             gl.active_texture(glow::TEXTURE0 + unit);
@@ -796,7 +802,7 @@ mod tests {
         assert_eq!(glow_plan, wgpu_plan);
 
         let used = capture.size().map(|side| u32::try_from(side).unwrap_or(0));
-        let allocations = Allocations { source: [256, 256], ping_pong: [[320, 192], used], state: [[0, 0]; 2], coverage: [0, 0] };
+        let allocations = Allocations { source: [256, 256], ping_pong: [[320, 192], used], state: [[0, 0]; 2], coverage: [0, 0], region: [0, 0] };
         let time = 1.25;
         let wgpu_uniforms = chain_uniforms(&wgpu_frame_uniforms(&geometry, time), &wgpu_plan, &passes, &geometry, &allocations, 256);
         let glow_frame = frame_uniforms(&geometry, time);
@@ -817,7 +823,7 @@ mod tests {
             assert_eq!(differing, flags, "block {index}: only the backend flags may differ");
         }
         // F9: a shape-masked run's composite block (coverage mapping, mask flag) is shared too.
-        let (glow_masked, wgpu_masked) = (glow_plan.clone().with_coverage(), wgpu_plan.with_coverage());
+        let (glow_masked, wgpu_masked) = (glow_plan.clone().with_coverage(), wgpu_plan.clone().with_coverage());
         assert_eq!(glow_masked, wgpu_masked);
         let allocations = Allocations { coverage: [512, 256], ..allocations };
         let glow_block = composite_uniforms(&glow_frame, &glow_masked, &allocations, &geometry);
@@ -827,6 +833,18 @@ mod tests {
         let differing: Vec<usize> = (0..UNIFORM_BLOCK_SIZE / 4).map(|word| word * 4).filter(|&at| glow_block[at..at + 4] != wgpu_block[at..at + 4]).collect();
         assert_eq!(differing, flags, "masked composite: only the backend flags may differ");
         assert_ne!(glow_block, composite_uniforms(&glow_frame, &glow_plan, &allocations, &geometry), "the mask changes the composite block");
+        // R1: a region run's pass blocks (the region-id mapping) are shared too.
+        let (glow_regions, wgpu_regions) = (glow_plan.clone().with_regions(3), wgpu_plan.with_regions(3));
+        assert_eq!(glow_regions, wgpu_regions);
+        let allocations = Allocations { region: [1024, 512], ..allocations };
+        let wgpu_region_uniforms = chain_uniforms(&wgpu_frame_uniforms(&geometry, time), &wgpu_regions, &passes, &geometry, &allocations, 256);
+        for ((index, step), draw) in glow_regions.steps.iter().enumerate().zip(&wgpu_region_uniforms.draws) {
+            let glow_block = step_uniforms(&glow_frame, &glow_regions, step, &allocations, &passes[step.pass]);
+            let wgpu_block = bytes_at_masked(&wgpu_region_uniforms.bytes, &draw.fl);
+            let differing: Vec<usize> = (0..UNIFORM_BLOCK_SIZE / 4).map(|word| word * 4).filter(|&at| glow_block[at..at + 4] != wgpu_block[at..at + 4]).collect();
+            assert_eq!(differing, flags, "region step {index}: only the backend flags may differ");
+            assert_ne!(glow_block[offsets::REGION_SCALE..offsets::REGION_SCALE + 8], [0_u8; 8], "region step {index}: the region mapping is set");
+        }
     }
 
     /// The bytes of `range` in `bytes`.

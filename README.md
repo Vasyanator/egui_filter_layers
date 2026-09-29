@@ -25,6 +25,9 @@ blur, colour adjustments, refraction, or your own WGSL shader.
   untouched backdrop (`original(uv)`) next to the pass input.
 - User textures: attach up to three egui textures (noise, normal maps, LUTs) to a layer.
 - Masks: the rect, a rounded rect, or any egui shape (paths, circles, meshes, text), anti-aliased.
+- Regions: split one layer into up to 255 areas that share one capture and one chain run; every
+  pass knows which area a pixel is in (`region()`) and can use per-area parameters (wgpu UI in
+  this build; glow and offline refuse region masks for now).
 - Offline processing of images and video with the same chains (features `image` / `video`).
 - View-only: never touches egui textures or your data.
 - One shader language on every backend (WGSL, translated to GLSL for OpenGL).
@@ -180,6 +183,7 @@ Prelude available to every effect:
 | `state(uv)` | the layer's persistent state (below), bilinear; zero without a state pass |
 | `state_load(px)`, `state_px(offset)` | an exact state texel (`vec2<i32>`, clamped) / the one under the current pixel, offset |
 | `state_size()`, `state_texel()`, `fl.pass_index` | state size in texels; one state texel in `uv` units; this pass's index among the chain's passes of its kind (state substeps) |
+| `region()`, `region_at(uv)`, `REGION_NONE` | the id of the region owning the current pixel / capture `uv` (its index in `Mask::Regions`); `REGION_NONE` (255) outside every region and on layers without regions |
 | `fl.texel`, `fl.size_px` | one capture pixel in `uv` units; capture size in pixels (also in scaled passes) |
 | `fl.pass_scale` | the pass's output resolution relative to the capture (`Pass::with_scale`, 1 = full) |
 | `fl.rect_uv` | the layer rect inside the capture (`xy` min, `zw` size) |
@@ -308,10 +312,34 @@ FilterLayer::new(rect, presets::gaussian_blur(8.0)).mask(Mask::Shape(lens)).pain
 The shape's alpha is the coverage (paint it opaque; egui's feathered edge anti-aliases it, and a
 translucent fill filters partially); outside it — and outside the rect — the backdrop is untouched,
 on wgpu too (a lower filter layer shows through). The mask follows layer transforms; its feathered
-edge scales with a `Scene` zoom (it is tessellated before the zoom is known). egui fills convex
-paths only: build concave outlines from convex pieces **that overlap** (pieces meeting exactly edge
-to edge leave a visible seam, because both feathered edges fade out along it) or from a mesh. Offline (`OfflineOptions::with_mask`)
+edge scales with a `Scene` zoom (it is tessellated before the zoom is known). The coverage of
+several pieces is the sum of their alphas, capped at 1: pieces meeting edge to edge leave no seam
+(their feathered edges are complementary and add up to full coverage), and overlapping translucent
+pieces add up. egui fills convex paths only: build concave outlines from convex pieces (abutting or
+overlapping) or from a mesh. Offline (`OfflineOptions::with_mask`)
 text masks and textured meshes are refused (`OfflineError::Mask`: there is no font atlas offline).
+
+**Regions.** `FilterLayer::regions` splits a layer into up to 255 `Region`s: their union is the
+mask (abutting regions leave no seam), and every pass reads the id of the region that owns a
+pixel with `region()` — its index in the list. Per-region values are named-parameter arrays
+indexed by it (scalars packed four to a `vec4`: `p.gain[r / 4u][r % 4u]`). Where regions
+overlap, the later one wins; the boundary between two regions is pixel-hard (a soft blend between
+two parameter sets needs two layers). A kernel that must not bleed into a neighbour compares
+`region_at(uv + d) == region()`. One capture and one chain run serve every region.
+
+```rust
+use egui_filter_layers::{Effect, FilterLayer, Pass, Region};
+
+let tint = Effect::new("tint", "struct Params { tint: array<vec4<f32>, 2> }
+fn effect(uv: vec2<f32>) -> vec4<f32> { return mix(src(uv), p.tint[min(region(), 1u)], 0.5); }")?;
+let mut pass = Pass::new(&tint);
+pass.set_slice("tint", &[[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]])?;
+let (left, right) = rect.split_left_right_at_fraction(0.5);
+FilterLayer::new(rect, pass).regions([Region::rounded_rect(left, 8), Region::rounded_rect(right, 8)]).paint(ui.painter());
+```
+
+In this build regions run on the wgpu backend; the glow backend skips region-masked layers (logged
+once) and offline runs refuse them (`OfflineError::InvalidOption`).
 
 ### Named parameters
 

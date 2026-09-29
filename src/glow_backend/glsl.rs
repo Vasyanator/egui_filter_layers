@@ -24,7 +24,7 @@ Texture units (`texture_unit`): GLSL combines texture and sampler, so a unit is 
 `(texture, sampler)` pair of the prelude's layout — a `@group(0)` texture's position in
 `GROUP0_TEXTURE_BINDINGS` (through the linear `fl_sampler` or with no sampler, `textureLoad`), and
 user texture slot `i` (`@group(1 + i)`, through its own sampler or none) on unit
-`USER_UNIT_BASE + i` (4..=6). At most unit 6 is used: GLES 3.0 / WebGL2 guarantee 16 fragment
+`USER_UNIT_BASE + i` (5..=7). At most unit 7 is used: GLES 3.0 / WebGL2 guarantee 16 fragment
 texture units. naga's writer rejects one texture read through two samplers in one module ("A image
 was used with multiple samplers"), so the prelude reads every texture through one sampler and
 exact reads through `textureLoad`, which naga combines with that same sampler.
@@ -33,17 +33,18 @@ exact reads through `textureLoad`, which naga combines with that same sampler.
 use naga::back::glsl;
 
 use crate::effect::{
-    BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, CompiledModule, FRAGMENT_ENTRY, TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING, USER_TEXTURE_GROUP_BASE,
+    BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_REGION_TEXTURE, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, CompiledModule, FRAGMENT_ENTRY, TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING, USER_TEXTURE_GROUP_BASE,
     VERTEX_ENTRY,
 };
 
 /// The prelude's `@group(0)` texture bindings; a texture's index here is its texture unit
-/// (`render.rs` binds units in this same order).
-pub(super) const GROUP0_TEXTURE_BINDINGS: [u32; 4] = [BINDING_SOURCE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_STATE_TEXTURE, BINDING_COVERAGE_TEXTURE];
+/// (`render.rs` binds units in this same order): 0 src, 1 original, 2 state, 3 coverage,
+/// 4 region ids (R1).
+pub(super) const GROUP0_TEXTURE_BINDINGS: [u32; 5] = [BINDING_SOURCE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_STATE_TEXTURE, BINDING_COVERAGE_TEXTURE, BINDING_REGION_TEXTURE];
 
 /// Texture unit of user texture slot 0; slot `i` is unit `USER_UNIT_BASE + i` (read through the
 /// texture object's own sampling parameters: no sampler object is bound there).
-pub(super) const USER_UNIT_BASE: u32 = 4;
+pub(super) const USER_UNIT_BASE: u32 = 5;
 
 /// Which GLSL dialect to emit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,6 +304,8 @@ mod tests {
         assert_eq!(texture_unit((0, BINDING_ORIGINAL_TEXTURE), Some((0, BINDING_SAMPLER))), Some(1));
         assert_eq!(texture_unit((0, BINDING_STATE_TEXTURE), None), Some(2));
         assert_eq!(texture_unit((0, BINDING_COVERAGE_TEXTURE), Some((0, BINDING_SAMPLER))), Some(3));
+        assert_eq!(texture_unit((0, BINDING_REGION_TEXTURE), None), Some(4));
+        assert_eq!(USER_UNIT_BASE, 5);
         assert_eq!(texture_unit((1, USER_TEXTURE_BINDING), Some((1, USER_SAMPLER_BINDING))), Some(USER_UNIT_BASE));
         assert_eq!(texture_unit((3, USER_TEXTURE_BINDING), None), Some(USER_UNIT_BASE + 2));
         assert_eq!(texture_unit((0, BINDING_UNIFORMS), None), None);
@@ -355,6 +358,27 @@ mod tests {
                     }
                     Err(error) => panic!("state {target:?}: {error}"),
                 }
+            }
+        }
+    }
+
+    /// R1: `region()` (a sampler-less `textureLoad` of the region texture, unit 4) translates with
+    /// `src()` and a user texture for every dialect: units `[0, 4, 5..]`.
+    #[test]
+    fn region_helpers_translate_with_src_and_a_user_texture() {
+        let snippet = "fn effect(uv: vec2<f32>) -> vec4<f32> {
+    let same = region_at(uv + fl.texel) == region();
+    return select(src(uv), tex(0u, uv), same && region() != REGION_NONE);
+}";
+        let effect = Effect::new("regions", snippet);
+        let Ok(effect) = effect else { panic!("{effect:?}") };
+        for target in TARGETS {
+            match translate(effect.module(), target) {
+                Ok(program) => {
+                    check_program("regions", &program, target, &[0, 4, USER_UNIT_BASE, USER_UNIT_BASE + 1, USER_UNIT_BASE + 2]);
+                    assert!(program.fragment.contains("texelFetch"), "{target:?}\n{}", program.fragment);
+                }
+                Err(error) => panic!("regions {target:?}: {error}"),
             }
         }
     }

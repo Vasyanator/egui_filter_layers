@@ -8,7 +8,10 @@
 //    through an sRGB view of the capture, so blending happens in linear exactly
 //    as on a `*Srgb` screen).
 // 2. Shape-mask coverage (F9, every backend): `vs_main` + `fs_main` without
-//    dithering into an RGBA8 coverage texture; the alpha is the coverage. glow
+//    dithering into an RGBA8 coverage texture; the alpha is the coverage.
+//    Region ids (R1): `vs_main` + `fs_region` write `region_id / 255` into `.r`
+//    of the region-id texture where the mesh covers more than `alpha_threshold`
+//    (no blend: the last region drawn owns the pixel). glow
 //    runs this same module translated by naga's GLSL writer (`glow_backend/
 //    coverage.rs`), so it must stay translatable (one sampler per texture, a
 //    `u32` colour attribute unpacked by hand).
@@ -27,7 +30,9 @@ struct MeshLocals {
     origin_px: vec2<f32>,
     // Size of the target viewport, in pixels.
     size_px: vec2<f32>,
-    reserved: vec2<f32>,
+    // R1 (`fs_region` only): the id written, and the coverage it must exceed.
+    region_id: f32,
+    alpha_threshold: f32,
 };
 
 @group(0) @binding(0) var<uniform> locals: MeshLocals;
@@ -101,4 +106,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 fn fs_main_linear(in: VertexOutput) -> @location(0) vec4<f32> {
     let color = shade_gamma(in);
     return vec4<f32>(linear_from_gamma_rgb(color.rgb), color.a);
+}
+
+// R1: writes the region id where the mesh covers the pixel more than `alpha_threshold` (the
+// coverage as `fs_main` computes it, without dithering). Drawn without blending, so the LAST
+// region drawn owns the pixel.
+@fragment
+fn fs_region(in: VertexOutput) -> @location(0) vec4<f32> {
+    let a = in.color.a * textureSample(tex_color, tex_sampler, in.tex_coord).a;
+    if a <= locals.alpha_threshold {
+        discard;
+    }
+    return vec4<f32>(locals.region_id / 255.0, 0.0, 0.0, 1.0);
 }

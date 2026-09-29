@@ -51,7 +51,16 @@ adheres to [Semantic Versioning](https://semver.org/).
 - Shape masks: `Mask` (`RoundedRect`, `Shape`: any egui shape incl. meshes and text galleys, in
   layer points), `MaskError` (callbacks, and malformed meshes: `InvalidMesh`),
   `FilterLayer::mask` / `layer_mask` / `check_mask`,
-  `OfflineOptions::with_mask`, `OfflineError::Mask`. The shape's alpha is the coverage.
+  `OfflineOptions::with_mask`, `OfflineError::Mask`. The shape's alpha is the coverage; the
+  coverage of several pieces is the sum of their alphas, capped at 1 (pieces meeting edge to edge
+  leave no seam).
+- Regions: `Mask::Regions` / `FilterLayer::regions` with `Region` (`rounded_rect`, `shape`,
+  `shape_ref`), up to `MAX_REGIONS` (255, `MaskError::TooManyRegions`): the union of the regions
+  is the mask and every pass reads the owning region's id with the prelude's `region()` /
+  `region_at(uv)` (`REGION_NONE` = 255 outside the regions; also `REGION_NONE` in Rust); later
+  regions win where they overlap; `Effect::reads_regions`. Runs on the wgpu backend; the glow
+  backend skips region-masked layers (logged once) and offline runs refuse them
+  (`OfflineError::InvalidOption`) in this build.
 - Feature `hot-reload` (native only, no extra dependencies): `HotEffect` (`watch`,
   `watch_with` + `HotOptions`, `poll` -> `HotReloadEvent`, `current`, `error`, `status_text`)
   recompiles a WGSL file off the GUI thread and keeps the last good effect while the file is

@@ -27,7 +27,7 @@ immediately, so a rejected shader becomes a latched failure instead of wgpu's de
 
 use super::WgpuOptions;
 use super::chain::{ChainResources, ChainTargets, CompositeOver};
-use super::coverage::{MESH_WGSL, mesh_locals_layout, mesh_pipeline};
+use super::coverage::{EGUI_BLEND, MESH_WGSL, mesh_locals_layout, mesh_pipeline};
 use super::gpu::{GrowBuffer, Target, egui_texture_entries, shader, with_error_scope};
 use crate::state::StateRegistry;
 
@@ -151,7 +151,7 @@ impl WgpuResources {
                 immediate_size: 0,
             });
             let mesh_shader = shader(device, "egui_filter_layers mesh", MESH_WGSL);
-            let mesh_pipeline = mesh_pipeline(device, &mesh_pipeline_layout, &mesh_shader, mesh_format, mesh_entry, "egui_filter_layers mesh");
+            let mesh_pipeline = mesh_pipeline(device, &mesh_pipeline_layout, &mesh_shader, mesh_format, mesh_entry, Some(EGUI_BLEND), "egui_filter_layers mesh");
             (mesh_locals_layout, mesh_pipeline)
         })?;
 

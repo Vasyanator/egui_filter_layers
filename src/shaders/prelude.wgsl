@@ -5,8 +5,8 @@
 //   fl.delta_time, fl.frame, fl.pointer, fl.pass_scale,
 //   src(), src_px(), src_texel(), out_texel(), original(), params(), to_linear(), to_gamma(),
 //   premultiply(), unpremultiply(), luma(), tex(), tex_size(), tex_load(), state(),
-//   state_load(), state_px(), state_size(), state_texel(), fl.pass_index, and `p` (the
-//   snippet's own `struct Params`, see below).
+//   state_load(), state_px(), state_size(), state_texel(), fl.pass_index, region(),
+//   region_at(), REGION_NONE, and `p` (the snippet's own `struct Params`, see below).
 // Every other `fl_*` / `internal_*` name, and every `fl` member not listed in the crate docs, is
 // private to the crate and may change.
 // Persistent state (F7, `Effect::new_state`): a layer with a state pass owns two state textures
@@ -24,6 +24,10 @@
 // `fl.frame` = frame counter (u32, wrapping), `fl.pointer` = pointer in capture uv (`xy`, the
 // space of `uv`), primary button down (`z`, 0/1), present (`w`, 0/1; 0 = no pointer, xyz = 0).
 // Reading them does not make an effect animated (only `fl.time` does).
+// Regions (R1, `Mask::Regions`): a layer with regions binds a region-id texture (the run's window,
+// full resolution, one id per pixel in `.r` as `id / 255`); `region_at(uv)` reads the exact texel
+// (ids are never interpolated), `REGION_NONE` outside every region. Without regions the texture is
+// a 1x1 white dummy, i.e. `REGION_NONE` everywhere.
 // Coordinates: `uv` is (0, 0) at the top-left of the captured region, y down.
 // `fl.pixels_per_point`: physical pixels per LAYER point = egui's pixels_per_point times the
 // layer transform's scale (Scene zoom), so point distances follow the zoom like the padding does.
@@ -59,6 +63,8 @@ struct FlUniforms {
     internal_src_texel: vec2<f32>,
     internal_state_texel: vec2<f32>,
     internal_state_size: vec2<f32>,
+    internal_region_scale: vec2<f32>,
+    internal_region_offset: vec2<f32>,
     params: array<vec4<f32>, 16>,
 }
 
@@ -73,6 +79,7 @@ struct FlUniforms {
 @group(0) @binding(3) var fl_original_texture: texture_2d<f32>;
 @group(0) @binding(5) var fl_state_texture: texture_2d<f32>;
 @group(0) @binding(6) var fl_coverage_texture: texture_2d<f32>;
+@group(0) @binding(7) var fl_region_texture: texture_2d<f32>;
 
 // User textures (F8): slot `i` is `@group(1 + i)`, laid out like egui-wgpu's texture bind group
 // (texture at 0, its sampler at 1), so wgpu binds egui's own bind group of the texture there and
@@ -201,6 +208,23 @@ fn state_load(px: vec2<i32>) -> vec4<f32> {
 fn state_px(offset: vec2<i32>) -> vec4<f32> {
     let here = vec2<i32>(floor(fl_frag_uv * fl.internal_state_size));
     return state_load(here + offset);
+}
+
+// The "no region" id of `region()` / `region_at(uv)`.
+const REGION_NONE: u32 = 255u;
+
+// Id of the region owning capture uv `uv` (exact texel: ids must never be interpolated), or
+// REGION_NONE outside every region and on layers without regions. The texture holds the window
+// at full capture resolution, so `fl.texel` is its texel.
+fn region_at(uv: vec2<f32>) -> u32 {
+    let storage = fl_storage_uv(uv, fl.texel, fl.internal_region_scale, fl.internal_region_offset);
+    let px = vec2<i32>(floor(storage * vec2<f32>(textureDimensions(fl_region_texture))));
+    return u32(round(textureLoad(fl_region_texture, px, 0).r * 255.0));
+}
+
+// Id of the region owning the current pixel (`region_at` at the fragment's uv).
+fn region() -> u32 {
+    return region_at(fl_frag_uv);
 }
 
 fn to_linear(c: vec4<f32>) -> vec4<f32> {

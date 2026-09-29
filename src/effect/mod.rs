@@ -17,6 +17,7 @@ Key functions:
   parameter tail), parse, lay out the named parameters, validate, check the resource interface.
 - `Effect::params()` / `Effect::param()`: reflection of the named parameters.
 - `Effect::reads_texture()`: which user texture slots the effect reads (IR scan, conservative).
+- `Effect::reads_regions()`: whether the effect reads region ids (IR scan, informational).
 - `composite_module()` / `composite_linear_module()` (crate-internal): the internal replace pass
   that writes the filtered region back (gamma output / linear output for `*Srgb` targets; glow,
   offline). `composite_erase_module()` / `composite_add_module()` / `composite_add_linear_module()`:
@@ -44,7 +45,7 @@ mod params;
 
 pub use diagnostics::SnippetLocation;
 use diagnostics::{Assembled, error_chain, error_sources, location_suffix};
-use interface::{check_interface, reads_time, texture_slots};
+use interface::{check_interface, reads_regions, reads_time, texture_slots};
 pub(crate) use params::{ParamLayout, element_range};
 pub use params::{ParamError, ParamInfo, ParamType, ParamValue};
 
@@ -75,6 +76,9 @@ pub(crate) const BINDING_PARAMS: u32 = 4;
 pub(crate) const BINDING_STATE_TEXTURE: u32 = 5;
 /// `@binding` of the mask coverage texture (`fl_coverage_texture`; a white dummy without one).
 pub(crate) const BINDING_COVERAGE_TEXTURE: u32 = 6;
+/// `@binding` of the region-id texture (`fl_region_texture`, R1: `.r * 255` = the region id; a
+/// white dummy, i.e. `REGION_NONE`, without regions).
+pub(crate) const BINDING_REGION_TEXTURE: u32 = 7;
 
 /// How many user textures a layer can attach (`FilterLayer::texture`, offline
 /// `OfflineOptions::with_texture`); effects read slot `i` with `tex(i, uv)`, `tex_size(i)` and
@@ -118,6 +122,8 @@ pub(crate) struct CompiledModule {
     /// Which user texture slots the module may read (`interface::texture_slots`; conservative:
     /// a slot index that is not a constant counts as every slot).
     pub(crate) texture_slots: [bool; TEXTURE_SLOTS],
+    /// Whether the module may read region ids (`interface::reads_regions`).
+    pub(crate) reads_regions: bool,
 }
 
 impl fmt::Debug for CompiledModule {
@@ -366,6 +372,14 @@ impl Effect {
         self.module.texture_slots.get(slot).copied().unwrap_or(false)
     }
 
+    /// Whether the effect reads region ids (`region()`, `region_at(uv)` or the region texture,
+    /// found in naga's IR). Informational: a layer without regions is a valid input (every pixel
+    /// reads `REGION_NONE`), so nothing is refused on it; a UI may warn instead.
+    #[must_use]
+    pub fn reads_regions(&self) -> bool {
+        self.module.reads_regions
+    }
+
     /// The shared compiled module (crate-internal: backends key their caches on it).
     pub(crate) fn module(&self) -> &Arc<CompiledModule> {
         &self.module
@@ -418,9 +432,10 @@ fn compile(label: &str, snippet: &str) -> Result<CompiledModule, EffectError> {
     check_interface(label, &module, declaration.is_some())?;
 
     let texture_slots = texture_slots(&module);
+    let reads_regions = reads_regions(&module);
     let id = NEXT_MODULE_ID.fetch_add(1, Ordering::Relaxed);
     log::debug!("egui_filter_layers: compiled effect `{label}` (module id {id}, user texture slots {texture_slots:?})");
-    Ok(CompiledModule { id, label: Arc::from(label), source: assembled.source, module, info, params, texture_slots })
+    Ok(CompiledModule { id, label: Arc::from(label), source: assembled.source, module, info, params, texture_slots, reads_regions })
 }
 
 /// `effect` wrapper appended to the composite body for targets that store gamma values as-is.
@@ -563,12 +578,36 @@ mod tests {
         assert_eq!(slots("fn unused() -> vec4<f32> { return tex(1u, vec2<f32>(0.0)); }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }"), [false, true, false, false], "any function of the module counts");
     }
 
+    /// R1: `region()` / `region_at(uv)` / `REGION_NONE` compile in a snippet; `reads_regions` sees
+    /// a call or a direct texture reference in the snippet, never the prelude's own helpers.
+    #[test]
+    fn region_reads_are_detected() {
+        let reads = |snippet: &str| match Effect::new("regions", snippet) {
+            Ok(effect) => effect.reads_regions(),
+            Err(error) => panic!("{error}"),
+        };
+        assert!(!reads("fn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv); }"));
+        assert!(reads("fn effect(uv: vec2<f32>) -> vec4<f32> { if region() == REGION_NONE { return vec4<f32>(1.0, 0.0, 0.0, 1.0); } return src(uv); }"));
+        assert!(reads("fn effect(uv: vec2<f32>) -> vec4<f32> { let same = region_at(uv + fl.texel) == region(); return select(src(uv), original(uv), same); }"));
+        assert!(reads("fn helper(uv: vec2<f32>) -> f32 { return f32(region_at(uv)); }\nfn effect(uv: vec2<f32>) -> vec4<f32> { return src(uv) * helper(uv); }"), "through a snippet function");
+        assert!(reads("fn effect(uv: vec2<f32>) -> vec4<f32> { return textureLoad(fl_region_texture, vec2<i32>(0), 0); }"), "the texture itself");
+        assert!(!crate::presets::gaussian_blur(4.0).passes().iter().any(|pass| pass.effect().reads_regions()), "presets read no regions");
+    }
+
+    /// R1: binding 7 is the prelude's region texture only; a snippet cannot bind anything there.
+    #[test]
+    fn the_region_binding_is_prelude_only() {
+        let own = "@group(0) @binding(7) var mine: texture_2d<f32>;\nfn effect(uv: vec2<f32>) -> vec4<f32> { return textureLoad(mine, vec2<i32>(0), 0); }";
+        assert!(Effect::new("own", own).is_err(), "binding 7 is taken by the prelude");
+        assert!(interface::PRELUDE_RESOURCES.contains(&("fl_region_texture", 0, BINDING_REGION_TEXTURE)), "the interface table lists the region texture");
+    }
+
     #[test]
     fn user_texture_bindings_are_prelude_only() {
         let foreign = "@group(1) @binding(2) var extra: texture_2d<f32>;\nfn effect(uv: vec2<f32>) -> vec4<f32> { return textureLoad(extra, vec2<i32>(0), 0); }";
         assert!(matches!(Effect::new("foreign", foreign), Err(EffectError::Interface { .. })), "a snippet cannot bind its own resource in a user group");
         let removed = "fn effect(uv: vec2<f32>) -> vec4<f32> { return textureSampleLevel(fl_src_texture, fl_nearest_sampler, uv, 0.0); }";
-        assert!(Effect::new("removed", removed).is_err(), "the nearest sampler (binding 7) no longer exists");
+        assert!(Effect::new("removed", removed).is_err(), "the nearest sampler no longer exists");
     }
 
     #[test]

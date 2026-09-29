@@ -64,7 +64,7 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   has not applied yet (kept across the passes of a frame, partial deltas followed);
   `resolve_user_textures` (the same resolution for attached user textures, failures reported).
 - `coverage.rs`: egui-free mesh machinery shared by the backdrop re-render and the shape-mask
-  coverage rasterizer (`mesh_pipeline`, `EGUI_BLEND`, `CoverageRasterizer` with a white texture
+  coverage rasterizer (`mesh_pipeline` with a blend: `EGUI_BLEND` / additive `COVERAGE_BLEND`, `CoverageRasterizer` with a white texture
   group for untextured offline meshes, per-run `CoverageTargets`, `CoverageJob`); used by
   `chain.rs`, so offline runs rasterize masks unchanged.
 - `chain.rs`: the chain executor (`ChainResources`, `ChainTargets`, `ChainWindow`, `record`,
@@ -84,8 +84,8 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
 
 ## Contracts and invariants
 - Every effect and composite pipeline shares ONE `@group(0)` layout (`ChainResources::layout`,
-  all seven prelude bindings); every draw's bind group fills all seven, dummies where the plan
-  binds no texture. Effect pipelines add the three user texture groups (`effect_pipeline_layout`;
+  all eight prelude bindings); every draw's bind group fills all eight, dummies where the plan
+  binds no texture (white for coverage and region ids: full coverage / `REGION_NONE`). Effect pipelines add the three user texture groups (`effect_pipeline_layout`;
   every step sets all three: the caller's bind group where the plan binds one, `dummy_user`
   elsewhere); composite pipelines are group 0 only. The params binding (4) is unsized so modules
   may declare any block size there; every draw binds its own `plan::params_block` range of the
@@ -119,7 +119,12 @@ are those of the whole layer. Hardware bilinear weights between texel centres ca
   crate) — uncaptured, so wgpu-core's default handler panics (native and WebGL2); browser WebGPU
   logs it and drops the frame. Never claim it latches.
 - Shape-mask coverage is `Rgba8Unorm`, the run's window at its origin, cleared then drawn with
-  egui's blend, single-sampled; only the composite binds it (the white dummy elsewhere).
+  the additive `COVERAGE_BLEND` (`One, One`, saturating; abutting pieces sum to 1),
+  single-sampled; only the composite binds it (the white dummy elsewhere). A region mask (R1) adds
+  the region-id texture (`Rgba8Unorm`, the window at its origin, cleared to id 255, then the id
+  passes A and B of `plan.rs` with `fs_region` and no blend; one `MeshLocals` block per (pass,
+  region) at the device's uniform offset alignment, selected by a dynamic offset), bound at
+  binding 7 of every pass step.
 - The UI composite never writes pixels its mask does not cover (discard), and inside the mask it
   equals the filtered value exactly; only the 1-px antialiased edge is a blend with what the pass
   holds (on `*Srgb` targets in linear, so it differs from the offline / glow gamma mix there).

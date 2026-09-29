@@ -22,9 +22,10 @@ Stateful layers (F7): the layer's state entry (`WgpuResources::states`, keyed by
 outside the per-frame pool) is looked up before recording and updated after it; a state format
 the device cannot render / filter skips the layer (`Shared::fail_state`). Unpainted states are
 evicted at every prepare (`StateRegistry::evict`).
-A shape mask (F9) is packed here and handed to the chain executor with its layer-points ->
-capture-pixels transform (`geometry::mask_transform`) and the texture groups the plugin resolved;
-the executor rasterizes it into the run's coverage texture.
+A shape mask (F9) or region mask (R1) is packed here and handed to the chain executor with its
+layer-points -> capture-pixels transform (`geometry::mask_transform`), the texture groups the
+plugin resolved and the regions' draw ranges; the executor rasterizes it into the run's coverage
+(and region-id) texture.
 The composite BLENDS over egui's pass (`chain::draw_composite_over`): pixels outside the
 mask keep what the pass holds, since the re-rendered backdrop lacks paint callbacks and lower
 filter layers. On `*Srgb` targets the meshes are rendered through an sRGB view of the capture
@@ -43,7 +44,6 @@ use super::resources::{CAPTURE_FORMAT, CAPTURE_SRGB_VIEW_FORMAT, WgpuResources};
 use super::{BeneathPlan, Drawn, LayerSlot, LoggedOnce, Shared};
 use crate::backend::LayerJob;
 use crate::geometry::{LayerGeometry, PxRect, layer_geometry, mask_transform, px_f32, transform_scale};
-use crate::mask::CoverageMeshes;
 use crate::plan::{MESH_LOCALS_SIZE, StatePlanInput, mesh_locals};
 use crate::state::StateKey;
 
@@ -68,7 +68,7 @@ impl FilterCallback {
 /// screen points -> capture pixels (`pos * pixels_per_point - capture.xy`) over the capture.
 #[must_use]
 pub(super) fn backdrop_locals(pixels_per_point: f32, dithering: bool, capture: PxRect) -> [u8; MESH_LOCALS_SIZE] {
-    mesh_locals(pixels_per_point, dithering, [px_f32(capture.x), px_f32(capture.y)], [px_f32(capture.w), px_f32(capture.h)])
+    mesh_locals(pixels_per_point, dithering, [px_f32(capture.x), px_f32(capture.y)], [px_f32(capture.w), px_f32(capture.h)], 0.0, 0.0)
 }
 
 /// The scissor of a primitive clipped by `clip_rect` (points), in capture-texture pixels, or
@@ -316,14 +316,15 @@ impl FilterCallback {
         let state_input = state.as_ref().map(|(_, run, _)| StatePlanInput { scale: self.job.state.scale(), current: run.current, previous_px: run.previous, step: run.step });
         // A shape mask (F9): its meshes in layer points, mapped through the layer transform the
         // callback rect reveals; every texture they sample was resolved by the plugin.
-        let packed = self.job.mask.coverage().map(CoverageMeshes::pack);
+        // A region mask (R1) packs every region into the same upload plus its draw ranges.
+        let packed = self.job.mask.pack();
         let coverage = match &packed {
             Some(packed) => {
-                let textures: Option<Vec<&wgpu::BindGroup>> = packed.draws.iter().map(|draw| plan.textures.get(&draw.texture)).collect();
+                let textures: Option<Vec<&wgpu::BindGroup>> = packed.packed.draws.iter().map(|draw| plan.textures.get(&draw.texture)).collect();
                 let Some(textures) = textures else {
                     return;
                 };
-                Some(CoverageJob { packed, transform: mask_transform(self.job.rect, plan.callback_rect, rec.pixels_per_point, capture), textures })
+                Some(CoverageJob { packed: &packed.packed, transform: mask_transform(self.job.rect, plan.callback_rect, rec.pixels_per_point, capture), textures, regions: &packed.regions })
             }
             None => None,
         };

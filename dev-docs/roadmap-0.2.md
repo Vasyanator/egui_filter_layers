@@ -495,6 +495,8 @@ Each phase is marked done here in the same commit that lands it.
 - Phase 7a (demo scaffold: `examples/demo/` directory example — `main.rs` shell + `--scene`, `record.rs`, `backdrop.rs`, `stack.rs` (+ kawase / bloom entries and custom `struct Params` via `params_ui.rs`), `scenes/mod.rs` `Scene` trait + `SCENES` registry, scene "stack"; no new scenes yet): done.
 - Phase 8 (docs + release prep: version 0.2.0, CHANGELOG `[0.2.0]` with every breaking change, README feature overview / prelude table / compatibility / demo scenes / Wayland capture note, `WaveObstacle` re-exported at the root, crate docs overview, direct-minimal-versions re-checked (dev-dep `glutin` floor 0.32.3 for eframe 0.36), package list + publish dry run): done.
 - Final review fixes (per-viewport eviction clocks in `StateRegistry`; `reset_state` as a `ResetTicket` claimed where the registry's `begin` runs, so an unrun paint keeps it; malformed user mask meshes refused (`MaskError::InvalidMesh`) and skipped by `CoverageMeshes::pack`; explicit `LayerOutcome` arms in glow; `#[non_exhaustive]` on `Mask`, `HotReloadEvent`, `WaveObstacle` (+ `new`), `PointerState` (+ `new`), `Impulse`, `ImpulsePack`, `Rebound`; demo captures written on a `FrameWriter` thread; hot-reload mtime granularity documented): done.
+- Phase R0 (§19 D1: additive coverage union — wgpu `COVERAGE_BLEND` (`One, One`), `mesh_pipeline` takes the blend (backdrop keeps `EGUI_BLEND`), glow `blend_func(ONE, ONE)`; mask / lib.rs / README / CHANGELOG text: abutting pieces leave no seam; GPU tests `abutting_mask_pieces_leave_no_seam` wgpu + glow (0 / 4x MSAA); no F9 expectation changed): done.
+- Phase R1a (§19.3 regions core + wgpu: `Region`, `Mask::Regions`, `MaskError::TooManyRegions`, `MAX_REGIONS`, `REGION_NONE`, `FilterLayer::regions`, `Effect::reads_regions`; `mask.rs` `RegionMeshes` / `PackedRegions` / `tessellate_regions` / `JobMask::{pack, textures, regions}`; binding 7 `fl_region_texture` + prelude `region()` / `region_at(uv)` / `REGION_NONE`; `FlUniforms` 464 B (`internal_region_scale` 184, `_offset` 192, `params` 208); `mesh.wgsl` `fs_region`, `MeshLocals.region_id` / `alpha_threshold`; `plan.rs` `Slot::RegionId`, `Bindings::region`, `CoverageStep::regions`, `ChainPlan::with_regions`, `region_locals`, `REGION_PASS_THRESHOLDS`, `Allocations::region`; wgpu `coverage.rs` region pipeline + target + dynamic-offset locals, `chain.rs` 8-entry layout; glow units shifted (group 0 = 0..=4, user = 5..=7) and region masks refused (`Unsupported::RegionMasks`, logged once) until R1b; offline refuses region masks (`OfflineError::InvalidOption`, option `mask`) until R1c; GPU tests wgpu (Vulkan + GL) grid / NONE / overlap, glow refusal): done.
 
 ## 18. Findings during execution
 - Phase 1: naga's GLSL writer rejects one texture read through two samplers in one module
@@ -670,7 +672,8 @@ Each phase is marked done here in the same commit that lands it.
   shape's alpha, so a translucent fill filters partially (documented feature).
 - Phase 5: egui fills CONVEX paths only; a concave outline (the star of the tests) must be built
   from convex pieces or a mesh. Adjacent pieces' feathered edges overlap into faint interior seams
-  (union of two ~0.5 coverages = 0.75); documented in the README, not worked around.
+  (union of two ~0.5 coverages = 0.75); documented in the README, not worked around. Superseded
+  by phase R0 (§19 D1): the union is additive now, abutting pieces leave no seam.
 - Phase 5: mask texture failures. glow: an id `Painter::texture` does not know skips the layer and is
   reported by `failed_textures`. wgpu: the same for user texture ids; a font atlas the plugin cannot
   resolve yet (size mismatch with the CPU atlas) only skips that frame (it cannot be permanent).
@@ -679,6 +682,32 @@ Each phase is marked done here in the same commit that lands it.
 - Phase 5: equivalence measured: a star mask over invert + blur, UI vs offline: exact where the
   coverage is 0 or 1, max 1 step on the anti-aliased outline (~450 values at 1 and 2 ppp); tiled vs
   whole offline: bit-identical.
+
+- Phase R0 (D1): no F9 test expectation changed — the existing star / circle / text / transformed
+  checks sample interiors and exteriors only, and the offline F9 cases compare UI vs offline, which
+  share the rasterizer. The new seam test was confirmed to detect the old rule: with egui's blend
+  restored the shared column read `[64, 191, 0]` (0.75 coverage), with the additive union
+  `[0, 255, 0]`.
+- Phase R1a: the D1 over-estimate at OUTER junctions is larger than §19.1 says (≤ 0.25): where two
+  abutting pieces' outer corners meet, egui's feathered corner is 0.5 at its geometric corner for
+  each piece, so the sum is 1.0 where the true coverage is about 0.5 — one pixel per junction
+  (pinned in `regions_tint_each_cell_and_own_their_edges`, row 60 of the left edge).
+- Phase R1a: a mid-pixel shared edge stores two ~0.5 feathers as 8-bit alphas that sum to ~254/255,
+  not 1 (the composite snaps only within 1/1024). On gamma targets that is ≤ 1 step; on `*Srgb`
+  UI targets the linear blend magnifies it to ~14 gamma steps of backdrop in that one column
+  (measured `[14, 254, 254]` over red). Not worked around; the sRGB variant of the grid test
+  compares only fully covered pixels.
+- Phase R1a deviations from §19.3: `JobMask::coverage()` stays the plain-shape accessor (tests);
+  backends call `JobMask::pack()` (-> `PackedRegions`, empty ranges for a shape mask) and
+  `JobMask::textures()`, so there is no separate "packed union" accessor. `FlUniforms` has 28
+  members (26 + 2; §19.3.8's "27" miscounted), 464 bytes as designed. `Region::shape_ref` is not
+  `#[must_use]` (clippy: `&Shape` already is). Temporary refusals: glow `Unsupported::RegionMasks`
+  in `glow_backend/mod.rs` (typed, latched, logged once; removed by R1b), offline
+  `OfflineError::InvalidOption { option: "mask" }` from `OfflineOptions::validate` (no new public
+  variant; removed by R1c). The prelude now reserves `region`, `region_at` and `REGION_NONE`: a
+  snippet declaring one of them fails to parse (redefinition), like any prelude name.
+- Phase R1a: the id passes are verified by mutation: with pass A dropped (thresholds `[0.5, 0.5]`)
+  the grid test and `region_none_outside_regions` fail on `REGION_NONE` fringe pixels.
 
 # 19. Multi-region layers (R1 regions, R2 benchmark, R3 entries) — design and phases
 

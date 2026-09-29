@@ -216,7 +216,9 @@ impl OfflineOptions {
     /// layer points (the frame spans `0..width / pixels_per_point` points), tessellated per run at
     /// the options' pixels per point with egui's default tessellation options. Offline masks must
     /// pass [`Mask::check_offline`]: no text (no font atlas offline) and only untextured meshes;
-    /// otherwise the run fails with [`OfflineError::Mask`] before any GPU work.
+    /// otherwise the run fails with [`OfflineError::Mask`] before any GPU work. Region masks
+    /// ([`Mask::Regions`]) are not supported offline yet: such a run fails with
+    /// [`OfflineError::InvalidOption`] (option `mask`) before any GPU work.
     #[must_use]
     pub fn with_mask(mut self, mask: Mask) -> Self {
         self.mask = mask;
@@ -303,6 +305,9 @@ impl OfflineOptions {
             return Err(OfflineError::Texture(TextureError::InvalidSlot { slot }));
         }
         self.mask.check_offline()?;
+        if let Mask::Regions(_) = self.mask {
+            return Err(regions_unsupported());
+        }
         if !(self.pixels_per_point.is_finite() && self.pixels_per_point > 0.0) {
             return Err(OfflineError::InvalidOption { option: "pixels_per_point", reason: format!("must be finite and positive, got {}", self.pixels_per_point) });
         }
@@ -323,6 +328,12 @@ impl OfflineOptions {
     }
 }
 
+/// The refusal of a region mask offline (`Mask::Regions`; offline runs do not rasterize region
+/// ids yet, so running one would give every pixel `REGION_NONE`, a silent wrong answer).
+pub(super) fn regions_unsupported() -> OfflineError {
+    OfflineError::InvalidOption { option: "mask", reason: "region masks (Mask::Regions) are not supported offline yet".to_owned() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +349,8 @@ mod tests {
         let options = OfflineOptions::default().with_mask(Mask::Shape(egui::Shape::Vec(vec![circle, callback])));
         assert!(matches!(options.validate(), Err(OfflineError::Mask(crate::MaskError::Callback))));
         assert_eq!(options.with_corner_radius(3).mask, Mask::RoundedRect(CornerRadius::same(3)), "the corner radius replaces the mask");
+        let regions = OfflineOptions::default().with_mask(Mask::Regions(vec![crate::Region::rounded_rect(egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(4.0, 4.0)), 0)]));
+        assert!(matches!(regions.validate(), Err(OfflineError::InvalidOption { option: "mask", .. })), "region masks are refused offline");
     }
 
     #[test]

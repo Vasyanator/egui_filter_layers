@@ -11,24 +11,26 @@ Key functions:
   or the crate-appended named-parameter block.
 - `reads_time()`: conservative IR scan deciding `Effect::is_animated`.
 - `texture_slots()`: conservative IR scan deciding `Effect::reads_texture`.
+- `reads_regions()`: IR scan deciding `Effect::reads_regions`.
 */
 
 use super::params::PARAMS_GLOBAL;
 use super::{
-    BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, EffectError, FRAGMENT_ENTRY, TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING, USER_TEXTURE_GROUP_BASE,
+    BINDING_COVERAGE_TEXTURE, BINDING_ORIGINAL_TEXTURE, BINDING_PARAMS, BINDING_REGION_TEXTURE, BINDING_SAMPLER, BINDING_SOURCE_TEXTURE, BINDING_STATE_TEXTURE, BINDING_UNIFORMS, EffectError, FRAGMENT_ENTRY, TEXTURE_SLOTS, USER_SAMPLER_BINDING, USER_TEXTURE_BINDING, USER_TEXTURE_GROUP_BASE,
     VERTEX_ENTRY,
 };
 
 /// Every resource the prelude declares, as `(name, @group, @binding)`. The interface check
 /// accepts exactly these: a snippet cannot redeclare a prelude name (naga rejects the
 /// redefinition), so a bound global with one of these names IS the prelude's.
-pub(super) const PRELUDE_RESOURCES: [(&str, u32, u32); 12] = [
+pub(super) const PRELUDE_RESOURCES: [(&str, u32, u32); 13] = [
     ("fl", 0, BINDING_UNIFORMS),
     ("fl_src_texture", 0, BINDING_SOURCE_TEXTURE),
     ("fl_sampler", 0, BINDING_SAMPLER),
     ("fl_original_texture", 0, BINDING_ORIGINAL_TEXTURE),
     ("fl_state_texture", 0, BINDING_STATE_TEXTURE),
     ("fl_coverage_texture", 0, BINDING_COVERAGE_TEXTURE),
+    (REGION_TEXTURE_GLOBAL, 0, BINDING_REGION_TEXTURE),
     (USER_TEXTURE_GLOBALS[0][0], USER_TEXTURE_GROUP_BASE, USER_TEXTURE_BINDING),
     (USER_TEXTURE_GLOBALS[0][1], USER_TEXTURE_GROUP_BASE, USER_SAMPLER_BINDING),
     (USER_TEXTURE_GLOBALS[1][0], USER_TEXTURE_GROUP_BASE + 1, USER_TEXTURE_BINDING),
@@ -39,6 +41,12 @@ pub(super) const PRELUDE_RESOURCES: [(&str, u32, u32); 12] = [
 
 /// The prelude's globals of user texture slot `i`: `[texture, its sampler]`.
 const USER_TEXTURE_GLOBALS: [[&str; 2]; TEXTURE_SLOTS] = [["fl_user0", "fl_user0_sampler"], ["fl_user1", "fl_user1_sampler"], ["fl_user2", "fl_user2_sampler"]];
+
+/// The prelude's region-id texture global (R1).
+const REGION_TEXTURE_GLOBAL: &str = "fl_region_texture";
+
+/// The prelude helpers that read the region-id texture (`region` calls `region_at`).
+const REGION_HELPERS: [&str; 2] = ["region", "region_at"];
 
 /// The prelude helpers whose FIRST argument is a user texture slot.
 const SLOT_HELPERS: [&str; 3] = ["tex", "tex_size", "tex_load"];
@@ -206,4 +214,30 @@ fn constant_u32(module: &naga::Module, function: &naga::Function, expression: na
         },
         _ => None,
     }
+}
+
+/// Whether `module` may read region ids: a function other than the prelude's region helpers
+/// ([`REGION_HELPERS`]) — or an entry point — names the region texture or calls a helper. The
+/// helpers themselves always exist in the assembled module (the prelude declares them), so they
+/// alone do not count. Informational (`Effect::reads_regions`): nothing is refused on it.
+pub(super) fn reads_regions(module: &naga::Module) -> bool {
+    let helpers: Vec<naga::Handle<naga::Function>> = module.functions.iter().filter(|(_, function)| function.name.as_deref().is_some_and(|name| REGION_HELPERS.contains(&name))).map(|(handle, _)| handle).collect();
+    let is_region_texture = |global: naga::Handle<naga::GlobalVariable>| module.global_variables.try_get(global).ok().and_then(|global| global.name.as_deref()) == Some(REGION_TEXTURE_GLOBAL);
+    let reads = |function: &naga::Function| {
+        let names_texture = function.expressions.iter().any(|(_, expression)| matches!(expression, naga::Expression::GlobalVariable(global) if is_region_texture(*global)));
+        names_texture || calls_any(&function.body, &helpers)
+    };
+    module.functions.iter().any(|(handle, function)| !helpers.contains(&handle) && reads(function)) || module.entry_points.iter().any(|entry| reads(&entry.function))
+}
+
+/// Whether `block` (nested blocks included) calls one of `helpers`, with or without arguments.
+fn calls_any(block: &naga::Block, helpers: &[naga::Handle<naga::Function>]) -> bool {
+    block.iter().any(|statement| match statement {
+        naga::Statement::Call { function, .. } => helpers.contains(function),
+        naga::Statement::Block(inner) => calls_any(inner, helpers),
+        naga::Statement::If { accept, reject, .. } => calls_any(accept, helpers) || calls_any(reject, helpers),
+        naga::Statement::Switch { cases, .. } => cases.iter().any(|case| calls_any(&case.body, helpers)),
+        naga::Statement::Loop { body, continuing, .. } => calls_any(body, helpers) || calls_any(continuing, helpers),
+        _ => false,
+    })
 }
